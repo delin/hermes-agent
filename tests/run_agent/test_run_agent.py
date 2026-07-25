@@ -1817,6 +1817,16 @@ class TestInvalidateSystemPrompt:
         agent._invalidate_system_prompt()
         assert agent._cached_system_prompt is None
 
+    def test_advances_tool_context_epoch(self, agent):
+        from agent.tool_context import get_tool_context_id
+
+        before = get_tool_context_id(agent)
+        agent._invalidate_system_prompt()
+        after = get_tool_context_id(agent)
+
+        assert after != before
+        assert agent._tool_context_epoch == 1
+
     def test_reloads_memory_store(self, agent):
         mock_store = MagicMock()
         agent._memory_store = mock_store
@@ -3075,12 +3085,15 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
+        from agent.tool_context import get_tool_context_id
+
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
                 "web_search", {"q": "test"}, "task-1",
                 tool_call_id=None,
                 session_id=agent.session_id,
+                context_id=get_tool_context_id(agent),
                 turn_id="",
                 api_request_id="",
                 enabled_tools=list(agent.valid_tool_names),
@@ -4347,6 +4360,11 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+        from agent.tool_context import get_tool_context_id
+        assert (
+            mock_handle_function_call.call_args.kwargs["context_id"]
+            == get_tool_context_id(agent)
+        )
 
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)

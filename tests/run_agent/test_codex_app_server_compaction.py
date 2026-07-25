@@ -1,11 +1,14 @@
 import time
+import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from agent.codex_runtime import _record_codex_app_server_compaction
 from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, compress_context
 from agent.transports.codex_app_server_session import TurnResult
+from agent.tool_context import get_tool_context_id
 
 
 class FakeCodexSession:
@@ -146,6 +149,7 @@ def test_codex_app_server_manual_compression_routes_to_codex_thread():
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
     ]
+    before_context = get_tool_context_id(agent)
 
     returned, prompt = compress_context(
         agent,
@@ -170,6 +174,7 @@ def test_codex_app_server_manual_compression_routes_to_codex_thread():
     assert agent.context_compressor.last_prompt_tokens == -1
     assert agent.context_compressor.last_completion_tokens == 0
     assert agent.context_compressor.awaiting_real_usage_after_compression is True
+    assert get_tool_context_id(agent) != before_context
     assert agent.events == [
         (
             "session:compress",
@@ -185,6 +190,66 @@ def test_codex_app_server_manual_compression_routes_to_codex_thread():
             },
         )
     ]
+
+
+def test_codex_compaction_reloads_deduplicated_skill_content(tmp_path):
+    from tools.skills_tool import _skill_view_with_bump, reset_skill_view_dedup
+
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    skill_dir = tmp_path / "codex-compression-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: codex-compression-skill\ndescription: Test Codex compaction.\n---\n\n"
+        "# codex-compression-skill\n\nCodex instructions.\n"
+    )
+
+    reset_skill_view_dedup()
+    try:
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skill_usage.bump_view"),
+            patch("tools.skill_usage.bump_use"),
+        ):
+            before_context = get_tool_context_id(agent)
+            first = json.loads(
+                _skill_view_with_bump(
+                    {"name": "codex-compression-skill"},
+                    task_id="test",
+                    context_id=before_context,
+                )
+            )
+            duplicate = json.loads(
+                _skill_view_with_bump(
+                    {"name": "codex-compression-skill"},
+                    task_id="test",
+                    context_id=before_context,
+                )
+            )
+
+            compress_context(
+                agent,
+                [{"role": "user", "content": "hi"}],
+                "system",
+                approx_tokens=100000,
+                task_id="test",
+                force=True,
+            )
+            after_context = get_tool_context_id(agent)
+            after_compression = json.loads(
+                _skill_view_with_bump(
+                    {"name": "codex-compression-skill"},
+                    task_id="test",
+                    context_id=after_context,
+                )
+            )
+    finally:
+        reset_skill_view_dedup()
+
+    assert after_context != before_context
+    assert first["content_returned"] is True
+    assert duplicate["deduplicated"] is True
+    assert after_compression["content_returned"] is True
+    assert "Codex instructions" in after_compression["content"]
 
 
 def test_codex_app_server_hermes_mode_auto_compression_routes_to_codex_thread():
@@ -210,6 +275,7 @@ def test_codex_app_server_hermes_mode_auto_compression_routes_to_codex_thread():
 def test_codex_app_server_compression_failure_preserves_bookkeeping():
     agent = DummyAgent(TurnResult(error="compact failed"))
     messages = [{"role": "user", "content": "hi"}]
+    before_context = get_tool_context_id(agent)
 
     returned, prompt = compress_context(
         agent,
@@ -224,6 +290,7 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
     assert agent._codex_session.calls == 1
     assert agent.context_compressor.compression_count == 0
     assert agent.context_compressor.last_prompt_tokens == 123
+    assert get_tool_context_id(agent) == before_context
     assert agent.warnings
     assert agent.touch_calls[0] == "context compression started"
     assert agent.touch_calls[-1] == "context compression failed"
@@ -244,9 +311,11 @@ def test_codex_app_server_native_compaction_notice_emits_status_and_event():
         compacted=True,
     )
 
+    before_context = get_tool_context_id(agent)
     recorded = _record_codex_app_server_compaction(agent, turn)
 
     assert recorded is True
+    assert get_tool_context_id(agent) != before_context
     assert agent.context_compressor.compression_count == 1
     assert agent.statuses == [COMPACTION_STATUS]
     assert agent.events == [

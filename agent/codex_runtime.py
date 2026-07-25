@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.tool_context import advance_tool_context_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +244,11 @@ def _record_codex_app_server_compaction(
             compressor.last_prompt_tokens = -1
             compressor.last_completion_tokens = 0
             compressor.awaiting_real_usage_after_compression = True
+
+    # The remote Codex thread has discarded or summarized earlier tool results.
+    # Advance the same context epoch used by local compression so context-aware
+    # tools can return full content again on the next call.
+    advance_tool_context_epoch(agent)
 
     agent._last_compaction_in_place = False
     try:

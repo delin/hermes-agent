@@ -30,7 +30,9 @@ from agent.prompt_builder import (
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
+    SKILLS_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
+    TASK_COMPLETION_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -47,12 +49,28 @@ class TestGuidanceConstants:
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
         assert "session_search" in MEMORY_GUIDANCE
+        assert "explicitly requests" in MEMORY_GUIDANCE
+        assert "correction" in MEMORY_GUIDANCE.lower()
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
-        assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
+        assert "current request" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_skill_mutations_are_opt_in(self):
+        assert "persistent agent state" in SKILLS_GUIDANCE
+        assert "explicitly requests" in SKILLS_GUIDANCE
+        assert "offer is not authorization" in SKILLS_GUIDANCE
+
+    def test_task_completion_respects_user_scope(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "current user request" in text
+        assert "explicit bounded request" in text
+        assert "prerequisite reads" in text
+        assert "do not ask for the same permission again" in text
+        assert "ask before" in text
+        assert "public, destructive, financial" in text
 
 
 # =========================================================================
@@ -424,6 +442,28 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_loading_policy_requires_direct_need_without_autonomous_mutation(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "directly needed for the current request" in result
+        assert "MUST load it before acting" in result
+        assert "single most specific skill" in result
+        assert "topical overlap alone" in result
+        assert "not evidence about the live system" in result
+        assert "even partially relevant" not in result
+        assert "always better to have context you don't need" not in result
+        assert "fix it with skill_manage" not in result
+        assert "update it before finishing" not in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1623,6 +1663,11 @@ class TestToolUseEnforcementGuidance:
     def test_guidance_requires_action(self):
         assert "MUST" in TOOL_USE_ENFORCEMENT_GUIDANCE
 
+    def test_guidance_limits_action_to_authorized_scope(self):
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "current user request" in text
+        assert "authorized scope" in text
+
     def test_enforcement_models_includes_gpt(self):
         assert "gpt" in TOOL_USE_ENFORCEMENT_MODELS
 
@@ -1665,6 +1710,13 @@ class TestOpenAIModelExecutionGuidance:
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
+
+    def test_guidance_does_not_expand_user_scope(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "current user request" in text
+        assert "explicitly excluded" in text
+        assert "necessary prerequisite lookups are in scope" in text
+        assert "high-impact" in text
 
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE

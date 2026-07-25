@@ -51,6 +51,7 @@ from agent.prompt_builder import (
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
+from agent.tool_context import advance_tool_context_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -581,6 +582,10 @@ def invalidate_system_prompt(agent: Any) -> None:
     """
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
+    # Any caller invalidating the cached prompt is performing context surgery
+    # (compression, reset, rewind, or an explicit immediate refresh). Earlier
+    # deduplicated tool results may no longer be present, so start a new epoch.
+    advance_tool_context_epoch(agent)
     if agent._memory_store:
         agent._memory_store.load_from_disk()
 

@@ -1096,6 +1096,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    context_id: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1117,6 +1118,9 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        context_id: Opaque identity for the active model context. Context-aware
+                       tools use it to avoid returning stubs that refer to a
+                       different agent fork or a pre-compression context.
 
     Returns:
         Function result as a JSON string.
@@ -1206,6 +1210,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                context_id=context_id,
             )
 
     _tool_original_args = dict(function_args)
@@ -1334,12 +1339,22 @@ def handle_function_call(
                         enabled_tools=sandbox_enabled,
                     )
             else:
+                # context_id is an internal capability for tools whose output
+                # may be replaced by a context-local marker. Do not expose it
+                # to unrelated or third-party handlers.
+                context_kwargs = (
+                    {"context_id": context_id}
+                    if function_name == "skill_view" and context_id
+                    else {}
+                )
+
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        **context_kwargs,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 

@@ -17,6 +17,8 @@ from tools.skills_tool import (
     skill_matches_platform,
     skills_list,
     skill_view,
+    _skill_view_with_bump,
+    reset_skill_view_dedup,
     MAX_DESCRIPTION_LENGTH,
 )
 
@@ -581,6 +583,139 @@ class TestSkillView:
         assert view_result["available_skills"] == [
             skill["name"] for skill in list_result["skills"]
         ]
+
+
+class TestSkillViewContextDedup:
+    @pytest.fixture(autouse=True)
+    def _reset_dedup(self):
+        reset_skill_view_dedup()
+        with (
+            patch("tools.skill_usage.bump_view"),
+            patch("tools.skill_usage.bump_use"),
+        ):
+            yield
+        reset_skill_view_dedup()
+
+    @staticmethod
+    def _load(name, context_id=None, file_path=None):
+        return json.loads(
+            _skill_view_with_bump(
+                {"name": name, "file_path": file_path},
+                task_id="task-1",
+                context_id=context_id,
+            )
+        )
+
+    def test_repeated_unchanged_content_returns_compact_marker(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "dedup-skill", body="Unique instructions.")
+            first = self._load("dedup-skill", context_id="ctx-1")
+            second = self._load("dedup-skill", context_id="ctx-1")
+
+        assert first["content_returned"] is True
+        assert "Unique instructions" in first["content"]
+        assert first["content_hash"].startswith("sha256:")
+        assert first["content_chars"] == len(first["content"])
+        assert second["deduplicated"] is True
+        assert second["content_returned"] is False
+        assert second["content_hash"] == first["content_hash"]
+        assert "content" not in second
+        assert "already present in the active context" in second["message"]
+
+    def test_different_context_and_changed_content_return_full_body(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "mutable-skill", body="Version one.")
+            first = self._load("mutable-skill", context_id="ctx-1")
+            other_context = self._load("mutable-skill", context_id="ctx-2")
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: mutable-skill\ndescription: Changed.\n---\n\n"
+                "# mutable-skill\n\nVersion two.\n"
+            )
+            changed = self._load("mutable-skill", context_id="ctx-1")
+
+        assert first["content_returned"] is True
+        assert other_context["content_returned"] is True
+        assert changed["content_returned"] is True
+        assert "Version two" in changed["content"]
+        assert changed["content_hash"] != first["content_hash"]
+
+    def test_linked_file_is_tracked_separately_from_main_skill(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "linked-skill", body="Main body.")
+            refs = skill_dir / "references"
+            refs.mkdir()
+            (refs / "api.md").write_text("Reference body.")
+
+            main = self._load("linked-skill", context_id="ctx-1")
+            reference = self._load(
+                "linked-skill",
+                context_id="ctx-1",
+                file_path="references/api.md",
+            )
+
+        assert "Main body" in main["content"]
+        assert "Reference body" in reference["content"]
+        assert reference["content_returned"] is True
+
+    def test_refresh_bypasses_duplicate_marker(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "refresh-skill", body="Refresh body.")
+            self._load("refresh-skill", context_id="ctx-1")
+            refreshed = json.loads(
+                _skill_view_with_bump(
+                    {"name": "refresh-skill", "refresh": True},
+                    task_id="task-1",
+                    context_id="ctx-1",
+                )
+            )
+
+        assert refreshed["content_returned"] is True
+        assert refreshed["refresh_applied"] is True
+        assert "Refresh body" in refreshed["content"]
+
+    def test_missing_context_id_preserves_stateless_full_response(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "stateless-skill", body="Always returned.")
+            first = self._load("stateless-skill")
+            second = self._load("stateless-skill")
+
+        assert "Always returned" in first["content"]
+        assert "Always returned" in second["content"]
+        assert "deduplicated" not in second
+
+    def test_context_epoch_reset_returns_full_body_and_preserves_usage_semantics(
+        self, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        from agent.tool_context import advance_tool_context_epoch, get_tool_context_id
+
+        agent = SimpleNamespace(
+            _tool_context_instance_id="agent-1",
+            _tool_context_epoch=0,
+            session_id="session-1",
+        )
+        first_context = get_tool_context_id(agent)
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skill_usage.bump_view") as bump_view,
+            patch("tools.skill_usage.bump_use") as bump_use,
+        ):
+            _make_skill(tmp_path, "epoch-skill", body="Epoch body.")
+            first = self._load("epoch-skill", context_id=first_context)
+            duplicate = self._load("epoch-skill", context_id=first_context)
+
+            advance_tool_context_epoch(agent)
+            next_context = get_tool_context_id(agent)
+            after_reset = self._load("epoch-skill", context_id=next_context)
+
+        assert next_context != first_context
+        assert first["content_returned"] is True
+        assert duplicate["deduplicated"] is True
+        assert after_reset["content_returned"] is True
+        assert bump_view.call_count == 3
+        assert bump_use.call_count == 2
 
 
 class TestSkillViewSecureSetupOnLoad:

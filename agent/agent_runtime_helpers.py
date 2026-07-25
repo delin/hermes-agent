@@ -39,6 +39,7 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
+from agent.tool_context import get_tool_context_id
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -2658,6 +2659,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 function_name, next_args, effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
+                context_id=get_tool_context_id(agent),
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,

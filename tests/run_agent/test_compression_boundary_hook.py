@@ -11,6 +11,7 @@ dag_nodes: 0). With boundary_reason="compression" plugins can distinguish
 this from a real user-initiated /new.
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -288,6 +289,77 @@ class TestCompressionBoundaryHook:
             f"No compression hook should fire without session_db rotation, "
             f"got {comp_calls!r}"
         )
+
+    def test_in_place_compression_reloads_deduplicated_skill_content(self, tmp_path):
+        from agent.tool_context import get_tool_context_id
+        from tools.skills_tool import _skill_view_with_bump, reset_skill_view_dedup
+
+        agent = self._make_agent(session_db=None)
+        agent.compression_in_place = True
+        compressor = MagicMock()
+        compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "tail question"},
+        ]
+        compressor.compression_count = 1
+        compressor.last_prompt_tokens = 0
+        compressor.last_completion_tokens = 0
+        compressor._last_summary_error = None
+        compressor._last_compress_aborted = False
+        agent.context_compressor = compressor
+
+        skill_dir = tmp_path / "compression-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: compression-skill\ndescription: Test compression.\n---\n\n"
+            "# compression-skill\n\nFull instructions.\n"
+        )
+
+        reset_skill_view_dedup()
+        try:
+            with (
+                patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+                patch("tools.skill_usage.bump_view"),
+                patch("tools.skill_usage.bump_use"),
+            ):
+                before_context = get_tool_context_id(agent)
+                first = json.loads(
+                    _skill_view_with_bump(
+                        {"name": "compression-skill"},
+                        task_id="test",
+                        context_id=before_context,
+                    )
+                )
+                duplicate = json.loads(
+                    _skill_view_with_bump(
+                        {"name": "compression-skill"},
+                        task_id="test",
+                        context_id=before_context,
+                    )
+                )
+
+                agent._compress_context(
+                    [{"role": "user", "content": "m"}],
+                    "sys",
+                    approx_tokens=100,
+                )
+                after_context = get_tool_context_id(agent)
+                after_compression = json.loads(
+                    _skill_view_with_bump(
+                        {"name": "compression-skill"},
+                        task_id="test",
+                        context_id=after_context,
+                    )
+                )
+        finally:
+            reset_skill_view_dedup()
+
+        assert agent.session_id == "original-session"
+        assert after_context != before_context
+        assert first["content_returned"] is True
+        assert duplicate["deduplicated"] is True
+        assert after_compression["content_returned"] is True
+        assert "Full instructions" in after_compression["content"]
 
     def test_hook_failure_does_not_break_compression(self):
         """If the context engine raises from on_session_start, compression still completes."""

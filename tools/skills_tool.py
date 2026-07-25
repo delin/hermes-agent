@@ -66,14 +66,17 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+from collections import OrderedDict
+from enum import Enum
+import hashlib
 import json
 import logging
 import time
-
-from hermes_constants import get_hermes_home, display_hermes_home
 import os
 import re
-from enum import Enum
+import threading
+
+from hermes_constants import get_hermes_home, display_hermes_home
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
@@ -161,6 +164,56 @@ def _skills_dir() -> Path:
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+
+# skill_view returns large instructional bodies. Keep a bounded, per-context
+# record of rendered bodies already returned so repeated calls can emit a small
+# marker instead. Context identity is supplied by the owning AIAgent and changes
+# after compression/rewind/reset; calls without one remain non-deduplicated.
+_SKILL_VIEW_DEDUP_CONTEXT_CAP = 128
+_SKILL_VIEW_DEDUP_ENTRY_CAP = 128
+_SKILL_VIEW_DEDUP_MESSAGE = (
+    "Skill content unchanged and already present in the active context. "
+    "Reuse the earlier skill_view result. If that full body is unavailable, "
+    "call skill_view again with refresh=true."
+)
+_skill_view_dedup_lock = threading.Lock()
+_skill_view_dedup: OrderedDict[
+    str, OrderedDict[Tuple[str, str, str], None]
+] = OrderedDict()
+
+
+def _record_skill_view_content(
+    context_id: str,
+    resolved_name: str,
+    file_path: str,
+    content_hash: str,
+) -> bool:
+    """Record a rendered body and return True when it is a duplicate."""
+    if not context_id:
+        return False
+    key = (resolved_name, file_path, content_hash)
+    with _skill_view_dedup_lock:
+        entries = _skill_view_dedup.setdefault(context_id, OrderedDict())
+        duplicate = key in entries
+        entries[key] = None
+        entries.move_to_end(key)
+        while len(entries) > _SKILL_VIEW_DEDUP_ENTRY_CAP:
+            entries.popitem(last=False)
+
+        _skill_view_dedup.move_to_end(context_id)
+        while len(_skill_view_dedup) > _SKILL_VIEW_DEDUP_CONTEXT_CAP:
+            _skill_view_dedup.popitem(last=False)
+    return duplicate
+
+
+def reset_skill_view_dedup(context_id: str = None) -> None:
+    """Clear one context's skill-view cache, or every context when omitted."""
+    with _skill_view_dedup_lock:
+        if context_id:
+            _skill_view_dedup.pop(context_id, None)
+        else:
+            _skill_view_dedup.clear()
+
 
 # Platform identifiers for the 'platforms' frontmatter field.
 # Maps user-friendly names to sys.platform prefixes.
@@ -1698,7 +1751,12 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": (
+        "Load a directly applicable skill's instructions or one of its linked files. "
+        "The first call returns full content plus linked_files metadata. Repeating the "
+        "same unchanged load in the active context returns a compact already-loaded "
+        "marker; full content is available again after context compression or reset."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -1709,6 +1767,10 @@ SKILL_VIEW_SCHEMA = {
             "file_path": {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
+            },
+            "refresh": {
+                "type": "boolean",
+                "description": "OPTIONAL: Force the full content to be returned even if an unchanged copy was already loaded in the active context.",
             },
         },
         "required": ["name"],
@@ -1726,28 +1788,61 @@ registry.register(
     emoji="📚",
 )
 def _skill_view_with_bump(args, **kw):
-    """Invoke skill_view, then bump view_count on success. Best-effort: a
-    telemetry failure never breaks the tool call."""
+    """Load a skill, deduplicate its body per active context, and record use."""
     name = args.get("name", "")
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=kw.get("task_id")
     )
     try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
-            # Use the resolved skill name from the payload when present —
-            # qualified forms ("plugin:skill") return with the canonical name.
-            resolved = parsed.get("name") or name
-            if resolved:
-                from tools.skill_usage import bump_use, bump_view
-                bump_view(str(resolved))
-                # A skill_view tool call is the agent actively loading the skill
-                # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(str(resolved))
+    except Exception:
+        return result
+    if not isinstance(parsed, dict) or not parsed.get("success"):
+        return result
+
+    # Use the resolved skill name from the payload when present — qualified
+    # forms ("plugin:skill") return with the canonical name.
+    resolved = str(parsed.get("name") or name or "")
+    duplicate = False
+    content = parsed.get("content")
+    context_id = str(kw.get("context_id") or "")
+    if resolved and context_id and isinstance(content, str):
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        file_path = str(parsed.get("file") or args.get("file_path") or "")
+        duplicate = _record_skill_view_content(
+            context_id,
+            resolved,
+            file_path,
+            digest,
+        ) and not bool(args.get("refresh"))
+        parsed["content_hash"] = f"sha256:{digest}"
+        parsed["content_chars"] = len(content)
+        if duplicate:
+            parsed.pop("content", None)
+            parsed["deduplicated"] = True
+            parsed["content_returned"] = False
+            parsed["message"] = _SKILL_VIEW_DEDUP_MESSAGE
+        else:
+            parsed["content_returned"] = True
+            if args.get("refresh"):
+                parsed["refresh_applied"] = True
+
+    # A duplicate call is still a view attempt, but it did not load a fresh
+    # instructional body and therefore must not refresh Curator's use timer.
+    try:
+        if resolved:
+            from tools.skill_usage import bump_use, bump_view
+
+            bump_view(resolved)
+            if not duplicate:
+                bump_use(resolved)
     except Exception:
         pass
-    return result
+
+    try:
+        return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        return result
 
 
 registry.register(
