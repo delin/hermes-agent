@@ -90,6 +90,7 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
 
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
+HISTORICAL_REMAINING_WORK_HEADING = "## Historical Remaining Work"
 
 
 SUMMARY_PREFIX = (
@@ -119,6 +120,17 @@ SUMMARY_PREFIX = (
     "run commands, search) instead of merely narrating what you would do. "
     "The current session state (files, config, etc.) may reflect work "
     "described here — avoid repeating it:"
+)
+_LOCAL_HANDOFF_SUMMARY_PREFIX = (
+    "[CONTEXT COMPACTION — HANDOFF] Earlier turns were compacted into the "
+    "summary below. It records historical state; it is not a new user request. "
+    "The latest genuine user message after this block is authoritative and any "
+    "stop, undo, verification-only request, or topic change overrides the handoff. "
+    "If no later genuine user message exists but the runtime preserves an active "
+    "task below, continue only that task; do not revive completed or merely listed "
+    "historical work. Persistent memory remains active. Tools remain fully active "
+    "for the current task. Files, processes, and config may already reflect the "
+    "work summarized here, so verify before repeating actions:"
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
@@ -252,6 +264,9 @@ _HISTORICAL_SUMMARY_PREFIXES = (
     "run commands, search) instead of merely narrating what you would do. "
     "The current session state (files, config, etc.) may reflect work "
     "described here — avoid repeating it:",
+    # Jul 2026 local authority/continuity revision: preserve stripping of the
+    # short-lived HANDOFF prefix emitted by the reliability overlay.
+    _LOCAL_HANDOFF_SUMMARY_PREFIX,
     # Jul 2026 (#65848 class): identical to the pre-#69619 prefix except it
     # lacked the explicit "tools remain fully active" clause — the strong
     # REFERENCE ONLY framing bled into general tool-use suppression
@@ -330,10 +345,10 @@ _RESTART_HANDOFF_PROBE_EXTRA_MESSAGES = 4
 _MIN_SUMMARY_TOKENS = 2000
 # Proportion of compressed content to allocate for summary
 _SUMMARY_RATIO = 0.20
-# Absolute ceiling for summary tokens (even on very large context windows).
-# Summaries must stay within a 1K-10K token envelope — anything larger is
-# itself a context-pressure source and slows every compaction.
-_SUMMARY_TOKENS_CEILING = 10_000
+# Default ceiling for summary tokens (even on very large context windows).
+# A 10K-token handoff was itself a context-pressure source on long sessions;
+# callers may override this per profile, but values remain bounded below.
+_SUMMARY_TOKENS_CEILING = 4_000
 
 # Aggregate cap on the serialized turn block fed to the summarizer prompt
 # (chars). Per-message truncation (_CONTENT_MAX / _TOOL_ARGS_MAX) alone is
@@ -1739,7 +1754,7 @@ class ContextCompressor(ContextEngine):
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(context_length * 0.05), self.summary_tokens_ceiling,
         )
 
         # Reset cross-call calibration state captured under the PREVIOUS model.
@@ -1903,6 +1918,7 @@ class ContextCompressor(ContextEngine):
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
+        summary_tokens_ceiling: int = _SUMMARY_TOKENS_CEILING,
         quiet_mode: bool = False,
         summary_model_override: str = None,
         base_url: str = "",
@@ -1974,6 +1990,14 @@ class ContextCompressor(ContextEngine):
         )
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        try:
+            parsed_summary_ceiling = int(summary_tokens_ceiling)
+        except (TypeError, ValueError):
+            parsed_summary_ceiling = _SUMMARY_TOKENS_CEILING
+        self.summary_tokens_ceiling = max(
+            _MIN_SUMMARY_TOKENS,
+            min(parsed_summary_ceiling, 10_000),
+        )
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
         # context window, so the usable input budget is context_length -
@@ -2025,7 +2049,7 @@ class ContextCompressor(ContextEngine):
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(self.context_length * 0.05), self.summary_tokens_ceiling,
         )
 
         if not quiet_mode:
@@ -3358,47 +3382,32 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
         else:
             _temporal_anchoring_rule = ""
 
-        # Shared structured template (used by both paths).
+        # Compact six-section checkpoint. A long checklist encourages the model
+        # to duplicate every fact across Goal/State/Files/Remaining Work and can
+        # turn the handoff into another context-pressure source.
         _template_sections = f"""{HISTORICAL_TASK_HEADING}
 {_historical_task_instructions}
 
-## Goal
-{_goal_instructions}
-
-## Constraints & Preferences
-{_constraints_instructions}
+## Constraints & Decisions
+[Only durable requirements, explicit constraints, key decisions, and their rationale.]
 
 ## Completed Actions
-[Numbered list of concrete actions taken — include tool used, target, and outcome.
-Format each as: N. ACTION target — outcome [tool: name]
-Example:
-1. READ config.py:45 — found `==` should be `!=` [tool: read_file]
-2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
-3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
-Be specific with file paths, commands, line numbers, and results.]
+[Numbered high-signal actions and verified outcomes. Include the tool or command
+when it is needed to establish evidence. Consolidate repeated checks and omit
+routine reads that did not change the conclusion.]
 
 ## Active State
-[Current working state — include:
-- Working directory and branch (if applicable)
-- Modified/created files with brief note on each
-- Test status (X/Y passing)
-- Any running processes or servers
-- Environment details that matter]
+[The single item currently in progress, plus working directory/branch, modified
+files, test status, live processes, and blockers needed to continue safely.]
 
-## Blocked
-[Any blockers, errors, or issues not yet resolved. Include exact error messages.]
-
-## Key Decisions
-[Important technical decisions and WHY they were made]
-
-## Resolved Questions
-{_resolved_questions_instructions}
-
-## Relevant Files
-[Files read, modified, or created — with brief note on each]
+{HISTORICAL_REMAINING_WORK_HEADING}
+[Only genuinely unfinished work or unanswered inputs from the compacted turns.
+This is historical unless a later protected message or runtime task state keeps
+it active. Write "None." when nothing remains.]
 
 ## Critical Context
-[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
+[Minimal paths, commands, exact errors, and values that would otherwise be lost.
+Never include credentials; write [REDACTED].]
 
 {_PRUNED_SKILLS_SECTION_HEADING}
 [If any [SKILL_PRUNED: ...reload with skill_view(...)] markers appear in the input,
@@ -3406,7 +3415,9 @@ repeat each one verbatim here — copy the exact text, do NOT paraphrase, summar
 or describe them. These markers tell the agent which skills must be reloaded before
 use. If none appear, omit this section entirely.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget} tokens maximum. Prefer precision over exhaustiveness.
+Do not repeat the same fact in multiple sections. Preserve exact user wording in
+Historical Task Snapshot; the runtime will deterministically ground that field.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -3431,7 +3442,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using the exact six-section structure below. Preserve only existing information that is still operationally relevant. Consolidate duplicate completed actions instead of appending an ever-growing log. Update Active State to the single current item and move finished work into Completed Actions. CRITICAL: Historical Task Snapshot must reflect the most recent unresolved user input, including a question or reverse signal; it will be deterministically grounded after generation. Do not carry cancelled work forward.
 
 {_template_sections}"""
         else:

@@ -1457,6 +1457,12 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
+    # Tool-result deduplication must be scoped to this AIAgent's actual model
+    # context, not merely session_id. Background-review forks intentionally
+    # share the parent's session_id while owning a separate message context.
+    agent._tool_context_instance_id = uuid.uuid4().hex
+    agent._tool_context_epoch = 0
+
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
@@ -1833,6 +1839,9 @@ def init_agent(
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
+    compression_summary_tokens_ceiling = _compression_cfg.get(
+        "max_summary_tokens", 4_000
+    )
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
     # uncompressed tail (compression.min_tail_user_messages).  Default 1
@@ -2384,6 +2393,7 @@ def init_agent(
             protect_first_n=compression_protect_first,
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,
+            summary_tokens_ceiling=compression_summary_tokens_ceiling,
             summary_model_override=None,
             quiet_mode=agent.quiet_mode,
             base_url=agent.base_url,

@@ -12,6 +12,8 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       auto_extract: false
       default_trust: 0.5
       min_trust_threshold: 0.3
+      prefetch_limit: 2
+      prefetch_min_token_overlap: 2
       temporal_decay_half_life: 0
 """
 
@@ -121,6 +123,19 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        try:
+            self._prefetch_limit = max(
+                0, min(int(self._config.get("prefetch_limit", 2)), 5)
+            )
+        except (TypeError, ValueError):
+            self._prefetch_limit = 2
+        try:
+            self._prefetch_min_token_overlap = max(
+                1,
+                min(int(self._config.get("prefetch_min_token_overlap", 2)), 5),
+            )
+        except (TypeError, ValueError):
+            self._prefetch_min_token_overlap = 2
 
     @property
     def name(self) -> str:
@@ -154,6 +169,8 @@ class HolographicMemoryProvider(MemoryProvider):
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
+            {"key": "prefetch_limit", "description": "Maximum facts injected before each turn", "default": "2"},
+            {"key": "prefetch_min_token_overlap", "description": "Minimum distinct query/content token overlap for automatic injection", "default": "2"},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -205,16 +222,38 @@ class HolographicMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._retriever or not query:
+        if not self._retriever or not query or self._prefetch_limit <= 0:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            # Ask for extra candidates, then apply a lexical coverage gate.
+            # Hybrid FTS/HRR scoring otherwise ranks any fact containing a broad
+            # term such as "Hermes" highly enough to inject unrelated MCP or
+            # profile facts into every technical turn.
+            candidates = self._retriever.search(
+                query,
+                min_trust=self._min_trust,
+                limit=max(8, self._prefetch_limit * 4),
+            )
+            query_tokens = self._retriever._tokenize(query)
+            required_overlap = min(
+                self._prefetch_min_token_overlap,
+                max(1, len(query_tokens)),
+            )
+            results = []
+            for candidate in candidates:
+                content = str(candidate.get("content") or "")
+                tags = str(candidate.get("tags") or "")
+                candidate_tokens = self._retriever._tokenize(
+                    f"{content} {tags}"
+                )
+                if len(query_tokens & candidate_tokens) < required_overlap:
+                    continue
+                results.append(candidate)
+                if len(results) >= self._prefetch_limit:
+                    break
             if not results:
                 return ""
-            lines = []
-            for r in results:
-                trust = r.get("trust_score", r.get("trust", 0))
-                lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
+            lines = [f"- {r.get('content', '')}" for r in results]
             return "## Holographic Memory\n" + "\n".join(lines)
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)

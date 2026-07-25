@@ -2593,14 +2593,65 @@ class TestSummaryTargetRatio:
         assert c.tail_token_budget == 200_000
 
     def test_summary_cap_scales_with_context(self):
-        """Max summary tokens should be 5% of context, capped at 10K."""
+        """Max summary tokens should be 5% of context, capped at 4K by default."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 10_000  # 200K * 0.05
+        assert c.max_summary_tokens == 4_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 10_000  # capped at 10K ceiling
+        assert c.max_summary_tokens == 4_000
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                summary_tokens_ceiling=6_000,
+            )
+        assert c.max_summary_tokens == 6_000
+        c.update_model("model-b", context_length=200_000)
+        assert c.max_summary_tokens == 6_000
+
+    def test_summary_cap_flows_from_agent_config(self, monkeypatch, tmp_path):
+        import contextlib
+        import io
+
+        from hermes_cli import config as config_mod
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        config = {
+            "compression": {
+                "enabled": True,
+                "threshold": 0.50,
+                "target_ratio": 0.20,
+                "protect_first_n": 3,
+                "protect_last_n": 20,
+                "max_summary_tokens": 6_000,
+            },
+            "prompt_caching": {"cache_ttl": "5m"},
+            "sessions": {},
+            "bedrock": {},
+        }
+        monkeypatch.setattr(config_mod, "load_config", lambda: config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent = AIAgent(
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    api_key="test-key",
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                    enabled_toolsets=[],
+                    disabled_toolsets=[],
+                    quiet_mode=True,
+                    skip_memory=True,
+                    session_db=db,
+                    session_id="summary-cap-config-test",
+                )
+            assert agent.context_compressor.summary_tokens_ceiling == 6_000
+        finally:
+            db.close()
 
     def test_ratio_clamped(self):
         """Ratio should be clamped to [0.10, 0.80]."""

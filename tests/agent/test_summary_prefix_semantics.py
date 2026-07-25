@@ -145,6 +145,20 @@ _FROZEN_PREFIX_GENERATIONS = (
         "config, etc.) may reflect work described here — avoid repeating "
         "it:"
     ),
+    # Jul 2026 local reliability overlay: short-lived HANDOFF prefix.
+    (
+        "[CONTEXT COMPACTION — HANDOFF] Earlier turns were compacted into "
+        "the summary below. It records historical state; it is not a new "
+        "user request. The latest genuine user message after this block is "
+        "authoritative and any stop, undo, verification-only request, or "
+        "topic change overrides the handoff. If no later genuine user "
+        "message exists but the runtime preserves an active task below, "
+        "continue only that task; do not revive completed or merely listed "
+        "historical work. Persistent memory remains active. Tools remain "
+        "fully active for the current task. Files, processes, and config may "
+        "already reflect the work summarized here, so verify before "
+        "repeating actions:"
+    ),
     # Jul 2026 (#65848 class): same discard clause, no tools-active clause.
     (
         "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were "
