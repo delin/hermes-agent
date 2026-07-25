@@ -7942,6 +7942,19 @@ class SessionDB:
         ]
         return bool(tokens) and all(len(t) >= 3 for t in tokens)
 
+    @staticmethod
+    def _tool_call_compaction_select(enabled: bool) -> str:
+        """Return an opt-in bounded flag for generated tool-call payloads."""
+        if not enabled:
+            return ""
+        return (
+            "CASE WHEN "
+            "instr(COALESCE(m.tool_calls, ''), '[CONTEXT COMPACTION') > 0 "
+            "OR instr(COALESCE(m.tool_calls, ''), '[CONTEXT SUMMARY]:') > 0 "
+            "OR instr(COALESCE(m.tool_calls, ''), '[END OF PRIOR CONTEXT') > 0 "
+            "THEN 1 ELSE 0 END AS tool_calls_contain_compaction,"
+        )
+
     def _run_trigram_search(
         self,
         raw_query: str,
@@ -7954,6 +7967,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        include_compaction_metadata: bool = False,
     ) -> Optional[List[Dict[str, Any]]]:
         """Run a search against a substring-capable FTS index.
 
@@ -7993,6 +8007,9 @@ class SessionDB:
         if role_filter:
             tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             tri_params.extend(role_filter)
+        compaction_select = self._tool_call_compaction_select(
+            include_compaction_metadata
+        )
         tri_sql = f"""
             SELECT
                 m.id,
@@ -8002,6 +8019,7 @@ class SessionDB:
                 m.content,
                 m.timestamp,
                 m.tool_name,
+                {compaction_select}
                 s.source,
                 s.model,
                 s.started_at AS session_started
@@ -8031,6 +8049,8 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        include_content: bool = False,
+        include_compaction_metadata: bool = False,
     ) -> List[Dict[str, Any]]:
         """Instrumented wrapper around :meth:`_search_messages_impl`.
 
@@ -8052,6 +8072,8 @@ class SessionDB:
                 offset=offset,
                 sort=sort,
                 include_inactive=include_inactive,
+                include_content=include_content,
+                include_compaction_metadata=include_compaction_metadata,
             )
             return rows
         finally:
@@ -8101,6 +8123,8 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        include_content: bool = False,
+        include_compaction_metadata: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -8129,6 +8153,11 @@ class SessionDB:
         the live context but remain part of the conversation's record, so the
         pre-compaction transcript stays discoverable after in-place compaction
         (#38763). Pass ``include_inactive=True`` to search every row regardless.
+
+        ``include_compaction_metadata=True`` adds only a bounded boolean field,
+        ``tool_calls_contain_compaction``. It never returns raw tool-call
+        arguments; trusted callers can use the flag to reject generated handoff
+        matches before shaping a response.
         """
         if not self._fts_enabled:
             return []
@@ -8186,6 +8215,9 @@ class SessionDB:
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
+        compaction_select = self._tool_call_compaction_select(
+            include_compaction_metadata
+        )
         sql = f"""
             SELECT
                 m.id,
@@ -8195,6 +8227,7 @@ class SessionDB:
                 m.content,
                 m.timestamp,
                 m.tool_name,
+                {compaction_select}
                 s.source,
                 s.model,
                 s.started_at AS session_started
@@ -8215,6 +8248,7 @@ class SessionDB:
         # (indexed substring matching with ranking and snippets).  For shorter
         # CJK queries (1-2 chars), trigram can't match (it needs ≥9 UTF-8
         # bytes = 3 CJK chars), so we fall back to LIKE.
+        matches: List[Dict[str, Any]] = []
         is_cjk = self._contains_cjk(query)
         if is_cjk:
             raw_query = query.strip('"').strip()
@@ -8284,6 +8318,7 @@ class SessionDB:
                         m.content,
                         m.timestamp,
                         m.tool_name,
+                        {compaction_select}
                         s.source,
                         s.model,
                         s.started_at AS session_started
@@ -8373,6 +8408,7 @@ class SessionDB:
                         m.content,
                         m.timestamp,
                         m.tool_name,
+                        {compaction_select}
                         s.source,
                         s.model,
                         s.started_at AS session_started
@@ -8464,6 +8500,7 @@ class SessionDB:
                                   max(1, instr(m.content, ?) - 40),
                                   120) AS snippet,
                            m.content, m.timestamp, m.tool_name,
+                           {compaction_select}
                            s.source, s.model, s.started_at AS session_started
                     FROM messages m
                     JOIN sessions s ON s.id = m.session_id
@@ -8517,6 +8554,7 @@ class SessionDB:
                     source_filter=source_filter,
                     exclude_sources=exclude_sources,
                     role_filter=role_filter,
+                    include_compaction_metadata=include_compaction_metadata,
                 )
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
@@ -8557,6 +8595,7 @@ class SessionDB:
                     role_filter=role_filter,
                     limit=limit,
                     offset=offset,
+                    include_compaction_metadata=include_compaction_metadata,
                 )
                 if cjk_fb:
                     matches = cjk_fb
@@ -8574,6 +8613,7 @@ class SessionDB:
                     role_filter=role_filter,
                     limit=limit,
                     offset=offset,
+                    include_compaction_metadata=include_compaction_metadata,
                 )
                 if tri_matches:
                     matches = tri_matches
@@ -8640,9 +8680,12 @@ class SessionDB:
             except Exception:
                 match["context"] = []
 
-        # Remove full content from result (snippet is enough, saves tokens)
-        for match in matches:
-            match.pop("content", None)
+        # Remove full content by default (snippet is enough, saves tokens).
+        # Trusted in-process consumers may request it for deterministic
+        # filtering before they shape their own bounded response.
+        if not include_content:
+            for match in matches:
+                match.pop("content", None)
 
         return matches
 
@@ -8655,6 +8698,7 @@ class SessionDB:
         source_filter: Optional[List[str]] = None,
         exclude_sources: Optional[List[str]] = None,
         role_filter: Optional[List[str]] = None,
+        include_compaction_metadata: bool = False,
     ) -> List[Dict[str, Any]]:
         """LIKE-scan the rows the deferred rebuild hasn't indexed yet.
 
@@ -8701,12 +8745,16 @@ class SessionDB:
             where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             params.extend(role_filter)
 
+        compaction_select = self._tool_call_compaction_select(
+            include_compaction_metadata
+        )
         sql = f"""
             SELECT m.id, m.session_id, m.role,
                    substr(m.content,
                           max(1, instr(m.content, ?) - 40),
                           120) AS snippet,
                    m.content, m.timestamp, m.tool_name,
+                   {compaction_select}
                    s.source, s.model, s.started_at AS session_started
             FROM messages m
             JOIN sessions s ON s.id = m.session_id

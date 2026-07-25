@@ -792,15 +792,577 @@ class TestCronDemotion:
 # =========================================================================
 
 class TestCompactionSummaryFiltering:
-    """session_search discovery must exclude compaction handoffs from bookends."""
+    """session_search discovery must exclude compaction handoffs entirely."""
+
+    def test_compaction_summary_cannot_be_discovery_anchor(self, db):
+        db.create_session("s_compaction_only", source="cli")
+        db.append_message(
+            "s_compaction_only",
+            role="user",
+            content=(
+                "[CONTEXT COMPACTION — REFERENCE ONLY] "
+                "onlycompactionneedle generated handoff"
+            ),
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(query="onlycompactionneedle", db=db, limit=1)
+        )
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["results"] == []
 
     def test_is_compaction_summary_detects_prefix(self):
-        from tools.session_search_tool import _is_compaction_summary
+        from tools.session_search_tool import (
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+            _is_compaction_summary,
+        )
+
         assert _is_compaction_summary("[CONTEXT COMPACTION — REFERENCE ONLY] foo")
         assert _is_compaction_summary("[CONTEXT SUMMARY]: old summary")
+        assert _is_compaction_summary(
+            f"{_MERGED_PRIOR_CONTEXT_HEADER}\nreal request\n\n"
+            f"{_MERGED_SUMMARY_DELIMITER}\n\n"
+            "[CONTEXT COMPACTION — HANDOFF] generated summary"
+        )
         assert not _is_compaction_summary("Hello, how can I help?")
         assert not _is_compaction_summary("")
         assert not _is_compaction_summary(None)
+
+    def test_merged_compaction_summary_cannot_be_discovery_anchor(self, db):
+        from tools.session_search_tool import (
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+        )
+
+        db.create_session("s_merged_compaction_only", source="cli")
+        db.append_message(
+            "s_merged_compaction_only",
+            role="user",
+            content=(
+                f"{_MERGED_PRIOR_CONTEXT_HEADER}\nreal request\n\n"
+                f"{_MERGED_SUMMARY_DELIMITER}\n\n"
+                "[CONTEXT COMPACTION — HANDOFF] "
+                "onlymergedsummaryneedle generated handoff"
+            ),
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(query="onlymergedsummaryneedle", db=db, limit=1)
+        )
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["results"] == []
+
+    @pytest.mark.parametrize(
+        ("needle", "marker"),
+        [
+            (
+                "onlytoolhandoffneedle",
+                "[CONTEXT COMPACTION — HANDOFF]",
+            ),
+            (
+                "onlytoollegacyneedle",
+                "[CONTEXT SUMMARY]:",
+            ),
+            (
+                "onlytoolmergedneedle",
+                "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]",
+            ),
+        ],
+    )
+    def test_tool_call_compaction_payload_cannot_be_discovery_anchor(
+        self, db, needle, marker
+    ):
+        session_id = f"s_{needle}"
+        db.create_session(session_id, source="cli")
+        db.append_message(
+            session_id,
+            role="assistant",
+            content="ordinary tool-call envelope",
+            tool_calls=[
+                {
+                    "id": "call-compaction",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_task",
+                        "arguments": {
+                            "context": f"{marker} {needle} generated handoff"
+                        },
+                    },
+                }
+            ],
+        )
+        db._conn.commit()
+        if needle == "onlytoolmergedneedle":
+            stored_tool_calls = db._conn.execute(
+                "SELECT tool_calls FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            assert r"\u2014" in stored_tool_calls
+
+        rows = db.search_messages(
+            query=needle,
+            role_filter=["assistant"],
+            include_content=True,
+            include_compaction_metadata=True,
+        )
+        assert rows
+        assert rows[0]["tool_calls_contain_compaction"] == 1
+        assert "tool_calls" not in rows[0]
+
+        default_rows = db.search_messages(
+            query=needle,
+            role_filter=["assistant"],
+        )
+        assert default_rows
+        assert "tool_calls_contain_compaction" not in default_rows[0]
+        assert "tool_calls" not in default_rows[0]
+
+        result = json.loads(session_search(query=needle, db=db, limit=1))
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["results"] == []
+
+    def test_ordinary_tool_call_match_remains_discoverable(self, db):
+        db.create_session("s_ordinary_tool_call", source="cli")
+        db.append_message(
+            "s_ordinary_tool_call",
+            role="assistant",
+            content="ordinary tool-call envelope",
+            tool_calls=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": {"command": "inspect ordinarytoolneedle"},
+                    },
+                }
+            ],
+        )
+        db._conn.commit()
+
+        rows = db.search_messages(
+            query="ordinarytoolneedle",
+            role_filter=["assistant"],
+            include_compaction_metadata=True,
+        )
+        assert rows
+        assert rows[0]["tool_calls_contain_compaction"] == 0
+        assert "tool_calls" not in rows[0]
+
+        result = json.loads(
+            session_search(query="ordinarytoolneedle", db=db, limit=1)
+        )
+        assert result["count"] == 1
+
+    @pytest.mark.parametrize(
+        ("backend", "query"),
+        [
+            ("cjk_bigram", "测试项目甲"),
+            ("trigram", "测试项目乙"),
+            ("like", "测"),
+        ],
+    )
+    def test_compaction_metadata_across_cjk_search_paths(self, db, backend, query):
+        if backend == "cjk_bigram" and not db._fts_cjk_available:
+            pytest.skip("CJK bigram tokenizer unavailable")
+        if backend == "trigram":
+            if not db._trigram_available:
+                pytest.skip("trigram tokenizer unavailable")
+            db._fts_cjk_available = False
+        elif backend == "like":
+            db._fts_cjk_available = False
+            db._trigram_available = False
+
+        session_id = f"s_cjk_{backend}"
+        db.create_session(session_id, source="cli")
+        db.append_message(
+            session_id,
+            role="assistant",
+            content=f"ordinary searchable content {query}",
+            tool_calls=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_task",
+                        "arguments": {
+                            "context": "[CONTEXT SUMMARY]: generated handoff"
+                        },
+                    },
+                }
+            ],
+        )
+        db._conn.commit()
+
+        rows = db.search_messages(
+            query=query,
+            role_filter=["assistant"],
+            include_compaction_metadata=True,
+        )
+        assert rows
+        assert rows[0]["tool_calls_contain_compaction"] == 1
+        assert "tool_calls" not in rows[0]
+
+        result = json.loads(session_search(query=query, db=db, limit=1))
+        assert result["count"] == 0
+
+    def test_unindexed_gap_search_returns_only_compaction_flag(self, db):
+        db.create_session("s_gap_metadata", source="cli")
+        db.append_message(
+            "s_gap_metadata",
+            role="assistant",
+            content="gapmetadataneedle searchable content",
+            tool_calls=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_task",
+                        "arguments": {
+                            "context": "[CONTEXT COMPACTION — HANDOFF] generated"
+                        },
+                    },
+                }
+            ],
+        )
+        message_id = db._conn.execute("SELECT max(id) FROM messages").fetchone()[0]
+        db.set_meta("fts_rebuild_progress", "0")
+        db.set_meta("fts_rebuild_high_water", str(message_id))
+
+        rows = db._search_unindexed_gap(
+            "gapmetadataneedle",
+            1,
+            role_filter=["assistant"],
+            include_compaction_metadata=True,
+        )
+
+        assert rows
+        assert rows[0]["tool_calls_contain_compaction"] == 1
+        assert "tool_calls" not in rows[0]
+
+    def test_discovery_shape_omits_nested_tool_calls(self):
+        from tools.session_search_tool import _shape_message
+
+        message = {
+            "id": 7,
+            "role": "assistant",
+            "content": "bounded discovery message",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": (
+                            '{"command":"inspect [CONTEXT COMPACTION — '
+                            'REFERENCE ONLY] nested payload"}'
+                        ),
+                    },
+                }
+            ],
+        }
+
+        shaped = _shape_message(message, include_tool_calls=False)
+        assert "tool_calls" not in shaped
+
+    def test_direct_shape_bounds_and_redacts_tool_call_arguments(self):
+        from tools.session_search_tool import _shape_message
+
+        arguments = (
+            '{"command":"inspect '
+            "[CONTEXT COMPACTION — REFERENCE ONLY] "
+            + ("x" * 5000)
+            + '"}'
+        )
+        shaped = _shape_message(
+            {
+                "id": 8,
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": arguments},
+                    }
+                ],
+            }
+        )
+        rendered = json.dumps(shaped, ensure_ascii=False)
+        assert "[CONTEXT COMPACTION" not in rendered
+        assert "compaction handoff omitted" in rendered
+        assert len(rendered) < 2000
+
+    def test_direct_shape_bounds_nested_tool_call_arguments(self):
+        from tools.session_search_tool import _shape_message
+
+        shaped = _shape_message(
+            {
+                "id": 9,
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "delegate_task",
+                            "arguments": {
+                                "context": (
+                                    "[CONTEXT COMPACTION — HANDOFF] " + "x" * 5000
+                                ),
+                                "metadata": {"padding": "y" * 5000},
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+        rendered = json.dumps(shaped, ensure_ascii=False)
+        assert "[CONTEXT COMPACTION" not in rendered
+        assert "compaction handoff omitted" in rendered
+        arguments = shaped["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, dict)
+        assert arguments["_truncated"] is True
+        assert arguments["reason"] == "compaction_omitted"
+        assert len(rendered) < 2000
+
+    def test_direct_shape_preserves_small_structured_arguments(self):
+        from tools.session_search_tool import _shape_message
+
+        arguments = {"command": "inspect target", "options": ["safe", 3]}
+        shaped = _shape_message(
+            {
+                "id": 10,
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            }
+        )
+
+        assert shaped["tool_calls"][0]["function"]["arguments"] == arguments
+
+    def test_direct_shape_bounds_large_nested_arguments_without_marker(self):
+        from tools.session_search_tool import _shape_message
+
+        shaped = _shape_message(
+            {
+                "id": 11,
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "x" * 1000,
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": {"command": "x" * 10_000},
+                        },
+                    }
+                ]
+                * 10,
+            }
+        )
+
+        assert len(shaped["tool_calls"]) == 8
+        first = shaped["tool_calls"][0]
+        assert len(first["id"]) == 256
+        arguments = first["function"]["arguments"]
+        assert isinstance(arguments, dict)
+        assert arguments["_truncated"] is True
+        assert arguments["reason"] == "size"
+        assert len(json.dumps(arguments, ensure_ascii=False)) <= 1200
+
+    def test_direct_shape_bounds_oversized_integer_argument(self):
+        from tools.session_search_tool import _shape_message
+
+        shaped = _shape_message(
+            {
+                "id": 12,
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "numeric_tool",
+                            "arguments": 10**5_000,
+                        },
+                    }
+                ],
+            }
+        )
+
+        arguments = shaped["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, dict)
+        assert arguments["_truncated"] is True
+        assert arguments["reason"] == "size"
+        assert len(json.dumps(arguments, ensure_ascii=False)) <= 1200
+
+    def test_direct_shape_preserves_large_integer_within_argument_budget(self):
+        from tools.session_search_tool import _shape_message
+
+        value = 10**1_000
+        shaped = _shape_message(
+            {
+                "id": 13,
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "numeric_tool",
+                            "arguments": value,
+                        },
+                    }
+                ],
+            }
+        )
+
+        arguments = shaped["tool_calls"][0]["function"]["arguments"]
+        assert arguments == value
+        assert len(json.dumps(arguments, ensure_ascii=False)) <= 1200
+
+    def test_argument_budget_uses_actual_response_json_spacing(self):
+        from tools.session_search_tool import _shape_message
+
+        value = {f"k{i}": "v" for i in range(101)}
+        assert (
+            len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+            <= 1200
+        )
+        assert len(json.dumps(value, ensure_ascii=False)) > 1200
+
+        shaped = _shape_message(
+            {
+                "id": 14,
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "spacing_tool",
+                            "arguments": value,
+                        },
+                    }
+                ],
+            }
+        )
+
+        arguments = shaped["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, dict)
+        assert arguments["_truncated"] is True
+        assert arguments["reason"] == "size"
+        assert len(json.dumps(arguments, ensure_ascii=False)) <= 1200
+
+    def test_single_discovery_result_cannot_exceed_response_budget(self, db):
+        db.create_session(
+            "s_single_budget",
+            source="cli",
+            model="oversized-model-" + "z" * 60_000,
+        )
+        db.append_message(
+            "s_single_budget",
+            role="user",
+            content="singlebudgetneedle searchable content",
+        )
+        db._conn.commit()
+
+        encoded = session_search(query="singlebudgetneedle", db=db, limit=1)
+        result = json.loads(encoded)
+        assert len(encoded) <= 50_000
+        assert result["count"] == 1
+        assert result["response_truncated_for_budget"] is True
+        assert result["results"][0]["truncated_for_budget"] is True
+        assert "results_omitted_for_budget" not in result
+        assert result["results"][0]["session_id"] == "s_single_budget"
+
+    def test_discovery_budget_reports_only_removed_results(self, db):
+        for index in range(3):
+            session_id = f"s_multi_budget_{index}"
+            db.create_session(
+                session_id,
+                source="cli",
+                model=f"oversized-model-{index}-" + "z" * 25_000,
+            )
+            db.append_message(
+                session_id,
+                role="user",
+                content="multibudgetneedle searchable content",
+            )
+        db._conn.commit()
+
+        encoded = session_search(query="multibudgetneedle", db=db, limit=3)
+        result = json.loads(encoded)
+        assert len(encoded) <= 50_000
+        assert result["count"] == 1
+        assert result["results_omitted_for_budget"] == 2
+        assert result["response_truncated_for_budget"] is True
+
+    def test_discovery_last_resort_budget_metadata_is_truthful(self, db):
+        session_id = "s_" + "z" * 60_000
+        db.create_session(session_id, source="cli")
+        db.append_message(
+            session_id,
+            role="user",
+            content="lastresortbudgetneedle searchable content",
+        )
+        db._conn.commit()
+
+        encoded = session_search(
+            query="lastresortbudgetneedle",
+            db=db,
+            limit=1,
+        )
+        result = json.loads(encoded)
+        assert len(encoded) <= 50_000
+        assert result["count"] == 0
+        assert result["results_omitted_for_budget"] == 1
+        assert result["response_truncated_for_budget"] is True
+        assert result["discovery_failed_for_budget"] is True
+
+    def test_last_resort_budget_counts_results_pruned_before_discard(self, db):
+        for index in range(3):
+            session_id = f"s_{index}_" + "z" * 60_000
+            db.create_session(session_id, source="cli")
+            db.append_message(
+                session_id,
+                role="user",
+                content="prunedlastresortneedle searchable content",
+            )
+        db._conn.commit()
+
+        encoded = session_search(
+            query="prunedlastresortneedle",
+            db=db,
+            limit=3,
+        )
+        result = json.loads(encoded)
+        assert len(encoded) <= 50_000
+        assert result["count"] == 0
+        assert result["results_omitted_for_budget"] == 3
+        assert result["response_truncated_for_budget"] is True
+        assert result["discovery_failed_for_budget"] is True
+
+    def test_discovery_marks_truncated_echoed_query(self, db):
+        query = "missingneedle" + "z" * 2_100
+
+        result = json.loads(session_search(query=query, db=db, limit=1))
+
+        assert result["count"] == 0
+        assert result["query_truncated"] is True
+        assert len(result["query"]) == 2_000
 
     def test_compaction_summary_excluded_from_bookend_start(self, db):
         """Compaction handoff in bookend_start position must be filtered out."""
@@ -834,6 +1396,47 @@ class TestCompactionSummaryFiltering:
         # The normal message should still be present in bookend_start
         bookend_contents = [m.get("content", "") for m in entry.get("bookend_start", [])]
         assert any("zorgblat" in c for c in bookend_contents)
+
+    def test_merged_bookend_preserves_prior_content_without_handoff(self, db):
+        from tools.session_search_tool import (
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+        )
+
+        db.create_session("s_merged_bookend", source="cli")
+        db.append_message(
+            "s_merged_bookend",
+            role="user",
+            content=(
+                f"{_MERGED_PRIOR_CONTEXT_HEADER}\n"
+                "preserve this genuine prior request\n\n"
+                f"{_MERGED_SUMMARY_DELIMITER}\n\n"
+                "[CONTEXT COMPACTION — HANDOFF] generated private summary"
+            ),
+        )
+        db.append_message(
+            "s_merged_bookend", role="assistant", content="Acknowledged."
+        )
+        for i in range(10):
+            db.append_message("s_merged_bookend", role="user", content=f"setup {i}")
+            db.append_message(
+                "s_merged_bookend", role="assistant", content=f"done {i}"
+            )
+        db.append_message(
+            "s_merged_bookend",
+            role="user",
+            content="investigate the unique merged bookend target",
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(query="unique merged bookend target", db=db, limit=1)
+        )
+        assert result["success"] is True
+        rendered = json.dumps(result["results"][0]["bookend_start"])
+        assert "preserve this genuine prior request" in rendered
+        assert _MERGED_SUMMARY_DELIMITER not in rendered
+        assert "generated private summary" not in rendered
 
     def test_compaction_summary_excluded_from_bookend_end(self, db):
         """Compaction handoff in bookend_end position must be filtered out."""

@@ -54,6 +54,21 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+_DISCOVER_RAW_SCAN_CAP = 1200
+
+# Hard response-shaping bounds. session_search results are fed back into the
+# active model context, so an unbounded read can recursively preserve prior
+# compaction summaries and tool payloads. Keep discovery useful while capping
+# the default response near 50K characters; direct read/scroll remain available
+# for deliberate drilling into a session.
+_DISCOVER_RESPONSE_MAX_CHARS = 50_000
+_DISCOVER_MESSAGE_MAX_CHARS = 1_200
+_DISCOVER_BOOKEND_MAX_CHARS = 600
+_DISCOVER_SNIPPET_MAX_CHARS = 1_200
+_DISCOVER_QUERY_MAX_CHARS = 2_000
+_READ_MESSAGE_MAX_CHARS = 1_500
+_SCROLL_MESSAGE_MAX_CHARS = 1_000
+_BROWSE_PREVIEW_MAX_CHARS = 600
 
 # Prefixes that identify generated context-compaction handoff summaries.
 # These are inserted by agent/context_compressor.py as normal user/assistant
@@ -64,6 +79,11 @@ _COMPACTION_PREFIXES = (
     "[CONTEXT COMPACTION",
     "[CONTEXT SUMMARY]:",
 )
+_MERGED_PRIOR_CONTEXT_HEADER = (
+    "[PRIOR CONTEXT — for reference only; not a new message]"
+)
+_MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+_MERGED_SUMMARY_DELIMITER_PREFIX = "[END OF PRIOR CONTEXT"
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -91,12 +111,37 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-def _is_compaction_summary(content: str) -> bool:
-    """Return True if *content* looks like a generated compaction handoff."""
-    if not content:
-        return False
+def _split_compaction_content(content: Any) -> tuple[Any, bool]:
+    """Remove a generated handoff while preserving real merged-tail content.
+
+    Standalone handoffs have no user-authored payload and return ``(None, True)``.
+    Merge-into-tail handoffs keep the genuine content before the delimiter but
+    drop the generated summary after it.  The boolean identifies either shape
+    so FTS discovery can reject the whole row as an anchor: an FTS hit may have
+    matched only generated summary text, which is not safe to treat as recall.
+    """
+    if not isinstance(content, str) or not content:
+        return content, False
     stripped = content.lstrip()
-    return any(stripped.startswith(p) for p in _COMPACTION_PREFIXES)
+    if any(stripped.startswith(prefix) for prefix in _COMPACTION_PREFIXES):
+        return None, True
+    if _MERGED_SUMMARY_DELIMITER not in stripped:
+        return content, False
+
+    prior, summary = stripped.split(_MERGED_SUMMARY_DELIMITER, 1)
+    if not any(
+        summary.lstrip().startswith(prefix) for prefix in _COMPACTION_PREFIXES
+    ):
+        return content, False
+    prior = prior.strip()
+    if prior.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+        prior = prior[len(_MERGED_PRIOR_CONTEXT_HEADER):].lstrip()
+    return prior or None, True
+
+
+def _is_compaction_summary(content: Any) -> bool:
+    """Return True if *content* looks like a generated compaction handoff."""
+    return _split_compaction_content(content)[1]
 
 
 def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
@@ -235,10 +280,164 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     )
 
 
+_TOOL_CALL_ARGUMENTS_MAX_CHARS = 1200
+_TOOL_CALLS_MAX_ITEMS = 8
+_IDENTITY_FIELD_MAX_CHARS = 256
+
+
+def _try_render_value(value: Any) -> tuple[str, bool]:
+    """Render a value and report whether normal JSON serialization succeeded."""
+    if isinstance(value, str):
+        return value, True
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str), True
+    except (TypeError, ValueError, OverflowError):
+        try:
+            return str(value), False
+        except (TypeError, ValueError, OverflowError):
+            return f"<unrenderable {type(value).__name__}>", False
+
+
+def _render_value(value: Any) -> str:
+    """Render provider-specific values deterministically before bounding."""
+    return _try_render_value(value)[0]
+
+
+def _compaction_marker_index(text: str) -> int:
+    """Return the earliest generated-handoff marker, or -1."""
+    positions = [
+        text.find(marker)
+        for marker in (*_COMPACTION_PREFIXES, _MERGED_SUMMARY_DELIMITER_PREFIX)
+    ]
+    present = [position for position in positions if position >= 0]
+    return min(present) if present else -1
+
+
+def _bound_text(value: Any, max_chars: int) -> str:
+    """Render *value* as text and apply an explicit character ceiling."""
+    text = _render_value(value)
+    if max_chars <= 0:
+        return ""
+    if len(text) > max_chars:
+        if max_chars == 1:
+            return "…"
+        return text[: max_chars - 1] + "…"
+    return text
+
+
+def _bound_without_compaction(value: Any, max_chars: int) -> str:
+    """Bound text while replacing any generated handoff suffix."""
+    rendered = _render_value(value)
+    cut_at = _compaction_marker_index(rendered)
+    text = rendered if cut_at < 0 else rendered[:cut_at]
+    if cut_at >= 0:
+        text = text.rstrip() + " [compaction handoff omitted]"
+    return _bound_text(text, max_chars)
+
+
+def _bound_identity_value(value: Any) -> Any:
+    """Bound ordinary string identifiers without coercing primitive values."""
+    if isinstance(value, str):
+        return _bound_text(value, _IDENTITY_FIELD_MAX_CHARS)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        rendered, serializable = _try_render_value(value)
+        if serializable and len(rendered) <= _IDENTITY_FIELD_MAX_CHARS:
+            return value
+        return _bound_text(rendered, _IDENTITY_FIELD_MAX_CHARS)
+    return _bound_text(value, _IDENTITY_FIELD_MAX_CHARS)
+
+
+def _bound_tool_argument_value(value: Any) -> Any:
+    """Bound nested tool-call arguments while preserving normal value shapes.
+
+    FTS indexes ``tool_calls`` as well as message content. Returning raw
+    arguments from a discovery window can therefore re-inject the very
+    compaction handoff that session_search is meant to keep out of active
+    context. Small structured values retain their existing dict/list schema;
+    oversized or compaction-bearing structures become an explicit, bounded
+    sentinel of the same top-level type.
+    """
+    if isinstance(value, str):
+        return _bound_without_compaction(value, _TOOL_CALL_ARGUMENTS_MAX_CHARS)
+    if value is None or isinstance(value, (bool, float)):
+        return value
+
+    rendered, serializable = _try_render_value(value)
+    contains_compaction = _compaction_marker_index(rendered) >= 0
+    if (
+        serializable
+        and not contains_compaction
+        and len(rendered) <= _TOOL_CALL_ARGUMENTS_MAX_CHARS
+    ):
+        return value
+
+    reason = (
+        "compaction_omitted"
+        if contains_compaction
+        else "size"
+        if serializable or isinstance(value, int)
+        else "unserializable"
+    )
+    if serializable:
+        preview = _bound_without_compaction(
+            rendered,
+            _TOOL_CALL_ARGUMENTS_MAX_CHARS - 128,
+        )
+    else:
+        preview = f"[{type(value).__name__} argument omitted]"
+
+    def _container(preview_text: str) -> Any:
+        sentinel = {
+            "_truncated": True,
+            "reason": reason,
+            "preview": preview_text,
+        }
+        return [sentinel] if isinstance(value, list) else sentinel
+
+    result = _container(preview)
+    while len(_render_value(result)) > _TOOL_CALL_ARGUMENTS_MAX_CHARS and preview:
+        overflow = len(_render_value(result)) - _TOOL_CALL_ARGUMENTS_MAX_CHARS
+        preview = _bound_text(preview, max(0, len(preview) - overflow - 1))
+        result = _container(preview)
+    return result
+
+
+def _shape_tool_calls(value: Any) -> Any:
+    """Return a compact, provider-neutral preview of tool calls."""
+    if not isinstance(value, list):
+        return _bound_tool_argument_value(value)
+    shaped = []
+    for call in value[:_TOOL_CALLS_MAX_ITEMS]:
+        if not isinstance(call, dict):
+            shaped.append(_bound_tool_argument_value(call))
+            continue
+        item = {
+            k: _bound_identity_value(call.get(k))
+            for k in ("id", "type")
+            if call.get(k) is not None
+        }
+        function = call.get("function")
+        if isinstance(function, dict):
+            item["function"] = {
+                k: (
+                    _bound_tool_argument_value(v)
+                    if k == "arguments"
+                    else _bound_identity_value(v)
+                )
+                for k, v in function.items()
+                if k in {"name", "arguments"} and v is not None
+            }
+        shaped.append(item)
+    return shaped
+
+
 def _shape_message(
     m: Dict[str, Any],
     anchor_id: Optional[int] = None,
     max_content_len: Optional[int] = None,
+    include_tool_calls: bool = True,
 ) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty.
 
@@ -262,11 +461,15 @@ def _shape_message(
         "timestamp": m.get("timestamp"),
     }
     if m.get("tool_name"):
-        entry["tool_name"] = m.get("tool_name")
-    if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+        entry["tool_name"] = _bound_text(
+            m.get("tool_name"), _IDENTITY_FIELD_MAX_CHARS
+        )
+    if include_tool_calls and m.get("tool_calls"):
+        entry["tool_calls"] = _shape_tool_calls(m.get("tool_calls"))
     if m.get("tool_call_id"):
-        entry["tool_call_id"] = m.get("tool_call_id")
+        entry["tool_call_id"] = _bound_text(
+            m.get("tool_call_id"), _IDENTITY_FIELD_MAX_CHARS
+        )
     if anchor_id is not None and m.get("id") == anchor_id:
         entry["anchor"] = True
     if truncated:
@@ -275,6 +478,33 @@ def _shape_message(
     # Strip None values to keep payload tight, but always keep content
     # (absent content is meaningful — tool-call-only assistant turns).
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
+
+
+def _shape_discovery_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    anchor_id: Optional[int] = None,
+    max_content_len: int,
+) -> List[Dict[str, Any]]:
+    """Shape discovery rows without re-injecting compaction handoffs."""
+    shaped = []
+    for message in messages:
+        visible_content, is_handoff = _split_compaction_content(
+            message.get("content")
+        )
+        if is_handoff and visible_content is None:
+            continue
+        normalized = dict(message)
+        normalized["content"] = visible_content
+        shaped.append(
+            _shape_message(
+                normalized,
+                anchor_id=anchor_id,
+                max_content_len=max_content_len,
+                include_tool_calls=False,
+            )
+        )
+    return shaped
 
 
 def _resolve_profile_db(profile: str):
@@ -388,7 +618,10 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
         logging.error("get_messages failed for %s: %s", session_id, e, exc_info=True)
         return tool_error(f"failed to load session: {e}", success=False)
 
-    shaped = [_shape_message(m) for m in rows]
+    shaped = [
+        _shape_message(m, max_content_len=_READ_MESSAGE_MAX_CHARS)
+        for m in rows
+    ]
     total = len(shaped)
     truncated = total > head + tail
     window = shaped[:head] + shaped[-tail:] if truncated else shaped
@@ -443,7 +676,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
                 "started_at": s.get("started_at", ""),
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
-                "preview": s.get("preview", ""),
+                "preview": (s.get("preview", "") or "")[:_BROWSE_PREVIEW_MAX_CHARS],
             })
             if len(results) >= limit:
                 break
@@ -588,7 +821,14 @@ def _scroll(
             "title": session_meta.get("title"),
         },
         "window": window,
-        "messages": [_shape_message(m, anchor_id=around_message_id) for m in messages],
+        "messages": [
+            _shape_message(
+                m,
+                anchor_id=around_message_id,
+                max_content_len=_SCROLL_MESSAGE_MAX_CHARS,
+            )
+            for m in messages
+        ],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", 0),
     }
@@ -657,9 +897,19 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": _shape_discovery_messages(
+            view.get("bookend_start") or messages[:3],
+            max_content_len=_DISCOVER_BOOKEND_MAX_CHARS,
+        ),
+        "messages": _shape_discovery_messages(
+            view.get("window") or messages[:5],
+            anchor_id=anchor_id,
+            max_content_len=_DISCOVER_MESSAGE_MAX_CHARS,
+        ),
+        "bookend_end": _shape_discovery_messages(
+            view.get("bookend_end") or messages[-3:],
+            max_content_len=_DISCOVER_BOOKEND_MAX_CHARS,
+        ),
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
         "_lineage_root": lineage_root,
@@ -680,20 +930,52 @@ def _discover(
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
+    response_query = _bound_text(query, _DISCOVER_QUERY_MAX_CHARS)
+    query_response = {"query": response_query}
+    if response_query != query:
+        query_response["query_truncated"] = True
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
 
     try:
-        raw_results = db.search_messages(
-            query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
-            # distinct sessions AND so interactive matches buried under a wall
-            # of cron rows are still in hand for the demotion pass below.
-            offset=0,
-            sort=sort,
-        )
+        # Compaction summaries are indexed legacy rows. Filter them BEFORE
+        # ranking/dedup, paging farther when they occupy the first FTS batch so
+        # generated handoffs cannot starve genuine user/assistant matches.
+        raw_results = []
+        raw_offset = 0
+        while (
+            len(raw_results) < _DISCOVER_SCAN_LIMIT
+            and raw_offset < _DISCOVER_RAW_SCAN_CAP
+        ):
+            batch_limit = min(
+                _DISCOVER_SCAN_LIMIT,
+                _DISCOVER_RAW_SCAN_CAP - raw_offset,
+            )
+            batch = db.search_messages(
+                query=query,
+                role_filter=role_list,
+                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                limit=batch_limit,
+                offset=raw_offset,
+                sort=sort,
+                include_content=True,
+                include_compaction_metadata=True,
+            )
+            if not batch:
+                break
+            for row in batch:
+                is_summary = (
+                    _is_compaction_summary(row.get("content", ""))
+                    or bool(row.get("tool_calls_contain_compaction"))
+                )
+                row.pop("content", None)
+                row.pop("tool_calls_contain_compaction", None)
+                if not is_summary:
+                    raw_results.append(row)
+            raw_offset += len(batch)
+            if len(batch) < batch_limit:
+                break
+        raw_results = raw_results[:_DISCOVER_SCAN_LIMIT]
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
@@ -708,7 +990,7 @@ def _discover(
         _empty_payload = {
             "success": True,
             "mode": "discover",
-            "query": query,
+            **query_response,
             "results": [],
             "count": 0,
             "message": "No matching sessions found.",
@@ -792,18 +1074,23 @@ def _discover(
             "title": session_meta.get("title") or None,
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
-            "snippet": match_info.get("snippet") or "",
-            "bookend_start": [
-                _shape_message(m, max_content_len=1200)
-                for m in (view.get("bookend_start") or [])
-                if not _is_compaction_summary(m.get("content", ""))
-            ],
-            "messages": [_shape_message(m, anchor_id=msg_id, max_content_len=4000) for m in (view.get("window") or [])],
-            "bookend_end": [
-                _shape_message(m, max_content_len=1200)
-                for m in (view.get("bookend_end") or [])
-                if not _is_compaction_summary(m.get("content", ""))
-            ],
+            "snippet": _bound_without_compaction(
+                match_info.get("snippet") or "",
+                _DISCOVER_SNIPPET_MAX_CHARS,
+            ),
+            "bookend_start": _shape_discovery_messages(
+                view.get("bookend_start") or [],
+                max_content_len=_DISCOVER_BOOKEND_MAX_CHARS,
+            ),
+            "messages": _shape_discovery_messages(
+                view.get("window") or [],
+                anchor_id=msg_id,
+                max_content_len=_DISCOVER_MESSAGE_MAX_CHARS,
+            ),
+            "bookend_end": _shape_discovery_messages(
+                view.get("bookend_end") or [],
+                max_content_len=_DISCOVER_BOOKEND_MAX_CHARS,
+            ),
             "messages_before": view.get("messages_before", 0),
             "messages_after": view.get("messages_after", 0),
         }
@@ -817,13 +1104,71 @@ def _discover(
     _final_payload = {
         "success": True,
         "mode": "discover",
-        "query": query,
+        **query_response,
         "results": results,
         "count": len(results),
         "sessions_searched": len(seen_sessions),
     }
     _annotate_rebuild_status(db, _final_payload)
-    return json.dumps(_final_payload, ensure_ascii=False)
+    encoded = json.dumps(_final_payload, ensure_ascii=False)
+    omitted = 0
+    while len(encoded) > _DISCOVER_RESPONSE_MAX_CHARS and len(results) > 1:
+        results.pop()
+        omitted += 1
+        _final_payload["count"] = len(results)
+        _final_payload["results_omitted_for_budget"] = omitted
+        _final_payload["response_truncated_for_budget"] = True
+        encoded = json.dumps(_final_payload, ensure_ascii=False)
+    if len(encoded) > _DISCOVER_RESPONSE_MAX_CHARS and results:
+        # A single pathological row must not bypass the overall response cap.
+        # Keep enough identity to scroll into the session, but drop bookends
+        # and windows from this one discovery response.
+        result = results[0]
+        results[:] = [
+            {
+                "session_id": result.get("session_id", ""),
+                "link": result.get("link", ""),
+                "when": _bound_text(
+                    result.get("when", "unknown"), _IDENTITY_FIELD_MAX_CHARS
+                ),
+                "source": _bound_text(
+                    result.get("source", "unknown"), _IDENTITY_FIELD_MAX_CHARS
+                ),
+                "title": _bound_text(
+                    result.get("title") or "", _DISCOVER_SNIPPET_MAX_CHARS
+                ),
+                "matched_role": _bound_text(
+                    result.get("matched_role", ""), _IDENTITY_FIELD_MAX_CHARS
+                ),
+                "match_message_id": result.get("match_message_id"),
+                "snippet": _bound_without_compaction(
+                    result.get("snippet", ""), _DISCOVER_SNIPPET_MAX_CHARS
+                ),
+                "truncated_for_budget": True,
+            }
+        ]
+        _final_payload["count"] = 1
+        _final_payload["response_truncated_for_budget"] = True
+        if omitted:
+            _final_payload["results_omitted_for_budget"] = omitted
+        encoded = json.dumps(_final_payload, ensure_ascii=False)
+    if len(encoded) > _DISCOVER_RESPONSE_MAX_CHARS:
+        # Preserve valid JSON and a strict upper bound even for an unexpected
+        # field type that serializes far larger than anticipated.
+        encoded = json.dumps(
+            {
+                "success": True,
+                "mode": "discover",
+                **query_response,
+                "results": [],
+                "count": 0,
+                "results_omitted_for_budget": omitted + 1,
+                "response_truncated_for_budget": True,
+                "discovery_failed_for_budget": True,
+            },
+            ensure_ascii=False,
+        )
+    return encoded
 
 
 def session_search(
