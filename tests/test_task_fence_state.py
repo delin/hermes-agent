@@ -15,6 +15,8 @@ from hermes_state import (
 
 
 EXPECTED_TASK_FENCE_TABLES = {
+    "task_fence_acceptance_pending_inputs",
+    "task_fence_acceptance_snapshots",
     "task_fence_attempt_transitions",
     "task_fence_attempts",
     "task_fence_cohort_capabilities",
@@ -26,6 +28,7 @@ EXPECTED_TASK_FENCE_TABLES = {
     "task_fence_incident_evidence",
     "task_fence_incidents",
     "task_fence_ingress",
+    "task_fence_ingress_collisions",
     "task_fence_ingress_correlations",
     "task_fence_ingress_evidence",
     "task_fence_model_generations",
@@ -69,6 +72,42 @@ def _drop_task_fence_schema(path):
         conn.close()
 
 
+def _install_task_fence_v1_schema(path, **control_overrides):
+    _drop_task_fence_schema(path)
+    control = {
+        "runtime_epoch": 0,
+        "mode_generation": 0,
+        "ever_enforced": 0,
+        "tested_artifact_commit": None,
+        "tested_artifact_checksum": None,
+        "dependency_lock_fingerprint": None,
+    }
+    control.update(control_overrides)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(hermes_state.TASK_FENCE_SCHEMA_V1_SQL)
+        conn.execute(
+            "INSERT INTO task_fence_control ("
+            "singleton, store_schema_version, control_protocol_version, "
+            "runtime_epoch, mode_generation, ever_enforced, "
+            "tested_artifact_commit, tested_artifact_checksum, "
+            "dependency_lock_fingerprint, created_at, updated_at"
+            ") VALUES (1, 1, ?, ?, ?, ?, ?, ?, ?, 1.0, 1.0)",
+            (
+                TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+                control["runtime_epoch"],
+                control["mode_generation"],
+                control["ever_enforced"],
+                control["tested_artifact_commit"],
+                control["tested_artifact_checksum"],
+                control["dependency_lock_fingerprint"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _insert_task(
     conn,
     *,
@@ -100,7 +139,7 @@ def _insert_task(
     )
 
 
-def test_fresh_store_initializes_exact_task_fence_v1_schema(tmp_path):
+def test_fresh_store_initializes_exact_task_fence_v2_schema(tmp_path):
     path = tmp_path / "state.db"
     db = SessionDB(path)
     try:
@@ -144,7 +183,7 @@ def test_fresh_store_initializes_exact_task_fence_v1_schema(tmp_path):
     assert main_version == SCHEMA_VERSION
 
 
-def test_task_fence_schema_migration_is_idempotent(tmp_path):
+def test_current_task_fence_schema_open_is_idempotent(tmp_path):
     path = tmp_path / "state.db"
     first = SessionDB(path)
     first.close()
@@ -185,6 +224,273 @@ def test_writable_open_migrates_store_without_task_fence_tables(tmp_path):
     assert {
         row[1] for row in _task_fence_schema_objects(path) if row[0] == "table"
     } == EXPECTED_TASK_FENCE_TABLES
+
+
+def test_exact_pristine_v1_store_migrates_atomically_to_v2(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db._conn.execute("CREATE TABLE unrelated_v1_guard (value TEXT)")
+    db._conn.execute("INSERT INTO unrelated_v1_guard VALUES ('preserved')")
+    db.close()
+    _install_task_fence_v1_schema(path)
+    assert (
+        _task_fence_schema_objects(path)
+        == hermes_state._expected_task_fence_v1_schema_objects()
+    )
+
+    migrated = SessionDB(path)
+    try:
+        inspection = migrated.inspect_task_fence_store(include_counts=True)
+        unrelated = migrated._conn.execute(
+            "SELECT value FROM unrelated_v1_guard"
+        ).fetchone()[0]
+    finally:
+        migrated.close()
+
+    assert inspection.compatible is True
+    assert inspection.observed_store_schema_version == 2
+    assert unrelated == "preserved"
+    assert _task_fence_schema_objects(path) == (
+        hermes_state._expected_task_fence_schema_objects()
+    )
+
+
+def test_nonempty_exact_v1_store_is_not_partially_backfilled(tmp_path):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v1_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO task_fence_ingress ("
+            "event_id, source, source_event_id, conversation_id, "
+            "protocol_version, origin, ingress_class, intent, execution, "
+            "input_effect, correlation_kind, accepted_at"
+            ") VALUES ('event-v1', 'gateway', 'message-v1', 'conversation-v1', "
+            "1, 'human', 'advisory', 'keep', 'none', 'none', 'none', 1.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    objects_before = _task_fence_schema_objects(path)
+
+    reopened = SessionDB(path)
+    try:
+        inspection = reopened.inspect_task_fence_store()
+        ingress_count = reopened._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0]
+    finally:
+        reopened.close()
+
+    assert inspection.compatible is False
+    assert inspection.reason == "unsupported_store_schema"
+    assert inspection.observed_store_schema_version == 1
+    assert ingress_count == 1
+    assert _task_fence_schema_objects(path) == objects_before
+
+
+def test_orphan_v1_child_row_also_blocks_automatic_migration(tmp_path):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v1_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            "INSERT INTO task_fence_ingress_evidence "
+            "VALUES ('orphan-event', 'operator:orphan')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    objects_before = _task_fence_schema_objects(path)
+
+    reopened = SessionDB(path)
+    try:
+        inspection = reopened.inspect_task_fence_store()
+        child_count = reopened._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_evidence"
+        ).fetchone()[0]
+    finally:
+        reopened.close()
+
+    assert inspection.compatible is False
+    assert inspection.reason == "unsupported_store_schema"
+    assert child_count == 1
+    assert _task_fence_schema_objects(path) == objects_before
+
+
+@pytest.mark.parametrize(
+    "control_overrides",
+    (
+        {"runtime_epoch": 1},
+        {"mode_generation": 1},
+        {"ever_enforced": 1},
+        {"tested_artifact_commit": "artifact"},
+    ),
+)
+def test_nonpristine_v1_control_metadata_refuses_automatic_migration(
+    tmp_path,
+    control_overrides,
+):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v1_schema(path, **control_overrides)
+    objects_before = _task_fence_schema_objects(path)
+
+    reopened = SessionDB(path)
+    try:
+        inspection = reopened.inspect_task_fence_store()
+    finally:
+        reopened.close()
+
+    assert inspection.compatible is False
+    assert inspection.reason == "unsupported_store_schema"
+    assert inspection.observed_store_schema_version == 1
+    assert _task_fence_schema_objects(path) == objects_before
+
+
+def test_read_only_open_does_not_migrate_exact_v1(tmp_path):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v1_schema(path)
+    objects_before = _task_fence_schema_objects(path)
+
+    read_only = SessionDB(path, read_only=True)
+    try:
+        inspection = read_only.inspect_task_fence_store()
+    finally:
+        read_only.close()
+
+    assert inspection.compatible is False
+    assert inspection.reason == "unsupported_store_schema"
+    assert inspection.observed_store_schema_version == 1
+    assert _task_fence_schema_objects(path) == objects_before
+
+
+def test_concurrent_v1_migration_rechecks_under_write_lock(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v1_schema(path)
+    expected_v1 = hermes_state._expected_task_fence_v1_schema_objects()
+    expected_v2 = hermes_state._expected_task_fence_schema_objects()
+    original_read = hermes_state._read_task_fence_schema_objects
+    barrier = threading.Barrier(2)
+    reads_by_connection = {}
+    reads_lock = threading.Lock()
+
+    def synchronized_read(conn):
+        observed = original_read(conn)
+        connection_id = id(conn)
+        with reads_lock:
+            observations = reads_by_connection.setdefault(connection_id, [])
+            read_count = len(observations)
+            observations.append((observed, conn.in_transaction))
+        if read_count == 0:
+            assert observed == expected_v1
+            barrier.wait(timeout=5)
+        return observed
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_read_task_fence_schema_objects",
+        synchronized_read,
+    )
+
+    def migrate():
+        db = SessionDB(path)
+        try:
+            return db.inspect_task_fence_store().compatible
+        finally:
+            db.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(lambda _: migrate(), range(2)))
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_read_task_fence_schema_objects",
+        original_read,
+    )
+    assert results == (True, True)
+    assert len(reads_by_connection) == 2
+    first_locked_reads = tuple(
+        observations[1] for observations in reads_by_connection.values()
+    )
+    assert all(in_transaction for _observed, in_transaction in first_locked_reads)
+    assert {
+        observed for observed, _in_transaction in first_locked_reads
+    } == {expected_v1, expected_v2}
+    assert _task_fence_schema_objects(path) == (
+        hermes_state._expected_task_fence_schema_objects()
+    )
+
+
+def test_v1_migration_ddl_failure_rolls_back_to_exact_v1(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v1_schema(path)
+    objects_before = _task_fence_schema_objects(path)
+    monkeypatch.setattr(
+        hermes_state,
+        "TASK_FENCE_SCHEMA_V2_EXTENSION_SQL",
+        hermes_state.TASK_FENCE_SCHEMA_V2_EXTENSION_SQL
+        + "CREATE TABLE task_fence_v2_partial (value INTEGER);"
+        + "INVALID TASK FENCE V2;",
+    )
+
+    failed = SessionDB(path)
+    try:
+        inspection = failed.inspect_task_fence_store()
+    finally:
+        failed.close()
+
+    assert inspection.compatible is False
+    assert inspection.reason == "schema_initialization_failed"
+    assert _task_fence_schema_objects(path) == objects_before
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute(
+            "SELECT store_schema_version FROM task_fence_control"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_v1_migration_control_update_failure_rolls_back_extension(tmp_path):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v1_schema(path)
+    objects_before = _task_fence_schema_objects(path)
+    probe = SessionDB.__new__(SessionDB)
+    probe._conn = sqlite3.connect(path, isolation_level=None)
+    probe._task_fence_schema_init_failed = False
+    try:
+        probe._conn.execute(
+            "CREATE TEMP TRIGGER fail_task_fence_v1_update "
+            "BEFORE UPDATE ON main.task_fence_control BEGIN "
+            "SELECT RAISE(ABORT, 'injected migration metadata failure'); END"
+        )
+        probe._init_task_fence_schema()
+        assert probe._task_fence_schema_init_failed is True
+    finally:
+        probe._conn.close()
+
+    assert _task_fence_schema_objects(path) == objects_before
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute(
+            "SELECT store_schema_version FROM task_fence_control"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_schema_statement_executor_handles_semicolon_inside_sql_literal(monkeypatch):
@@ -641,8 +947,9 @@ def test_future_store_schema_is_reported_and_not_rewritten(tmp_path):
     conn = sqlite3.connect(path)
     try:
         conn.execute(
-            "UPDATE task_fence_control SET store_schema_version = 2, "
-            "runtime_epoch = 7 WHERE singleton = 1"
+            "UPDATE task_fence_control SET store_schema_version = ?, "
+            "runtime_epoch = 7 WHERE singleton = 1",
+            (TASK_FENCE_STORE_SCHEMA_VERSION + 1,),
         )
         conn.execute("CREATE TABLE task_fence_future_record (id TEXT PRIMARY KEY)")
         conn.commit()
@@ -659,7 +966,10 @@ def test_future_store_schema_is_reported_and_not_rewritten(tmp_path):
     assert inspection.initialized is True
     assert inspection.compatible is False
     assert inspection.reason == "unsupported_store_schema"
-    assert inspection.observed_store_schema_version == 2
+    assert (
+        inspection.observed_store_schema_version
+        == TASK_FENCE_STORE_SCHEMA_VERSION + 1
+    )
     assert inspection.runtime_epoch == 7
     assert _task_fence_schema_objects(path) == future_objects
 

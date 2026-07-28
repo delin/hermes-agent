@@ -1,12 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import sqlite3
 import threading
 
 import pytest
 
-from hermes_state import SessionDB
+import hermes_state
+from hermes_state import TASK_FENCE_STORE_SCHEMA_VERSION, SessionDB
 from task_fence import (
     TASK_FENCE_ACTIONS,
     CorrelationKind,
@@ -64,6 +65,34 @@ def _connection(db: SessionDB) -> sqlite3.Connection:
     conn = db._conn
     assert conn is not None
     return conn
+
+
+def _rewrite_append_only_row(
+    db: SessionDB,
+    *,
+    trigger_name: str,
+    statement: str,
+    params: tuple,
+) -> None:
+    conn = _connection(db)
+    trigger = conn.execute(
+        "SELECT sql FROM main.sqlite_master "
+        "WHERE type = 'trigger' AND name = ?",
+        (trigger_name,),
+    ).fetchone()
+    assert trigger is not None
+    assert isinstance(trigger[0], str)
+    quoted_name = trigger_name.replace('"', '""')
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(f'DROP TRIGGER main."{quoted_name}"')
+        conn.execute(statement, params)
+        conn.execute(trigger[0])
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    assert db.inspect_task_fence_store().compatible is True
 
 
 def _seed_started_generation_and_permit(
@@ -174,6 +203,20 @@ def test_initial_submit_commits_task_input_and_run_before_return(tmp_path) -> No
     assert acceptance.task_id
     assert acceptance.opened_run_id
     assert acceptance.closed_run_id is None
+    assert acceptance.pending_input_ids == ()
+    assert acceptance.task_projection is not None
+    assert acceptance.task_projection.task_id == acceptance.task_id
+    assert acceptance.task_projection.status == "running"
+    assert acceptance.task_projection.intent_epoch == 1
+    assert acceptance.task_projection.control_revision == 1
+    assert (
+        acceptance.task_projection.active_authority_event_id
+        == acceptance.event_id
+    )
+    assert (
+        acceptance.task_projection.active_execution_run_id
+        == acceptance.opened_run_id
+    )
 
     reopened = SessionDB(path)
     try:
@@ -208,6 +251,10 @@ def test_initial_submit_commits_task_input_and_run_before_return(tmp_path) -> No
             )
             == "open"
         )
+        assert _scalar(
+            conn,
+            "SELECT COUNT(*) FROM main.task_fence_acceptance_snapshots",
+        ) == 1
     finally:
         reopened.close()
 
@@ -274,6 +321,34 @@ def test_comment_hold_closes_generation_run_and_reserved_permit_atomically(
     db.close()
 
 
+def test_acceptance_snapshot_rejects_update_delete_and_replace(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    envelope = _envelope("initial_submit", "message-1")
+    accepted = db.accept_task_fence_ingress(envelope)
+    conn = _connection(db)
+    statements = (
+        "UPDATE main.task_fence_acceptance_snapshots "
+        f"SET task_status = 'paused' WHERE event_id = '{accepted.event_id}'",
+        "DELETE FROM main.task_fence_acceptance_snapshots "
+        f"WHERE event_id = '{accepted.event_id}'",
+        "INSERT OR REPLACE INTO main.task_fence_acceptance_snapshots "
+        "SELECT * FROM main.task_fence_acceptance_snapshots "
+        f"WHERE event_id = '{accepted.event_id}'",
+        "REPLACE INTO main.task_fence_acceptance_snapshots "
+        "SELECT * FROM main.task_fence_acceptance_snapshots "
+        f"WHERE event_id = '{accepted.event_id}'",
+    )
+    for statement in statements:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute(statement)
+
+    assert db.accept_task_fence_ingress(envelope) == replace(
+        accepted,
+        replayed=True,
+    )
+    db.close()
+
+
 def test_replace_run_binds_pending_inputs_and_opens_one_run(tmp_path) -> None:
     db = SessionDB(tmp_path / "state.db")
     initial = db.accept_task_fence_ingress(
@@ -316,10 +391,11 @@ def test_replace_run_binds_pending_inputs_and_opens_one_run(tmp_path) -> None:
     db.close()
 
 
-def test_exact_replay_after_later_acceptance_returns_original_identity(
+def test_exact_replay_after_later_acceptance_returns_original_projection(
     tmp_path,
 ) -> None:
-    db = SessionDB(tmp_path / "state.db")
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
     original_envelope = _envelope("initial_submit", "message-1")
     initial = db.accept_task_fence_ingress(original_envelope)
     assert initial.task_id is not None
@@ -329,15 +405,19 @@ def test_exact_replay_after_later_acceptance_returns_original_identity(
     before = db.inspect_task_fence_task(initial.task_id).task
     assert before is not None
     revision_before = before.control_revision
+    db.close()
+    db = SessionDB(path)
 
     replay = db.accept_task_fence_ingress(original_envelope)
 
-    assert replay.replayed is True
-    assert replay.event_id == initial.event_id
-    assert replay.accepted_order == initial.accepted_order
-    assert replay.task_id == initial.task_id
-    assert replay.opened_run_id == initial.opened_run_id
-    assert replay.accepted_at == initial.accepted_at
+    assert replay == replace(initial, replayed=True)
+    assert replay.task_projection is not None
+    assert replay.task_projection.control_revision == 1
+    assert replay.task_projection.status == "running"
+    assert replay.pending_input_ids == ()
+    assert db.accept_task_fence_ingress(
+        replace(original_envelope, task_id=initial.task_id)
+    ) == replace(initial, replayed=True)
     after = db.inspect_task_fence_task(initial.task_id).task
     assert after is not None
     assert after.control_revision == revision_before
@@ -347,6 +427,131 @@ def test_exact_replay_after_later_acceptance_returns_original_identity(
             "SELECT COUNT(*) FROM main.task_fence_ingress",
         )
         == 2
+    )
+    db.close()
+
+
+def test_wall_clock_regression_preserves_typed_acceptance(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    timestamps = iter((100.0, 90.0))
+    monkeypatch.setattr(hermes_state.time, "time", lambda: next(timestamps))
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "message-clock-initial")
+    )
+    assert initial.task_id is not None
+    note_envelope = _envelope(
+        "explicit_note",
+        "message-clock-note",
+        task_id=initial.task_id,
+    )
+
+    note = db.accept_task_fence_ingress(note_envelope)
+
+    assert note.task_projection is not None
+    assert note.task_projection.created_at == 100.0
+    assert note.task_projection.updated_at == 90.0
+    assert db.accept_task_fence_ingress(note_envelope) == replace(
+        note,
+        replayed=True,
+    )
+    db.close()
+
+
+def test_replay_preserves_fifo_pending_projection_after_inputs_are_bound(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "message-initial")
+    )
+    assert initial.task_id is not None
+    first_pending = db.accept_task_fence_ingress(
+        _envelope("comment_hold", "message-z", task_id=initial.task_id)
+    )
+    second_envelope = _envelope(
+        "comment_hold",
+        "message-a",
+        task_id=initial.task_id,
+    )
+    second_pending = db.accept_task_fence_ingress(second_envelope)
+
+    assert first_pending.pending_input_ids == (first_pending.event_id,)
+    assert second_pending.pending_input_ids == (
+        first_pending.event_id,
+        second_pending.event_id,
+    )
+    db.accept_task_fence_ingress(
+        _envelope("change_and_run", "message-run", task_id=initial.task_id)
+    )
+    conn = _connection(db)
+    for statement, params in (
+        (
+            "INSERT INTO main.task_fence_acceptance_pending_inputs "
+            "(event_id, ordinal, input_event_id) VALUES (?, 2, ?)",
+            (second_pending.event_id, initial.event_id),
+        ),
+        (
+            "UPDATE main.task_fence_acceptance_pending_inputs "
+            "SET input_event_id = ? WHERE event_id = ? AND ordinal = 0",
+            (initial.event_id, second_pending.event_id),
+        ),
+        (
+            "DELETE FROM main.task_fence_acceptance_pending_inputs "
+            "WHERE event_id = ? AND ordinal = 0",
+            (second_pending.event_id,),
+        ),
+        (
+            "INSERT OR REPLACE INTO main.task_fence_acceptance_pending_inputs "
+            "(event_id, ordinal, input_event_id) VALUES (?, 0, ?)",
+            (second_pending.event_id, initial.event_id),
+        ),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute(statement, params)
+    replay = db.accept_task_fence_ingress(second_envelope)
+
+    assert replay == replace(second_pending, replayed=True)
+    assert replay.pending_input_ids == (
+        first_pending.event_id,
+        second_pending.event_id,
+    )
+    db.close()
+
+
+def test_task_bound_and_taskless_advisory_snapshots_are_historical(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    taskless_envelope = _envelope("explicit_note", "note-taskless")
+    taskless = db.accept_task_fence_ingress(taskless_envelope)
+    assert taskless.task_id is None
+    assert taskless.task_projection is None
+    assert taskless.pending_input_ids == ()
+
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "message-initial")
+    )
+    assert initial.task_id is not None
+    bound_note = db.accept_task_fence_ingress(
+        _envelope("explicit_note", "note-bound", task_id=initial.task_id)
+    )
+    assert bound_note.task_projection is not None
+    assert bound_note.task_projection.task_id == initial.task_id
+    assert bound_note.task_projection.status == "running"
+    assert (
+        bound_note.task_projection.active_execution_run_id
+        == initial.opened_run_id
+    )
+    assert (
+        bound_note.task_projection.last_accepted_order
+        == bound_note.accepted_order
+    )
+    assert db.accept_task_fence_ingress(taskless_envelope) == replace(
+        taskless,
+        replayed=True,
     )
     db.close()
 
@@ -368,7 +573,7 @@ def test_mismatched_source_event_collision_rejects_without_authority_mutation(
             _envelope("initial_submit", "message-1", payload="different")
         )
 
-    assert caught.value.incident_id is None
+    assert caught.value.incident_id is not None
     task = db.inspect_task_fence_task(accepted.task_id).task
     assert task is not None
     assert task.control_revision == 1
@@ -380,6 +585,500 @@ def test_mismatched_source_event_collision_rejects_without_authority_mutation(
         _connection(db),
         "SELECT COUNT(*) FROM main.task_fence_incidents",
     ) == 0
+    collision = _connection(db).execute(
+        "SELECT collision_id, accepted_event_id, incoming_fingerprint "
+        "FROM main.task_fence_ingress_collisions"
+    ).fetchone()
+    assert collision[0] == caught.value.incident_id
+    assert collision[1] == accepted.event_id
+    assert len(collision[2]) == 64
+    db.close()
+
+
+def test_collision_retries_are_idempotent_and_distinct_payloads_append(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    accepted = db.accept_task_fence_ingress(
+        _envelope("explicit_note", "note-1", payload="accepted")
+    )
+    assert accepted.task_id is None
+
+    def collide(payload: str) -> str:
+        with pytest.raises(
+            TaskFenceIngressRejected,
+            match="source_event_id_collision",
+        ) as caught:
+            db.accept_task_fence_ingress(
+                _envelope("explicit_note", "note-1", payload=payload)
+            )
+        assert caught.value.incident_id is not None
+        return caught.value.incident_id
+
+    first_id = collide("different-a")
+    assert collide("different-a") == first_id
+    second_id = collide("different-b")
+
+    assert second_id != first_id
+    rows = _connection(db).execute(
+        "SELECT collision_order, collision_id, accepted_event_id, "
+        "incoming_fingerprint "
+        "FROM main.task_fence_ingress_collisions ORDER BY collision_order"
+    ).fetchall()
+    assert [row[0] for row in rows] == [1, 2]
+    assert [row[1] for row in rows] == [first_id, second_id]
+    conn = _connection(db)
+    for statement, params in (
+        (
+            "UPDATE main.task_fence_ingress_collisions "
+            "SET collision_id = 'changed' WHERE collision_order = 1",
+            (),
+        ),
+        (
+            "DELETE FROM main.task_fence_ingress_collisions "
+            "WHERE collision_order = 1",
+            (),
+        ),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute(statement, params)
+    for verb in ("INSERT OR REPLACE", "REPLACE"):
+        replacements = (
+            (
+                f"{verb} INTO main.task_fence_ingress_collisions ("
+                "collision_order, collision_id, accepted_event_id, "
+                "incoming_fingerprint, first_detected_at"
+                ") VALUES (1, 'replacement-order', ?, ?, 2.0)",
+                (accepted.event_id, "a" * 64),
+            ),
+            (
+                f"{verb} INTO main.task_fence_ingress_collisions ("
+                "collision_id, accepted_event_id, incoming_fingerprint, "
+                "first_detected_at) VALUES (?, ?, ?, 2.0)",
+                (first_id, accepted.event_id, "b" * 64),
+            ),
+            (
+                f"{verb} INTO main.task_fence_ingress_collisions ("
+                "collision_id, accepted_event_id, incoming_fingerprint, "
+                "first_detected_at) VALUES ('replacement-pair', ?, ?, 2.0)",
+                (accepted.event_id, rows[0][3]),
+            ),
+        )
+        for statement, params in replacements:
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                conn.execute(statement, params)
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_incidents",
+    ) == 0
+    db.close()
+
+
+def test_concurrent_identical_collisions_share_one_durable_incident(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    seed = SessionDB(path)
+    seed.accept_task_fence_ingress(
+        _envelope("explicit_note", "note-1", payload="accepted")
+    )
+    seed.close()
+    first = SessionDB(path)
+    second = SessionDB(path)
+    barrier = threading.Barrier(2)
+    collision = _envelope("explicit_note", "note-1", payload="different")
+
+    def collide(db: SessionDB) -> str:
+        barrier.wait(timeout=5)
+        with pytest.raises(TaskFenceIngressRejected) as caught:
+            db.accept_task_fence_ingress(collision)
+        assert caught.value.incident_id is not None
+        return caught.value.incident_id
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            collision_ids = tuple(pool.map(collide, (first, second)))
+    finally:
+        first.close()
+        second.close()
+
+    assert len(set(collision_ids)) == 1
+    verify = sqlite3.connect(path)
+    try:
+        assert _scalar(
+            verify,
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions",
+        ) == 1
+    finally:
+        verify.close()
+
+
+def test_collision_journal_failure_is_unavailable_without_authority_change(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    accepted = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "message-1", payload="accepted")
+    )
+    assert accepted.task_id is not None
+    conn = _connection(db)
+    conn.execute(
+        "CREATE TEMP TRIGGER fail_task_fence_collision "
+        "BEFORE INSERT ON main.task_fence_ingress_collisions BEGIN "
+        "SELECT RAISE(ABORT, 'injected collision failure'); END"
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="acceptance_database_error",
+    ):
+        db.accept_task_fence_ingress(
+            _envelope("initial_submit", "message-1", payload="different")
+        )
+
+    task = db.inspect_task_fence_task(accepted.task_id).task
+    assert task is not None
+    assert task.control_revision == 1
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_ingress_collisions",
+    ) == 0
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_ingress",
+    ) == 1
+    db.close()
+
+
+def test_missing_historical_snapshot_fails_closed_without_live_fallback(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    conn = _connection(db)
+    envelope = _envelope("explicit_note", "note-1")
+    conn.execute(
+        "INSERT INTO main.task_fence_ingress ("
+        "event_id, source, source_event_id, conversation_id, protocol_version, "
+        "origin, ingress_class, intent, execution, input_effect, "
+        "correlation_kind, payload_hash, accepted_at"
+        ") VALUES ('manual-event', ?, ?, ?, 1, 'human', 'advisory', 'keep', "
+        "'none', 'none', 'none', ?, 1.0)",
+        (
+            envelope.source,
+            envelope.source_event_id,
+            envelope.conversation_id,
+            envelope.payload_hash,
+        ),
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(envelope)
+
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_ingress_collisions",
+    ) == 0
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("task_conversation_id", sqlite3.Binary(b"not-text")),
+        ("task_conversation_id", "other-conversation"),
+        ("task_cohort_key", "invalid\x00cohort"),
+        ("task_cohort_key", "x" * 513),
+        ("task_updated_at", sqlite3.Binary(b"1.0")),
+        ("task_updated_at", float("inf")),
+    ),
+)
+def test_malformed_historical_projection_is_unavailable_before_collision(
+    tmp_path,
+    column,
+    value,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    envelope = _envelope("initial_submit", "message-1", payload="accepted")
+    accepted = db.accept_task_fence_ingress(envelope)
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_acceptance_snapshots_no_update",
+        statement=(
+            f"UPDATE main.task_fence_acceptance_snapshots SET {column} = ? "
+            "WHERE event_id = ?"
+        ),
+        params=(value, accepted.event_id),
+    )
+
+    for replay_envelope in (
+        envelope,
+        _envelope("initial_submit", "message-1", payload="different"),
+    ):
+        with pytest.raises(
+            TaskFenceIngressUnavailable,
+            match="incompatible_acceptance_projection",
+        ):
+            db.accept_task_fence_ingress(replay_envelope)
+
+    assert _scalar(
+        _connection(db),
+        "SELECT COUNT(*) FROM main.task_fence_ingress_collisions",
+    ) == 0
+    db.close()
+
+
+def test_historical_acceptance_rejects_blob_timestamp(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    envelope = _envelope("explicit_note", "note-blob-timestamp")
+    accepted = db.accept_task_fence_ingress(envelope)
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_ingress_no_update",
+        statement=(
+            "UPDATE main.task_fence_ingress SET accepted_at = ? "
+            "WHERE event_id = ?"
+        ),
+        params=(sqlite3.Binary(b"1.0"), accepted.event_id),
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(envelope)
+    db.close()
+
+
+def test_historical_pending_projection_rejects_cross_task_input(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    task_a_initial_envelope = replace(
+        _envelope("initial_submit", "a-initial"),
+        source="gateway:test:conversation-a",
+        conversation_id="conversation-a",
+    )
+    task_a = db.accept_task_fence_ingress(task_a_initial_envelope)
+    assert task_a.task_id is not None
+    task_a_pending = db.accept_task_fence_ingress(
+        replace(
+            _envelope("comment_hold", "a-pending", task_id=task_a.task_id),
+            source="gateway:test:conversation-a",
+            conversation_id="conversation-a",
+        )
+    )
+    task_b_initial_envelope = replace(
+        _envelope("initial_submit", "b-initial"),
+        source="gateway:test:conversation-b",
+        conversation_id="conversation-b",
+    )
+    task_b = db.accept_task_fence_ingress(task_b_initial_envelope)
+    assert task_b.task_id is not None
+    task_b_pending_envelope = replace(
+        _envelope("comment_hold", "b-pending", task_id=task_b.task_id),
+        source="gateway:test:conversation-b",
+        conversation_id="conversation-b",
+    )
+    task_b_pending = db.accept_task_fence_ingress(task_b_pending_envelope)
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_acceptance_pending_inputs_no_update",
+        statement=(
+            "UPDATE main.task_fence_acceptance_pending_inputs "
+            "SET input_event_id = ? WHERE event_id = ? AND ordinal = 0"
+        ),
+        params=(task_a_pending.event_id, task_b_pending.event_id),
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(task_b_pending_envelope)
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("snapshot_field", "foreign_id_kind"),
+    (
+        ("task_active_authority_event_id", "event"),
+        ("task_last_transition_event_id", "event"),
+        ("task_active_execution_run_id", "run"),
+        ("opened_run_id", "run"),
+        ("closed_run_id", "run"),
+    ),
+)
+def test_historical_projection_rejects_cross_task_authority_links(
+    tmp_path,
+    snapshot_field,
+    foreign_id_kind,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    task_a = db.accept_task_fence_ingress(
+        replace(
+            _envelope("initial_submit", "a-initial"),
+            source="gateway:test:conversation-a",
+            conversation_id="conversation-a",
+        )
+    )
+    task_b_envelope = replace(
+        _envelope("initial_submit", "b-initial"),
+        source="gateway:test:conversation-b",
+        conversation_id="conversation-b",
+    )
+    task_b = db.accept_task_fence_ingress(task_b_envelope)
+    assert task_a.opened_run_id is not None
+    foreign_id = (
+        task_a.event_id
+        if foreign_id_kind == "event"
+        else task_a.opened_run_id
+    )
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_acceptance_snapshots_no_update",
+        statement=(
+            "UPDATE main.task_fence_acceptance_snapshots "
+            f"SET {snapshot_field} = ? WHERE event_id = ?"
+        ),
+        params=(foreign_id, task_b.event_id),
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(task_b_envelope)
+    db.close()
+
+
+@pytest.mark.parametrize("corruption", ("paused_active", "older_active_run"))
+def test_historical_projection_rejects_impossible_run_shape(
+    tmp_path,
+    corruption,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "shape-initial")
+    )
+    assert initial.task_id is not None
+    assert initial.opened_run_id is not None
+    if corruption == "paused_active":
+        replay_envelope = _envelope("initial_submit", "shape-initial")
+        acceptance = initial
+        assignment = "task_status = 'paused'"
+        params = (acceptance.event_id,)
+    else:
+        replay_envelope = _envelope(
+            "change_and_run",
+            "shape-replacement",
+            task_id=initial.task_id,
+        )
+        acceptance = db.accept_task_fence_ingress(replay_envelope)
+        assignment = "task_active_execution_run_id = ?"
+        params = (initial.opened_run_id, acceptance.event_id)
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_acceptance_snapshots_no_update",
+        statement=(
+            "UPDATE main.task_fence_acceptance_snapshots "
+            f"SET {assignment} WHERE event_id = ?"
+        ),
+        params=params,
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(replay_envelope)
+    db.close()
+
+
+def test_historical_generation_must_match_active_run_and_counters(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "generation-initial")
+    )
+    assert initial.task_id is not None
+    assert initial.opened_run_id is not None
+    conn = _connection(db)
+    _seed_started_generation_and_permit(
+        conn,
+        task_id=initial.task_id,
+        run_id=initial.opened_run_id,
+        event_id=initial.event_id,
+    )
+    note_envelope = _envelope(
+        "explicit_note",
+        "generation-note",
+        task_id=initial.task_id,
+    )
+    note = db.accept_task_fence_ingress(note_envelope)
+    assert note.task_projection is not None
+    assert note.task_projection.current_generation_id == "generation-1"
+    conn.execute(
+        "INSERT INTO main.task_fence_model_generations ("
+        "generation_id, task_id, run_id, intent_epoch, control_revision, "
+        "runtime_epoch, input_manifest_hash, snapshot_event_id, state, "
+        "opened_at, closed_at"
+        ") VALUES ('generation-wrong-counters', ?, ?, 0, 0, 0, ?, ?, "
+        "'failed', 1.0, 2.0)",
+        (
+            initial.task_id,
+            initial.opened_run_id,
+            _hash("wrong-generation"),
+            initial.event_id,
+        ),
+    )
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_acceptance_snapshots_no_update",
+        statement=(
+            "UPDATE main.task_fence_acceptance_snapshots "
+            "SET task_current_generation_id = 'generation-wrong-counters' "
+            "WHERE event_id = ?"
+        ),
+        params=(note.event_id,),
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(note_envelope)
+    db.close()
+
+
+def test_historical_closed_run_must_close_on_acceptance_event(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "close-initial")
+    )
+    assert initial.task_id is not None
+    second = db.accept_task_fence_ingress(
+        _envelope("change_and_run", "close-second", task_id=initial.task_id)
+    )
+    third_envelope = _envelope(
+        "change_and_run",
+        "close-third",
+        task_id=initial.task_id,
+    )
+    third = db.accept_task_fence_ingress(third_envelope)
+    assert second.opened_run_id == third.closed_run_id
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_acceptance_snapshots_no_update",
+        statement=(
+            "UPDATE main.task_fence_acceptance_snapshots "
+            "SET closed_run_id = ? WHERE event_id = ?"
+        ),
+        params=(initial.opened_run_id, third.event_id),
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(third_envelope)
     db.close()
 
 
@@ -404,6 +1103,9 @@ def test_duplicate_acceptance_serializes_across_two_connections(tmp_path) -> Non
 
     assert {result.replayed for result in results} == {False, True}
     assert len({result.event_id for result in results}) == 1
+    accepted_result = next(result for result in results if not result.replayed)
+    replayed_result = next(result for result in results if result.replayed)
+    assert replayed_result == replace(accepted_result, replayed=True)
     verify = sqlite3.connect(path)
     try:
         assert _scalar(
@@ -474,7 +1176,10 @@ def test_distinct_replace_run_acceptances_have_one_serial_order(tmp_path) -> Non
         verify.close()
 
 
-@pytest.mark.parametrize("failure_stage", ["run_insert", "task_update"])
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["run_insert", "task_update", "snapshot_insert"],
+)
 def test_mid_transaction_sqlite_abort_rolls_back_every_authority_write(
     tmp_path,
     failure_stage: str,
@@ -484,6 +1189,7 @@ def test_mid_transaction_sqlite_abort_rolls_back_every_authority_write(
     operation, table = {
         "run_insert": ("INSERT", "task_fence_execution_runs"),
         "task_update": ("UPDATE", "task_fence_tasks"),
+        "snapshot_insert": ("INSERT", "task_fence_acceptance_snapshots"),
     }[failure_stage]
     conn.execute(
         "CREATE TEMP TRIGGER fail_task_fence_acceptance "
@@ -504,6 +1210,8 @@ def test_mid_transaction_sqlite_abort_rolls_back_every_authority_write(
         "task_fence_ingress",
         "task_fence_task_inputs",
         "task_fence_execution_runs",
+        "task_fence_acceptance_pending_inputs",
+        "task_fence_acceptance_snapshots",
     ):
         assert _scalar(
             conn,
@@ -572,6 +1280,55 @@ def test_existing_authority_rolls_back_on_late_projection_failure(tmp_path) -> N
     assert _scalar(
         conn,
         "SELECT COUNT(*) FROM main.task_fence_task_inputs",
+    ) == 1
+    db.close()
+
+
+def test_pending_snapshot_child_failure_rolls_back_existing_authority(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "message-1")
+    )
+    assert initial.task_id is not None
+    assert initial.opened_run_id is not None
+    conn = _connection(db)
+    conn.execute(
+        "CREATE TEMP TRIGGER fail_task_fence_pending_snapshot "
+        "BEFORE INSERT ON main.task_fence_acceptance_pending_inputs BEGIN "
+        "SELECT RAISE(ABORT, 'injected pending snapshot failure'); END"
+    )
+
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="acceptance_database_error",
+    ):
+        db.accept_task_fence_ingress(
+            _envelope("comment_hold", "message-2", task_id=initial.task_id)
+        )
+
+    task = db.inspect_task_fence_task(initial.task_id).task
+    assert task is not None
+    assert task.control_revision == 1
+    assert task.status == "running"
+    assert task.active_execution_run_id == initial.opened_run_id
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_ingress",
+    ) == 1
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_acceptance_snapshots",
+    ) == 1
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_acceptance_pending_inputs",
+    ) == 0
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM main.task_fence_execution_runs "
+        "WHERE state = 'open'",
     ) == 1
     db.close()
 
@@ -795,18 +1552,17 @@ def test_incident_resolution_requires_exact_attempts_and_evidence(tmp_path) -> N
         "SELECT COUNT(*) FROM main.task_fence_ingress",
     ) == 1
 
-    resolved = db.accept_task_fence_ingress(
-        _envelope(
-            "resolve_incident",
-            "message-2",
-            task_id=initial.task_id,
-            correlation_ids=("attempt-1",),
-            resolution_disposition=(
-                ResolutionDisposition.ACCEPTED_UNKNOWN_NO_RETRY
-            ),
-            evidence_refs=("operator:ticket-1",),
-        )
+    resolution_envelope = _envelope(
+        "resolve_incident",
+        "message-2",
+        task_id=initial.task_id,
+        correlation_ids=("attempt-1",),
+        resolution_disposition=(
+            ResolutionDisposition.ACCEPTED_UNKNOWN_NO_RETRY
+        ),
+        evidence_refs=("operator:ticket-1",),
     )
+    resolved = db.accept_task_fence_ingress(resolution_envelope)
 
     task = db.inspect_task_fence_task(initial.task_id).task
     assert task is not None
@@ -830,6 +1586,31 @@ def test_incident_resolution_requires_exact_attempts_and_evidence(tmp_path) -> N
         conn,
         "SELECT evidence_ref FROM main.task_fence_resolution_evidence",
     ) == "operator:ticket-1"
+    guarded_statements = (
+        "INSERT INTO main.task_fence_ingress_correlations "
+        f"VALUES ('{resolved.event_id}', 'attempt-late')",
+        "UPDATE main.task_fence_ingress_correlations "
+        "SET correlation_id = 'attempt-other' "
+        f"WHERE event_id = '{resolved.event_id}'",
+        "DELETE FROM main.task_fence_ingress_correlations "
+        f"WHERE event_id = '{resolved.event_id}'",
+        "INSERT OR REPLACE INTO main.task_fence_ingress_evidence "
+        f"VALUES ('{resolved.event_id}', 'operator:replacement')",
+        "UPDATE main.task_fence_resolution_evidence "
+        "SET evidence_ref = 'operator:replacement'",
+        "DELETE FROM main.task_fence_resolution_evidence",
+        "INSERT INTO main.task_fence_incident_evidence "
+        "VALUES ('incident-1', 'operator:late')",
+        "INSERT OR REPLACE INTO main.task_fence_incident_attempts "
+        "VALUES ('incident-1', 'attempt-1')",
+    )
+    for statement in guarded_statements:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute(statement)
+    assert db.accept_task_fence_ingress(resolution_envelope) == replace(
+        resolved,
+        replayed=True,
+    )
     db.close()
 
 
@@ -917,9 +1698,9 @@ def test_future_task_projection_rejects_without_mutation(tmp_path) -> None:
     assert initial.task_id is not None
     conn = _connection(db)
     conn.execute(
-        "UPDATE main.task_fence_tasks SET store_schema_version = 2 "
+        "UPDATE main.task_fence_tasks SET store_schema_version = ? "
         "WHERE task_id = ?",
-        (initial.task_id,),
+        (TASK_FENCE_STORE_SCHEMA_VERSION + 1, initial.task_id),
     )
 
     with pytest.raises(
@@ -935,7 +1716,11 @@ def test_future_task_projection_rejects_without_mutation(tmp_path) -> None:
         "FROM main.task_fence_tasks WHERE task_id = ?",
         (initial.task_id,),
     ).fetchone()
-    assert tuple(row) == (2, 1, "running")
+    assert tuple(row) == (
+        TASK_FENCE_STORE_SCHEMA_VERSION + 1,
+        1,
+        "running",
+    )
     assert _scalar(
         conn,
         "SELECT COUNT(*) FROM main.task_fence_ingress",
@@ -1055,11 +1840,23 @@ def test_incompatible_read_only_and_closed_stores_never_accept(tmp_path) -> None
 
 def test_raw_payload_is_never_persisted_in_task_fence_namespace(tmp_path) -> None:
     secret = "do-not-store-this-private-prompt"
+    rejected_reference = "do-not-store-this-rejected-private-reference"
     path = tmp_path / "state.db"
     db = SessionDB(path)
-    db.accept_task_fence_ingress(
+    accepted = db.accept_task_fence_ingress(
         _envelope("initial_submit", "message-1", payload=secret)
     )
+    with pytest.raises(TaskFenceIngressRejected):
+        db.accept_task_fence_ingress(
+            IngressEnvelope(
+                source="gateway:test:conversation-1",
+                source_event_id="message-1",
+                conversation_id="conversation-1",
+                task_id=accepted.task_id,
+                action=TASK_FENCE_ACTIONS["initial_submit"],
+                opaque_payload_ref=rejected_reference,
+            )
+        )
     db.close()
 
     conn = sqlite3.connect(path)
@@ -1072,4 +1869,5 @@ def test_raw_payload_is_never_persisted_in_task_fence_namespace(tmp_path) -> Non
     finally:
         conn.close()
     assert secret not in dump
+    assert rejected_reference not in dump
     assert _hash(secret) in dump

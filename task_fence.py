@@ -326,18 +326,36 @@ class IngressEnvelope:
 
 
 @dataclass(frozen=True)
-class IngressAcceptance:
-    """Stable durable identity returned after the acceptance commit.
+class TaskFenceTaskControl:
+    """Immutable scalar task projection captured by one acceptance."""
 
-    Mutable task/input projections are intentionally inspected separately.
-    Schema v1 does not store historical projection snapshots, so returning
-    them here would make a later idempotent replay appear to return the
-    original state when it actually observed a newer one.
-    """
+    task_id: str
+    conversation_id: str
+    cohort_key: str | None
+    store_schema_version: int
+    control_protocol_version: int
+    intent_epoch: int
+    control_revision: int
+    status: str
+    active_authority_event_id: str | None
+    active_execution_run_id: str | None
+    current_generation_id: str | None
+    current_runtime_epoch: int
+    last_accepted_order: int
+    last_transition_event_id: str | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class IngressAcceptance:
+    """Exact historical result returned after the acceptance commit."""
 
     event_id: str
     accepted_order: int
     task_id: str | None
+    task_projection: TaskFenceTaskControl | None
+    pending_input_ids: tuple[str, ...]
     replayed: bool
     opened_run_id: str | None
     closed_run_id: str | None
