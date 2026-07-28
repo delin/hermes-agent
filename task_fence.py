@@ -326,6 +326,83 @@ class IngressEnvelope:
 
 
 @dataclass(frozen=True)
+class TaskFenceIngressSidecar:
+    """Secret-free typed authority attached by a trusted ingress adapter.
+
+    ``active_lane_action`` lets an adapter state both closed protocol actions
+    for a plain message without consulting mutable runtime state itself.  The
+    durable writer selects between them under the same SQLite write lock that
+    accepts the event.  Redelivery reuses the already-recorded action before
+    checking the full envelope fingerprint.
+    """
+
+    source: str
+    source_event_id: str
+    action: TaskFenceAction
+    payload_hash: str | None = None
+    opaque_payload_ref: str | None = None
+    active_lane_action: TaskFenceAction | None = None
+    protocol_version: int = CONTROL_PROTOCOL_VERSION
+    correlation_ids: tuple[str, ...] = ()
+    resolution_disposition: ResolutionDisposition | None = None
+    evidence_refs: tuple[str, ...] = ()
+    terminal_reason: TerminalReason | None = None
+    source_sequence: int | None = None
+    causal_parent_generation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "correlation_ids",
+            _canonical_refs(
+                self.correlation_ids,
+                field="correlation_ids",
+                max_items=_MAX_CORRELATION_IDS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _canonical_refs(
+                self.evidence_refs,
+                field="evidence_refs",
+                max_items=_MAX_EVIDENCE_REFS,
+            ),
+        )
+        for candidate in (self.action, self.active_lane_action):
+            if candidate is None:
+                continue
+            self.to_envelope(
+                conversation_id="task-fence-sidecar-validation",
+                action=candidate,
+            )
+
+    def to_envelope(
+        self,
+        *,
+        conversation_id: str,
+        action: TaskFenceAction | None = None,
+    ) -> IngressEnvelope:
+        """Bind adapter authority to one canonical gateway conversation."""
+
+        return IngressEnvelope(
+            source=self.source,
+            source_event_id=self.source_event_id,
+            conversation_id=conversation_id,
+            action=self.action if action is None else action,
+            payload_hash=self.payload_hash,
+            opaque_payload_ref=self.opaque_payload_ref,
+            protocol_version=self.protocol_version,
+            correlation_ids=self.correlation_ids,
+            resolution_disposition=self.resolution_disposition,
+            evidence_refs=self.evidence_refs,
+            terminal_reason=self.terminal_reason,
+            source_sequence=self.source_sequence,
+            causal_parent_generation_id=self.causal_parent_generation_id,
+        )
+
+
+@dataclass(frozen=True)
 class TaskFenceTaskControl:
     """Immutable scalar task projection captured by one acceptance."""
 

@@ -54,9 +54,11 @@ from gateway.platforms.base import (
     is_host_excluded_by_no_proxy,
     resolve_proxy_url,
     safe_url_for_log,
+    task_fence_sidecar_for_human_message,
     _ssrf_redirect_guard,
     cache_document_from_bytes,
     cache_video_from_bytes,
+    coerce_plaintext_gateway_command,
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
@@ -5631,6 +5633,7 @@ class SlackAdapter(BasePlatformAdapter):
                     team_id=team_id,
                 )
             if sender_is_bot_user:
+                sender_is_bot = True
                 allow_bots = self._slack_allow_bots()
                 if allow_bots == "none":
                     return
@@ -6210,7 +6213,7 @@ class SlackAdapter(BasePlatformAdapter):
             # subtype=bot_message with user=None; flag them so the
             # gateway SLACK_ALLOW_BOTS bypass can authorize them
             # (they carry no user_id to match against the allowlist).
-            is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
+            is_bot=sender_is_bot,
         )
 
         # Per-channel ephemeral prompt
@@ -6327,6 +6330,26 @@ class SlackAdapter(BasePlatformAdapter):
             msg_event.text = (
                 f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
                 f"{msg_event.text}"
+            )
+
+        if ts and not (
+            event.get("_hermes_force_process")
+            or event.get("_hermes_reaction")
+        ):
+            # BasePlatformAdapter repeats this idempotently. Classify only
+            # after the same plaintext-command normalization that legacy
+            # dispatch sees, so an excluded admin command cannot gain task
+            # authority as ordinary text.
+            coerce_plaintext_gateway_command(msg_event)
+            msg_event.task_fence_ingress = task_fence_sidecar_for_human_message(
+                msg_event,
+                source="gateway:slack",
+                source_event_id=(
+                    f"event:{team_id or '-'}:{channel_id}:{event_ts or ts}"
+                ),
+                payload_text=(
+                    command_probe_text if is_command_text else original_text
+                ),
             )
 
         if ts:
@@ -7734,6 +7757,15 @@ class SlackAdapter(BasePlatformAdapter):
             source=source,
             raw_message=command,
         )
+        trigger_id = command.get("trigger_id")
+        if trigger_id:
+            event.task_fence_ingress = task_fence_sidecar_for_human_message(
+                event,
+                source="gateway:slack",
+                source_event_id=(
+                    f"command:{team_id or '-'}:{channel_id}:{trigger_id}"
+                ),
+            )
 
         # Stash the Slack response_url so the first reply for this
         # channel+user can be routed ephemerally (replaces the initial

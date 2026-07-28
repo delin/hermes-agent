@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import logging
@@ -514,6 +515,13 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+from task_fence import (
+    IngressAcceptance,
+    TASK_FENCE_ACTIONS,
+    TaskFenceIngressSidecar,
+    TaskFenceProtocolRejected,
+    TerminalReason,
+)
 
 
 GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
@@ -1964,6 +1972,15 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Trusted, secret-free authority emitted by a supported adapter. The
+    # runner binds it to the canonical session key and durably accepts it
+    # before any adapter queue, acknowledgement, typing hook, or agent start.
+    # ``task_fence_acceptance`` is process-local replay state only; durable
+    # authority remains in state.db.
+    task_fence_ingress: Optional[TaskFenceIngressSidecar] = None
+    task_fence_acceptance: Optional[IngressAcceptance] = None
+    task_fence_acceptance_attempted: bool = False
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins
@@ -2003,6 +2020,73 @@ class MessageEvent:
         # iOS auto-corrects -- to — (em dash) and - to – (en dash)
         args = args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
         return args
+
+
+def task_fence_sidecar_for_human_message(
+    event: MessageEvent,
+    *,
+    source: str,
+    source_event_id: str,
+    payload_text: Optional[str] = None,
+) -> Optional[TaskFenceIngressSidecar]:
+    """Classify one adapter event without model or free-form text inference.
+
+    The first live lane intentionally supports only plain text plus the exact
+    session-closing commands. Existing approval, clarify, ``/resume``, media,
+    and other command paths remain outside this shadow increment.
+    """
+
+    if (
+        event.internal
+        or getattr(event.source, "is_bot", False)
+        or event.prompt_response is not None
+        or event.media_urls
+        or event.media_types
+        or not source_event_id
+    ):
+        return None
+
+    command = event.get_command()
+    terminal_reason = None
+    active_lane_action = None
+    if command == "stop":
+        action = TASK_FENCE_ACTIONS["stop"]
+        terminal_reason = TerminalReason.STOPPED
+    elif command in {"new", "reset"}:
+        action = TASK_FENCE_ACTIONS["stop"]
+        terminal_reason = TerminalReason.CANCELLED
+    elif command is not None:
+        return None
+    elif event.message_type is MessageType.TEXT:
+        action = TASK_FENCE_ACTIONS["initial_submit"]
+        active_lane_action = TASK_FENCE_ACTIONS["comment_hold"]
+    else:
+        return None
+
+    try:
+        message_type = getattr(
+            event.message_type,
+            "value",
+            str(event.message_type),
+        )
+        canonical_text = event.text if payload_text is None else payload_text
+        payload_hash = hashlib.sha256(
+            f"{message_type}\x00{canonical_text or ''}".encode("utf-8")
+        ).hexdigest()
+        return TaskFenceIngressSidecar(
+            source=source,
+            source_event_id=source_event_id,
+            action=action,
+            active_lane_action=active_lane_action,
+            payload_hash=payload_hash,
+            terminal_reason=terminal_reason,
+        )
+    except (TaskFenceProtocolRejected, UnicodeEncodeError):
+        # Adapter metadata is untrusted until the typed value validates. In
+        # shadow mode malformed metadata excludes only this observation; it
+        # must never suppress the existing gateway delivery path.
+        logger.warning("Task Fence shadow sidecar omitted: invalid adapter metadata")
+        return None
 
 
 @dataclass
@@ -2652,6 +2736,9 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._task_fence_ingress_handler: Optional[
+            Callable[[MessageEvent, str], Awaitable[None]]
+        ] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3166,6 +3253,14 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_task_fence_ingress_handler(
+        self,
+        handler: Optional[Callable[[MessageEvent, str], Awaitable[None]]],
+    ) -> None:
+        """Install the default-off durable pre-dispatch acceptance hook."""
+
+        self._task_fence_ingress_handler = handler
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -5160,6 +5255,22 @@ class BasePlatformAdapter(ABC):
         # this is the split-brain tail described in issue #11016.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
+
+        # This optional hook is the only common boundary that dominates both
+        # the adapter busy queue/bypass paths and cold-path typing/start hooks.
+        # Audit is observation-only: an unavailable/rejected shadow write is
+        # logged by the runner but the legacy outcome remains unchanged.
+        task_fence_handler = getattr(self, "_task_fence_ingress_handler", None)
+        if task_fence_handler is not None:
+            try:
+                await task_fence_handler(event, session_key)
+            except Exception:
+                logger.warning(
+                    "[%s] Task Fence shadow ingress hook failed open for %s",
+                    self.name,
+                    session_key,
+                    exc_info=True,
+                )
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:

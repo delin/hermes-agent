@@ -3147,6 +3147,12 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Experimental, default-off Task Fence shadow ingress lane. This is
+        # one exact build_session_key() value, not a wildcard or mode switch.
+        "task_fence": {
+            "shadow_session_key": "",
+        },
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

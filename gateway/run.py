@@ -6135,6 +6135,151 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    async def _accept_task_fence_gateway_ingress(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> None:
+        """Accept one lane before queue, ack, typing, or legacy dispatch.
+
+        The empty config value and every non-matching session return without a
+        database call. The first bounded lane is the default-profile Slack
+        adapter; internal and currently unsupported command/answer paths keep
+        their legacy behavior and are not part of a coverage claim.
+        """
+
+        configured_key = getattr(
+            getattr(self, "config", None),
+            "task_fence_shadow_session_key",
+            "",
+        )
+        if not configured_key:
+            return
+        sidecar = getattr(event, "task_fence_ingress", None)
+        if sidecar is None or getattr(event, "internal", False):
+            return
+        if getattr(event, "task_fence_acceptance", None) is not None:
+            return
+        if getattr(event, "task_fence_acceptance_attempted", False):
+            return
+
+        source = getattr(event, "source", None)
+        if (
+            getattr(source, "platform", None) is not Platform.SLACK
+            or sidecar.source != "gateway:slack"
+        ):
+            return
+        # Multiplexed secondary profiles own distinct HERMES_HOME stores, but
+        # this first callback runs on the primary runner's AsyncSessionDB.
+        # Keep them explicitly out until a profile-scoped store binding exists.
+        if getattr(source, "profile", None) not in {None, "", "default"}:
+            return
+
+        # One candidate event gets one audit attempt. Set this before any
+        # dynamic session/auth lookup so an exception or concurrent pairing
+        # change cannot turn a later post-start retry into an acceptance.
+        event.task_fence_acceptance_attempted = True
+
+        canonical_key = self._session_key_for_source(source)
+        if canonical_key != configured_key:
+            return
+        if not self._is_user_authorized(source):
+            return
+
+        from task_fence import ExecutionEffect
+
+        if (
+            sidecar.action.execution is not ExecutionEffect.TERMINATE
+            and self._task_fence_uncorrelated_prompt_pending(canonical_key)
+        ):
+            logger.debug(
+                "Task Fence shadow ingress excluded for pending uncorrelated "
+                "prompt response in %s",
+                canonical_key,
+            )
+            return
+
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            logger.warning(
+                "Task Fence shadow ingress unavailable for %s: no SessionDB",
+                canonical_key,
+            )
+            return
+        try:
+            acceptance = await session_db.accept_task_fence_ingress_sidecar(
+                sidecar,
+                conversation_id=canonical_key,
+            )
+        except Exception as exc:
+            from task_fence import (
+                TaskFenceIngressRejected,
+                TaskFenceIngressUnavailable,
+                TaskFenceProtocolRejected,
+            )
+
+            if isinstance(
+                exc,
+                (
+                    TaskFenceIngressRejected,
+                    TaskFenceIngressUnavailable,
+                    TaskFenceProtocolRejected,
+                ),
+            ):
+                reason = getattr(exc, "reason", type(exc).__name__)
+                logger.warning(
+                    "Task Fence shadow ingress rejected for %s (%s/%s): %s",
+                    canonical_key,
+                    sidecar.source,
+                    sidecar.source_event_id,
+                    reason,
+                )
+            else:
+                logger.exception(
+                    "Task Fence shadow ingress failed open for %s (%s/%s)",
+                    canonical_key,
+                    sidecar.source,
+                    sidecar.source_event_id,
+                )
+            return
+
+        event.task_fence_acceptance = acceptance
+        logger.debug(
+            "Task Fence shadow ingress accepted for %s: event=%s task=%s replayed=%s",
+            canonical_key,
+            acceptance.event_id,
+            acceptance.task_id,
+            acceptance.replayed,
+        )
+
+    def _task_fence_uncorrelated_prompt_pending(self, session_key: str) -> bool:
+        """Conservatively exclude prompt answers until exact correlation exists."""
+
+        update_prompts = getattr(self, "_update_prompt_pending", {})
+        if isinstance(update_prompts, dict) and update_prompts.get(session_key):
+            return True
+        try:
+            from tools.approval import has_blocking_approval
+
+            if has_blocking_approval(session_key):
+                return True
+            from tools import clarify_gateway, slash_confirm
+
+            if clarify_gateway.get_pending_for_session(
+                session_key,
+                include_choice_prompts=True,
+            ) is not None:
+                return True
+            return slash_confirm.get_pending(session_key) is not None
+        except Exception:
+            logger.warning(
+                "Task Fence shadow prompt-state probe failed for %s; "
+                "excluding uncorrelated input",
+                session_key,
+                exc_info=True,
+            )
+            return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -8333,6 +8478,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            _set_task_fence = getattr(
+                adapter, "set_task_fence_ingress_handler", None
+            )
+            if callable(_set_task_fence):
+                _set_task_fence(self._accept_task_fence_gateway_ingress)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
@@ -9412,6 +9562,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    _set_task_fence = getattr(
+                        adapter, "set_task_fence_ingress_handler", None
+                    )
+                    if callable(_set_task_fence):
+                        _set_task_fence(self._accept_task_fence_gateway_ingress)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
@@ -10963,6 +11118,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
+            await self._accept_task_fence_gateway_ingress(
+                event,
+                self._session_key_for_source(source),
+            )
             self._queue_startup_restore_event(event)
             return None
 
@@ -11078,6 +11237,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        await self._accept_task_fence_gateway_ingress(event, _quick_key)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()

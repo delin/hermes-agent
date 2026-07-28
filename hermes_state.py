@@ -52,9 +52,14 @@ from task_fence import (
     IngressEnvelope,
     InputEffect,
     IntentEffect,
+    Origin,
+    TaskFenceAction,
+    TaskFenceIngressSidecar,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
+    TaskFenceProtocolRejected,
     TaskFenceTaskControl,
+    validate_action,
     validate_ingress_envelope,
 )
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
@@ -6031,6 +6036,109 @@ class SessionDB:
                     envelope,
                 )
             )
+        except sqlite3.OperationalError as exc:
+            raise TaskFenceIngressUnavailable(
+                "acceptance_unavailable"
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            raise TaskFenceIngressUnavailable(
+                "acceptance_database_error"
+            ) from exc
+        if isinstance(result, _TaskFenceIngressFailure):
+            if result.unavailable:
+                raise TaskFenceIngressUnavailable(result.reason)
+            raise TaskFenceIngressRejected(
+                result.reason,
+                incident_id=result.incident_id,
+            )
+        return result
+
+    def accept_task_fence_ingress_sidecar(
+        self,
+        sidecar: TaskFenceIngressSidecar,
+        *,
+        conversation_id: str,
+    ) -> IngressAcceptance:
+        """Resolve and accept one adapter sidecar under a single write lock.
+
+        A plain adapter message may state distinct empty-lane and active-lane
+        actions. Selection must happen in the acceptance transaction: a
+        pre-lock read races concurrent messages, while redelivery after the
+        first commit must reuse the recorded action rather than reclassify the
+        same source event against newer lane state.
+        """
+
+        if not isinstance(sidecar, TaskFenceIngressSidecar):
+            raise TaskFenceProtocolRejected("invalid_ingress_sidecar_type")
+        if self.read_only:
+            raise TaskFenceIngressUnavailable("read_only_store")
+        if self._conn is None:
+            raise TaskFenceIngressUnavailable("closed_store")
+
+        def _accept(conn: sqlite3.Connection):
+            selected_action = sidecar.action
+            existing = conn.execute(
+                "SELECT origin, ingress_class, intent, execution, "
+                "input_effect, correlation_kind "
+                "FROM main.task_fence_ingress "
+                "WHERE source = ? AND source_event_id = ?",
+                (sidecar.source, sidecar.source_event_id),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    recorded_action = TaskFenceAction(
+                        origin=Origin(existing["origin"]),
+                        ingress_class=IngressClass(existing["ingress_class"]),
+                        intent=IntentEffect(existing["intent"]),
+                        execution=ExecutionEffect(existing["execution"]),
+                        input_effect=InputEffect(existing["input_effect"]),
+                        correlation_kind=CorrelationKind(
+                            existing["correlation_kind"]
+                        ),
+                    )
+                    validate_action(recorded_action)
+                except (TypeError, ValueError, TaskFenceProtocolRejected):
+                    return _TaskFenceIngressFailure(
+                        "incompatible_acceptance_projection",
+                        unavailable=True,
+                    )
+                # Lane state may change between delivery and redelivery, so an
+                # action already offered by this sidecar must keep its recorded
+                # choice. A different incoming action is a real immutable
+                # source-event collision and must reach the fingerprint path.
+                if recorded_action in {
+                    sidecar.action,
+                    sidecar.active_lane_action,
+                }:
+                    selected_action = recorded_action
+            elif sidecar.active_lane_action is not None:
+                active = conn.execute(
+                    "SELECT 1 FROM main.task_fence_tasks "
+                    "WHERE conversation_id = ? "
+                    "AND status NOT IN ('stopped', 'done') LIMIT 1",
+                    (conversation_id,),
+                ).fetchone()
+                if active is not None:
+                    selected_action = sidecar.active_lane_action
+
+            try:
+                envelope = sidecar.to_envelope(
+                    conversation_id=conversation_id,
+                    action=selected_action,
+                )
+            except TaskFenceProtocolRejected:
+                # A source-event collision can change action-specific fields
+                # (for example stop versus task input). Let the ordinary
+                # fingerprint path journal that mismatch instead of turning it
+                # into an untracked pre-acceptance protocol error.
+                envelope = sidecar.to_envelope(
+                    conversation_id=conversation_id,
+                    action=sidecar.action,
+                )
+            return self._accept_task_fence_ingress_unlocked(conn, envelope)
+
+        try:
+            result = self._execute_write(_accept)
         except sqlite3.OperationalError as exc:
             raise TaskFenceIngressUnavailable(
                 "acceptance_unavailable"

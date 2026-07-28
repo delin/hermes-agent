@@ -22,9 +22,10 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 import pytest
 
 import agent.secret_scope as secret_scope
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.platforms.base import (
+    BasePlatformAdapter,
     MessageEvent,
     MessageType,
     SendResult,
@@ -32,6 +33,9 @@ from gateway.platforms.base import (
     SendResult,
     is_host_excluded_by_no_proxy,
 )
+from gateway.session import build_session_key
+from hermes_state import AsyncSessionDB, SessionDB
+from task_fence import TASK_FENCE_ACTIONS, TerminalReason
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +383,247 @@ class TestSlashCommandSessionIsolation:
         await adapter._handle_slash_command(command)
 
         adapter.handle_message.assert_not_awaited()
+
+
+class TestTaskFenceIngressSidecar:
+    @pytest.mark.asyncio
+    async def test_raw_dm_accepts_durably_before_real_adapter_handler(
+        self,
+        adapter,
+        tmp_path,
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        ts = "1700000000.123455"
+        source = adapter.build_source(
+            chat_id="D123",
+            chat_type="dm",
+            user_id="U123",
+            thread_id=ts,
+            scope_id="T123",
+        )
+        session_key = build_session_key(source)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="test")
+            },
+            task_fence_shadow_session_key=session_key,
+        )
+        runner._session_db = AsyncSessionDB(db)
+        runner._update_prompt_pending = {}
+        runner._is_user_authorized = lambda _source: True
+        adapter.handle_message = BasePlatformAdapter.handle_message.__get__(
+            adapter,
+            type(adapter),
+        )
+        adapter.set_task_fence_ingress_handler(
+            runner._accept_task_fence_gateway_ingress
+        )
+        handled = asyncio.Event()
+        observation = None
+
+        async def handler(event):
+            nonlocal observation
+            with db._lock:
+                observation = db._conn.execute(
+                    "SELECT COUNT(*), MIN(intent), MIN(execution) "
+                    "FROM task_fence_ingress"
+                ).fetchone()
+            handled.set()
+            return None
+
+        adapter.set_message_handler(handler)
+        try:
+            await adapter._handle_slack_message(
+                {
+                    "text": "real adapter path",
+                    "user": "U123",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "ts": ts,
+                },
+                {"team_id": "T123"},
+            )
+            await asyncio.wait_for(handled.wait(), timeout=1)
+            await adapter.cancel_background_tasks()
+        finally:
+            db.close()
+
+        assert tuple(observation) == (1, "replace", "run")
+
+    @pytest.mark.asyncio
+    async def test_plain_dm_emits_typed_secret_free_sidecar(self, adapter):
+        await adapter._handle_slack_message(
+            {
+                "text": "start the bounded task",
+                "user": "U123",
+                "channel": "D123",
+                "channel_type": "im",
+                "ts": "1700000000.123456",
+            },
+            {"team_id": "T123"},
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        sidecar = event.task_fence_ingress
+        assert sidecar is not None
+        assert sidecar.source == "gateway:slack"
+        assert sidecar.source_event_id == (
+            "event:T123:D123:1700000000.123456"
+        )
+        assert sidecar.action == TASK_FENCE_ACTIONS["initial_submit"]
+        assert sidecar.active_lane_action == TASK_FENCE_ACTIONS["comment_hold"]
+        assert len(sidecar.payload_hash or "") == 64
+        assert "start the bounded task" not in repr(sidecar)
+
+    @pytest.mark.asyncio
+    async def test_native_stop_emits_typed_terminal_sidecar(self, adapter):
+        await adapter._handle_slash_command(
+            {
+                "command": "/stop",
+                "text": "",
+                "user_id": "U123",
+                "channel_id": "D123",
+                "team_id": "T123",
+                "trigger_id": "trigger-123",
+            }
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        sidecar = event.task_fence_ingress
+        assert sidecar is not None
+        assert sidecar.source_event_id == "command:T123:D123:trigger-123"
+        assert sidecar.action == TASK_FENCE_ACTIONS["stop"]
+        assert sidecar.terminal_reason is TerminalReason.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_plaintext_admin_command_is_excluded_after_normalization(
+        self,
+        adapter,
+    ):
+        await adapter._handle_slack_message(
+            {
+                "text": "restart gateway",
+                "user": "U123",
+                "channel": "D123",
+                "channel_type": "im",
+                "ts": "1700000000.123457",
+            },
+            {"team_id": "T123"},
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/restart"
+        assert event.task_fence_ingress is None
+
+    @pytest.mark.asyncio
+    async def test_bot_authored_message_never_emits_human_sidecar(self, adapter):
+        adapter.config.extra["allow_bots"] = "all"
+        await adapter._handle_slack_message(
+            {
+                "text": "peer automation",
+                "user": "U_PEER_BOT",
+                "bot_id": "B_PEER",
+                "subtype": "bot_message",
+                "channel": "D123",
+                "channel_type": "im",
+                "ts": "1700000000.123458",
+            },
+            {"team_id": "T123"},
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.is_bot is True
+        assert event.task_fence_ingress is None
+
+    @pytest.mark.asyncio
+    async def test_reaction_handoff_never_emits_human_sidecar(self, adapter):
+        await adapter._handle_slack_message(
+            {
+                "text": "synthetic reaction handoff",
+                "user": "U123",
+                "channel": "D123",
+                "channel_type": "im",
+                "ts": "1700000000.123459",
+                "_hermes_force_process": True,
+                "_hermes_reaction": {"name": "eyes"},
+            },
+            {"team_id": "T123"},
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.task_fence_ingress is None
+
+    @pytest.mark.asyncio
+    async def test_edit_after_restart_uses_changed_delivery_identity(self, adapter):
+        await adapter._handle_slack_message(
+            {
+                "text": "original",
+                "user": "U123",
+                "channel": "D123",
+                "channel_type": "im",
+                "ts": "1700000000.123460",
+            },
+            {"team_id": "T123"},
+        )
+        original = adapter.handle_message.await_args.args[0]
+        adapter.handle_message.reset_mock()
+        adapter._processed_message_ts.clear()
+
+        await adapter._handle_slack_message(
+            {
+                "subtype": "message_changed",
+                "channel": "D123",
+                "channel_type": "im",
+                "event_ts": "1700000001.123460",
+                "message": {
+                    "text": "edited after restart",
+                    "user": "U123",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "ts": "1700000000.123460",
+                    "edited": {"ts": "1700000001.123460"},
+                },
+            },
+            {"team_id": "T123"},
+        )
+
+        edited = adapter.handle_message.await_args.args[0]
+        assert original.task_fence_ingress.source_event_id == (
+            "event:T123:D123:1700000000.123460"
+        )
+        assert edited.task_fence_ingress.source_event_id == (
+            "event:T123:D123:1700000001.123460"
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_hash_ignores_mutable_app_context_enrichment(
+        self,
+        adapter,
+    ):
+        adapter._agent_view_context_for_event = MagicMock(
+            side_effect=[{}, {"context_channel_id": "C_OTHER"}]
+        )
+        for ts in ("1700000000.123461", "1700000000.123462"):
+            await adapter._handle_slack_message(
+                {
+                    "text": "same authored text",
+                    "user": "U123",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "ts": ts,
+                },
+                {"team_id": "T123"},
+            )
+
+        first, second = (
+            call.args[0]
+            for call in adapter.handle_message.await_args_list
+        )
+        assert second.text.startswith("[Slack app context:")
+        assert first.task_fence_ingress.payload_hash == (
+            second.task_fence_ingress.payload_hash
+        )
 
 
 class TestSlackWorkspaceCollisionIsolation:
@@ -3413,6 +3658,8 @@ class TestMessageRouting:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "please answer exactly BOT_OK"
         assert msg_event.source.user_name == "AIDx Engineer"
+        assert msg_event.source.is_bot is True
+        assert msg_event.task_fence_ingress is None
 
     @pytest.mark.asyncio
     async def test_app_authored_messages_without_client_msg_id_are_ignored(self, adapter):

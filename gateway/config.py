@@ -37,6 +37,32 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return is_truthy_value(value, default=default)
 
 
+def _coerce_task_fence_shadow_session_key(value: Any) -> str:
+    """Return one exact bounded gateway lane key or the disabled value."""
+
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        logger.warning(
+            "Ignoring invalid gateway.task_fence.shadow_session_key "
+            "(expected one exact session key, got %s)",
+            type(value).__name__,
+        )
+        return ""
+    session_key = value.strip()
+    if (
+        not session_key
+        or "\x00" in session_key
+        or len(session_key.encode("utf-8")) > 512
+    ):
+        logger.warning(
+            "Ignoring invalid gateway.task_fence.shadow_session_key "
+            "(empty, NUL-containing, or larger than 512 bytes)"
+        )
+        return ""
+    return session_key
+
+
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
 # override. Anything not in either set — and a blank/whitespace value — is
 # treated as "unset" so it falls through to config.yaml rather than silently
@@ -926,6 +952,12 @@ class GatewayConfig:
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
 
+    # One exact, startup-latched gateway session lane may opt into Task Fence
+    # durable ingress acceptance. Empty is intentionally the only default:
+    # this Work Package is shadow-only and does not claim platform-wide
+    # coverage or add a wildcard activation surface.
+    task_fence_shadow_session_key: str = ""
+
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
     systemd_watchdog_seconds: int = 0
@@ -958,6 +990,11 @@ class GatewayConfig:
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
+        )
+        self.task_fence_shadow_session_key = (
+            _coerce_task_fence_shadow_session_key(
+                self.task_fence_shadow_session_key
+            )
         )
 
     def get_connected_platforms(self) -> List[Platform]:
@@ -1070,6 +1107,9 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
+            "task_fence": {
+                "shadow_session_key": self.task_fence_shadow_session_key,
+            },
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1134,6 +1174,18 @@ class GatewayConfig:
         thread_sessions_per_user = data.get("thread_sessions_per_user")
         multiplex_profiles = data.get("multiplex_profiles")
         nested_gateway = data.get("gateway") if isinstance(data.get("gateway"), dict) else {}
+        if "task_fence" in data:
+            task_fence = data.get("task_fence")
+        else:
+            task_fence = nested_gateway.get("task_fence")
+        if not isinstance(task_fence, dict):
+            task_fence = {}
+        task_fence_shadow_session_key = _coerce_task_fence_shadow_session_key(
+            data.get(
+                "task_fence_shadow_session_key",
+                task_fence.get("shadow_session_key"),
+            )
+        )
         if "systemd_watchdog_seconds" in data:
             systemd_watchdog_raw = data.get("systemd_watchdog_seconds")
             systemd_watchdog_key = "systemd_watchdog_seconds"
@@ -1207,6 +1259,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            task_fence_shadow_session_key=task_fence_shadow_session_key,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
@@ -1272,6 +1325,11 @@ def load_gateway_config() -> GatewayConfig:
             )
         except Exception as e:
             logger.warning("Failed to load %s: %s", gateway_json_path, e)
+
+    # Task Fence is a new config.yaml-only surface. Never let an unrelated or
+    # stale legacy gateway.json silently activate the shadow lane.
+    gw_data.pop("task_fence", None)
+    gw_data.pop("task_fence_shadow_session_key", None)
 
     # Primary source: config.yaml
     try:
@@ -1360,6 +1418,17 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["profile_routes"] = _pr
 
             if isinstance(gateway_section, dict):
+                if "task_fence" in gateway_section:
+                    task_fence_cfg = gateway_section.get("task_fence")
+                    if isinstance(task_fence_cfg, dict):
+                        gw_data["task_fence"] = task_fence_cfg
+                    else:
+                        logger.warning(
+                            "Ignoring invalid gateway.task_fence in "
+                            "config.yaml (expected mapping, got %s)",
+                            type(task_fence_cfg).__name__,
+                        )
+                        gw_data["task_fence"] = {}
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
