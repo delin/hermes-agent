@@ -11,43 +11,20 @@ from enum import Enum
 
 import pytest
 
-
-class IngressClass(str, Enum):
-    TASK_INPUT = "task_input"
-    CONTROL = "control"
-    ADVISORY = "advisory"
-    SYNTHETIC = "synthetic"
-
-
-class IntentEffect(str, Enum):
-    KEEP = "keep"
-    REPLACE = "replace"
-
-
-class ExecutionEffect(str, Enum):
-    NONE = "none"
-    HOLD = "hold"
-    RUN = "run"
-    TERMINATE = "terminate"
-
-
-class InputEffect(str, Enum):
-    NONE = "none"
-    APPEND = "append"
-    DISCARD_SELECTED = "discard_selected"
-
-
-class Correlation(str, Enum):
-    NONE = "none"
-    OPEN_QUESTION = "open_question"
-    PENDING_INPUTS = "pending_inputs"
-    INCIDENT_ATTEMPTS = "incident_attempts"
-
-
-class ResolutionDisposition(str, Enum):
-    CONFIRMED_SUCCESS = "confirmed_success"
-    CONFIRMED_FAILURE = "confirmed_failure"
-    ACCEPTED_UNKNOWN_NO_RETRY = "accepted_unknown_no_retry"
+from task_fence import (
+    TASK_FENCE_ACTIONS as ACTIONS,
+    CorrelationKind as Correlation,
+    ExecutionEffect,
+    IngressClass,
+    InputEffect,
+    IntentEffect,
+    Origin,
+    ResolutionDisposition,
+    TaskFenceAction as Action,
+    TaskFenceProtocolRejected as ProtocolRejected,
+    action_shape as wire_shape,
+    validate_action,
+)
 
 
 class TaskStatus(str, Enum):
@@ -64,135 +41,6 @@ class RuntimeMode(str, Enum):
     AUDIT = "audit"
     ENFORCE = "enforce"
     HALT_DISPATCH = "halt_dispatch"
-
-
-@dataclass(frozen=True)
-class Action:
-    name: str
-    ingress_class: IngressClass
-    intent: IntentEffect
-    execution: ExecutionEffect
-    input_effect: InputEffect
-    correlation: Correlation = Correlation.NONE
-    origin: str = "human"
-
-
-ACTIONS = {
-    action.name: action
-    for action in (
-        Action(
-            "initial_submit",
-            IngressClass.TASK_INPUT,
-            IntentEffect.REPLACE,
-            ExecutionEffect.RUN,
-            InputEffect.APPEND,
-        ),
-        Action(
-            "change_and_hold",
-            IngressClass.TASK_INPUT,
-            IntentEffect.REPLACE,
-            ExecutionEffect.HOLD,
-            InputEffect.APPEND,
-        ),
-        Action(
-            "change_and_run",
-            IngressClass.TASK_INPUT,
-            IntentEffect.REPLACE,
-            ExecutionEffect.RUN,
-            InputEffect.APPEND,
-        ),
-        Action(
-            "comment_hold",
-            IngressClass.TASK_INPUT,
-            IntentEffect.KEEP,
-            ExecutionEffect.HOLD,
-            InputEffect.APPEND,
-        ),
-        Action(
-            "answer_only",
-            IngressClass.TASK_INPUT,
-            IntentEffect.KEEP,
-            ExecutionEffect.HOLD,
-            InputEffect.APPEND,
-            Correlation.OPEN_QUESTION,
-        ),
-        Action(
-            "answer_and_resume",
-            IngressClass.TASK_INPUT,
-            IntentEffect.KEEP,
-            ExecutionEffect.RUN,
-            InputEffect.APPEND,
-            Correlation.OPEN_QUESTION,
-        ),
-        Action(
-            "pause",
-            IngressClass.CONTROL,
-            IntentEffect.KEEP,
-            ExecutionEffect.HOLD,
-            InputEffect.NONE,
-        ),
-        Action(
-            "resume",
-            IngressClass.CONTROL,
-            IntentEffect.KEEP,
-            ExecutionEffect.RUN,
-            InputEffect.NONE,
-        ),
-        Action(
-            "stop",
-            IngressClass.CONTROL,
-            IntentEffect.KEEP,
-            ExecutionEffect.TERMINATE,
-            InputEffect.NONE,
-        ),
-        Action(
-            "discard_pending",
-            IngressClass.CONTROL,
-            IntentEffect.KEEP,
-            ExecutionEffect.HOLD,
-            InputEffect.DISCARD_SELECTED,
-            Correlation.PENDING_INPUTS,
-        ),
-        Action(
-            "resolve_incident",
-            IngressClass.CONTROL,
-            IntentEffect.KEEP,
-            ExecutionEffect.HOLD,
-            InputEffect.NONE,
-            Correlation.INCIDENT_ATTEMPTS,
-        ),
-        Action(
-            "explicit_note",
-            IngressClass.ADVISORY,
-            IntentEffect.KEEP,
-            ExecutionEffect.NONE,
-            InputEffect.NONE,
-        ),
-        Action(
-            "synthetic_notice",
-            IngressClass.SYNTHETIC,
-            IntentEffect.KEEP,
-            ExecutionEffect.NONE,
-            InputEffect.NONE,
-            origin="runtime",
-        ),
-    )
-}
-
-
-def wire_shape(action: Action) -> tuple[object, ...]:
-    """Return the orthogonal protocol fields; action names are adapter labels."""
-    return (
-        action.ingress_class,
-        action.intent,
-        action.execution,
-        action.input_effect,
-        action.correlation,
-        action.origin,
-    )
-
-
-_ALLOWED_WIRE_SHAPES = {wire_shape(action) for action in ACTIONS.values()}
 
 
 @dataclass(frozen=True)
@@ -229,18 +77,8 @@ class ModeRecord:
     audit_degraded: bool = False
 
 
-class ProtocolRejected(ValueError):
-    pass
-
-
 class DispatchBlocked(RuntimeError):
     pass
-
-
-def validate_action(action: Action) -> None:
-    shape = wire_shape(action)
-    if shape not in _ALLOWED_WIRE_SHAPES:
-        raise ProtocolRejected(f"unsupported ingress tuple: {shape!r}")
 
 
 def accept_source_event(
@@ -304,18 +142,18 @@ def accept_ingress(
     if not has_task:
         if wire_shape(action) != wire_shape(ACTIONS["initial_submit"]):
             raise ProtocolRejected("only replace/run/append may create a task")
-    if action.correlation is not Correlation.NONE and not correlation_ids:
+    if action.correlation_kind is not Correlation.NONE and not correlation_ids:
         raise ProtocolRejected(
-            f"{action.name} requires exact {action.correlation.value} ids"
+            f"action requires exact {action.correlation_kind.value} ids"
         )
-    if action.correlation is Correlation.OPEN_QUESTION:
+    if action.correlation_kind is Correlation.OPEN_QUESTION:
         if state.status is not TaskStatus.WAITING_USER:
             raise ProtocolRejected("question answer requires waiting_user state")
         if set(correlation_ids) != set(state.open_question_ids) or len(
             correlation_ids
         ) != len(state.open_question_ids):
             raise ProtocolRejected("question answer requires exact open question ids")
-    if action.correlation is Correlation.INCIDENT_ATTEMPTS:
+    if action.correlation_kind is Correlation.INCIDENT_ATTEMPTS:
         if state.status is not TaskStatus.INCIDENT:
             raise ProtocolRejected("incident resolution requires incident state")
         if set(correlation_ids) != set(state.incident_attempt_ids) or len(
@@ -328,7 +166,7 @@ def accept_ingress(
         raise ProtocolRejected("resolution disposition requires incident attempts")
     if (
         state.status is TaskStatus.INCIDENT
-        and action.correlation is not Correlation.INCIDENT_ATTEMPTS
+        and action.correlation_kind is not Correlation.INCIDENT_ATTEMPTS
         and action.execution is not ExecutionEffect.TERMINATE
     ):
         raise ProtocolRejected("incident requires exact resolution or stop")
@@ -336,7 +174,7 @@ def accept_ingress(
         action.ingress_class is IngressClass.CONTROL
         and action.execution is ExecutionEffect.RUN
         and action.input_effect is InputEffect.NONE
-        and action.correlation is Correlation.NONE
+        and action.correlation_kind is Correlation.NONE
     )
     if is_plain_resume and (
         state.status is not TaskStatus.PAUSED or state.pending_input_ids
@@ -366,7 +204,7 @@ def accept_ingress(
         open_question_ids=(),
         incident_attempt_ids=(
             ()
-            if action.correlation is Correlation.INCIDENT_ATTEMPTS
+            if action.correlation_kind is Correlation.INCIDENT_ATTEMPTS
             or action.execution is ExecutionEffect.TERMINATE
             else state.incident_attempt_ids
         ),
@@ -581,14 +419,13 @@ def test_closed_ingress_matrix_accepts_only_documented_shapes() -> None:
         validate_action(action)
 
     invalid = Action(
-        "synthetic_run",
+        Origin.RUNTIME,
         IngressClass.SYNTHETIC,
         IntentEffect.KEEP,
         ExecutionEffect.RUN,
         InputEffect.NONE,
-        origin="runtime",
     )
-    with pytest.raises(ProtocolRejected, match="unsupported ingress tuple"):
+    with pytest.raises(ProtocolRejected, match="unsupported_ingress_tuple"):
         validate_action(invalid)
 
 

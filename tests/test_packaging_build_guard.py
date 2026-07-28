@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -69,4 +70,8 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
     result = _build_artifact(kind, tmp_path, nix_build=True)
 
     assert result.returncode == 0, result.stderr
-    assert list(tmp_path.glob(artifact_glob))
+    artifacts = list(tmp_path.glob(artifact_glob))
+    assert artifacts
+    if kind == "wheel":
+        with zipfile.ZipFile(artifacts[0]) as wheel:
+            assert "task_fence.py" in wheel.namelist()
