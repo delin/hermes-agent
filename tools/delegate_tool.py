@@ -20,6 +20,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+from contextlib import ExitStack
 
 logger = logging.getLogger(__name__)
 import os
@@ -1965,6 +1966,8 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    _task_fence_parent=None,
+    _task_fence_policy=None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2177,10 +2180,13 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
+                return _run_task_fence_child_launch(
+                    child=child,
+                    goal=goal,
+                    child_task_id=child_task_id,
                     stream_callback=_relay_child_text,
+                    parent_envelope=_task_fence_parent,
+                    policy=_task_fence_policy,
                 )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
@@ -2587,6 +2593,93 @@ def _run_single_child(
             logger.debug("Failed to close child agent after delegation")
 
 
+def _capture_task_fence_child_launch_capability():
+    """Capture one trusted parent capability before delegation thread hops."""
+
+    try:
+        from task_fence import (
+            current_causal_envelope,
+            current_task_fence_policy,
+        )
+
+        parent_envelope = current_causal_envelope()
+        policy = current_task_fence_policy()
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow child-launch capture failed: %s",
+            type(exc).__name__,
+        )
+        return None, None
+
+    if parent_envelope is None or policy is None:
+        return None, None
+    return parent_envelope, policy
+
+
+def _run_task_fence_child_launch(
+    *,
+    child,
+    goal: str,
+    child_task_id: str,
+    stream_callback,
+    parent_envelope=None,
+    policy=None,
+):
+    """Observe one physical child launch, then clear the live policy facade."""
+
+    try:
+        from task_fence import bind_causal_envelope, bind_task_fence_policy
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow child-launch policy scrub failed: %s",
+            type(exc).__name__,
+        )
+        return child.run_conversation(
+            user_message=goal,
+            task_id=child_task_id,
+            stream_callback=stream_callback,
+        )
+
+    launch_envelope = None
+    audit_start = None
+    if parent_envelope is not None and policy is not None:
+        try:
+            launch_envelope = parent_envelope.for_invocation()
+            from tools.registry import _audit_task_fence_tool_start
+
+            audit_start = _audit_task_fence_tool_start
+        except Exception as exc:
+            logger.warning(
+                "Task Fence shadow child-launch context failed: %s",
+                type(exc).__name__,
+            )
+
+    with ExitStack() as task_fence_scope:
+        if launch_envelope is not None:
+            task_fence_scope.enter_context(bind_causal_envelope(launch_envelope))
+        task_fence_scope.enter_context(bind_task_fence_policy(None))
+        if audit_start is not None:
+            try:
+                audit_start(
+                    "delegate_child_launch",
+                    {"goal": goal},
+                    adapter="delegate:run_conversation",
+                    policy=policy,
+                    envelope=launch_envelope,
+                    kwargs={"task_id": child_task_id},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Task Fence shadow child-launch observation failed: %s",
+                    type(exc).__name__,
+                )
+        return child.run_conversation(
+            user_message=goal,
+            task_id=child_task_id,
+            stream_callback=stream_callback,
+        )
+
+
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
 _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
 _CHILD_CONSTRUCTION_LOCK = threading.RLock()
@@ -2879,6 +2972,9 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    _task_fence_parent, _task_fence_policy = (
+        _capture_task_fence_child_launch_capability()
+    )
     overall_start = time.monotonic()
     results = []
 
@@ -2970,7 +3066,14 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child(
+                _i,
+                _t["goal"],
+                child,
+                parent_agent,
+                _task_fence_parent=_task_fence_parent,
+                _task_fence_policy=_task_fence_policy,
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2990,6 +3093,8 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        _task_fence_parent=_task_fence_parent,
+                        _task_fence_policy=_task_fence_policy,
                     )
                     futures[future] = i
 
@@ -3291,26 +3396,36 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
-        dispatch = dispatch_async_delegation_batch(
-            goals=_goals,
-            context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
-            role=top_role,
-            model=creds["model"],
-            session_key=_session_key,
-            origin_ui_session_id=_origin_ui_session_id,
-            origin_session_id=_wake_sid,
-            parent_session_id=_parent_session_id,
-            runner=_batch_runner,
-            interrupt_fn=_batch_interrupt,
-            max_async_children=_get_max_async_children(),
-            # Reuse the live-transcript directory's id (when created) so the
-            # returned delegation_id matches cache/delegation/live/<id>/.
-            delegation_id=live_deleg_id,
-            progress_fn=_batch_progress,
-        )
+        from task_fence import bind_causal_envelope, bind_task_fence_policy
+
+        # The async registry owns scheduling and completion, not child launch.
+        # Its worker copies ContextVars, so scrub live Task Fence authority
+        # while it captures that context. The launch capability above remains
+        # an explicit per-call closure value consumed only by _run_single_child.
+        with (
+            bind_causal_envelope(None),
+            bind_task_fence_policy(None),
+        ):
+            dispatch = dispatch_async_delegation_batch(
+                goals=_goals,
+                context=context,
+                # Metadata for the completion block only; subagents inherit the
+                # parent's toolsets (no model-facing toolsets arg).
+                toolsets=None,
+                role=top_role,
+                model=creds["model"],
+                session_key=_session_key,
+                origin_ui_session_id=_origin_ui_session_id,
+                origin_session_id=_wake_sid,
+                parent_session_id=_parent_session_id,
+                runner=_batch_runner,
+                interrupt_fn=_batch_interrupt,
+                max_async_children=_get_max_async_children(),
+                # Reuse the live-transcript directory's id (when created) so the
+                # returned delegation_id matches cache/delegation/live/<id>/.
+                delegation_id=live_deleg_id,
+                progress_fn=_batch_progress,
+            )
 
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
