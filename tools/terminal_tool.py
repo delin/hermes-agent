@@ -2734,7 +2734,26 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    if retry_count == 0:
+                        result = env.execute(command, **execute_kwargs)
+                    else:
+                        from tools.registry import _task_fence_tool_handoff
+
+                        with _task_fence_tool_handoff(
+                            "terminal",
+                            {
+                                "command": command,
+                                "execute_kwargs": execute_kwargs,
+                            },
+                            {
+                                "task_id": effective_task_id,
+                                "session_id": session_id,
+                                "session_key": session_key,
+                                "environment": env_type,
+                            },
+                            adapter="agent-runtime:terminal-retry",
+                        ):
+                            result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

@@ -155,11 +155,6 @@ def _task_fence_iteration_summary_attempt(agent, acceptance):
     )
 
     generation = _reserve_task_fence_shadow_generation(agent, acceptance)
-    if generation is None:
-        with bind_task_fence_policy(None):
-            yield None
-        return
-
     store = getattr(agent, "_session_db", None)
     try:
         policy = TaskFencePolicy(store)
@@ -168,17 +163,26 @@ def _task_fence_iteration_summary_attempt(agent, acceptance):
             "Task Fence shadow summary policy unavailable: %s",
             type(exc).__name__,
         )
-        _finish_task_fence_shadow_generation(
-            agent,
-            generation,
-            state="failed",
-            required=True,
-        )
+        if generation is not None:
+            _finish_task_fence_shadow_generation(
+                agent,
+                generation,
+                state="failed",
+                required=True,
+            )
         with bind_task_fence_policy(None):
             yield None
         return
 
     attempt = {"policy": policy, "state": "failed"}
+    if generation is None:
+        with (
+            bind_causal_envelope(None),
+            bind_task_fence_policy(None),
+        ):
+            yield attempt
+        return
+
     try:
         with (
             bind_causal_envelope(generation),

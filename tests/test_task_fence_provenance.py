@@ -17,6 +17,7 @@ from task_fence import (
     CONTROL_PROTOCOL_VERSION,
     CausalEnvelope,
     DecisionOutcome,
+    DecisionReason,
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
     TASK_FENCE_STORE_SCHEMA_VERSION,
@@ -2398,6 +2399,9 @@ def test_real_openai_stream_worker_keeps_policy_out_of_sdk_lifecycle(
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_dispatch_permits"
+        ).fetchone()[0] == 1
     finally:
         db.close()
 
@@ -3235,6 +3239,134 @@ def test_real_iteration_summary_empty_retry_owns_fresh_generations(
         )
         assert request_secret not in audit_dump
         assert api_key_secret not in audit_dump
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+def test_iteration_summary_retry_after_newer_ingress_is_audited_without_rebasing(
+    provenance_agent,
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    provider_observed = []
+    raw_prompt = "raw-stale-summary-retry-prompt-must-not-be-durable"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-summary-stale-retry")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(provenance_agent, [])
+
+        responses = iter(
+            [
+                _model_response(
+                    content="",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+                _model_response(
+                    content="summary retry stayed legacy",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+
+        def create(**kwargs):
+            envelope = current_causal_envelope()
+            attempt_state = None
+            if envelope is not None:
+                with db._lock:
+                    attempt = db._conn.execute(
+                        "SELECT a.state FROM task_fence_attempts AS a "
+                        "JOIN task_fence_dispatch_permits AS p "
+                        "ON p.permit_id = a.permit_id "
+                        "WHERE p.invocation_envelope_id = ?",
+                        (envelope.invocation_id,),
+                    ).fetchone()
+                attempt_state = attempt["state"] if attempt else None
+            provider_observed.append(
+                (
+                    envelope,
+                    attempt_state,
+                    dict(kwargs),
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            if len(provider_observed) == 1:
+                db.accept_task_fence_ingress(
+                    _ingress(
+                        "comment_hold",
+                        "event-summary-stale-retry-hold",
+                        task_id=acceptance.task_id,
+                    )
+                )
+            return next(responses)
+
+        provenance_agent.client.chat.completions.create.side_effect = create
+        with patch.object(
+            provenance_agent,
+            "_ensure_primary_openai_client",
+            return_value=provenance_agent.client,
+        ):
+            result = provenance_agent._handle_max_iterations(
+                [{"role": "user", "content": raw_prompt}],
+                7,
+                _task_fence_acceptance=acceptance,
+            )
+
+        assert result == "summary retry stayed legacy"
+        assert len(provider_observed) == 2
+        first, retry = provider_observed
+        assert first[0] is not None
+        assert first[0].invocation_id is not None
+        assert first[1] == "STARTED"
+        assert retry[0] is None
+        assert retry[1] is None
+        assert first[2] == retry[2]
+        assert all(entry[3] is None for entry in provider_observed)
+        assert not any(entry[4] for entry in provider_observed)
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, outcome, reason_code, adapter "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                "provider:openai.chat.completions.create",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                "provider:openai.chat.completions.create",
+            ),
+            (
+                "admission",
+                DecisionOutcome.WOULD_BLOCK.value,
+                DecisionReason.MISSING_PROVENANCE.value,
+                "provider:openai.chat.completions.create",
+            ),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+        generations = db._conn.execute(
+            "SELECT state, closed_at FROM task_fence_model_generations"
+        ).fetchall()
+        assert len(generations) == 1
+        assert generations[0]["closed_at"] is not None
+        task = db.inspect_task_fence_task(acceptance.task_id).task
+        assert task is not None
+        assert task.current_generation_id is None
+        assert raw_prompt not in "\n".join(db._conn.iterdump())
         assert current_causal_envelope() is None
         assert current_task_fence_policy() is None
     finally:
@@ -4930,6 +5062,187 @@ def test_stale_worker_keeps_captured_authority_instead_of_rebasing(
         assert task is not None
         assert task.current_generation_id is None
         assert captured.control_revision == generation.control_revision
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "advance_before_retry",
+    [False, True],
+    ids=["current", "newer-ingress"],
+)
+def test_terminal_physical_retry_gets_fresh_child_and_revalidates_authority(
+    monkeypatch,
+    tmp_path,
+    advance_before_retry,
+):
+    import tools.terminal_tool as terminal_module
+    from tools.registry import registry
+
+    db = SessionDB(tmp_path / "state.db")
+    raw_command = "terminal-retry-command-secret-must-not-be-durable"
+    calls = []
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress(
+                "initial_submit",
+                f"event-terminal-retry-{advance_before_retry}",
+            )
+        )
+        generation = db.reserve_task_fence_generation(acceptance)
+        assert db.finish_task_fence_generation(generation, state="committed")
+        policy = TaskFencePolicy(db)
+
+        class FakeEnvironment:
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                envelope = current_causal_envelope()
+                with db._lock:
+                    attempt = db._conn.execute(
+                        "SELECT a.state FROM task_fence_attempts AS a "
+                        "JOIN task_fence_dispatch_permits AS p "
+                        "ON p.permit_id = a.permit_id "
+                        "WHERE p.invocation_envelope_id = ?",
+                        (envelope.invocation_id,),
+                    ).fetchone()
+                calls.append(
+                    (
+                        envelope,
+                        attempt["state"] if attempt else None,
+                        command,
+                        dict(kwargs),
+                    )
+                )
+                if len(calls) == 1:
+                    if advance_before_retry:
+                        db.accept_task_fence_ingress(
+                            _ingress(
+                                "comment_hold",
+                                "event-terminal-retry-hold",
+                                task_id=acceptance.task_id,
+                            )
+                        )
+                    raise RuntimeError("transient terminal backend failure")
+                return {"output": "retry succeeded", "returncode": 0}
+
+        config = {
+            "env_type": "local",
+            "timeout": 30,
+            "cwd": str(tmp_path),
+            "host_cwd": None,
+            "docker_image": "",
+            "singularity_image": "",
+            "modal_image": "",
+            "daytona_image": "",
+        }
+        monkeypatch.setattr(terminal_module, "_get_env_config", lambda: config)
+        monkeypatch.setattr(
+            terminal_module,
+            "resolve_task_overrides",
+            lambda _task: {},
+        )
+        monkeypatch.setattr(terminal_module, "get_session_cwd", lambda _key: None)
+        monkeypatch.setattr(terminal_module, "record_session_cwd", lambda *_args: None)
+        monkeypatch.setattr(terminal_module, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(
+            terminal_module,
+            "_check_all_guards",
+            lambda *_args, **_kwargs: {"approved": True},
+        )
+        monkeypatch.setattr(terminal_module.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(
+            terminal_module,
+            "_active_environments",
+            {"default": FakeEnvironment()},
+        )
+        monkeypatch.setattr(terminal_module, "_last_activity", {"default": 0.0})
+
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(policy),
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+            patch("agent.verification_evidence.record_terminal_result", return_value=None),
+        ):
+            result = registry.dispatch(
+                "terminal",
+                {"command": raw_command},
+                task_id="sandbox-task",
+                session_id="conversation-1",
+            )
+
+        assert json.loads(result) == {
+            "output": "retry succeeded",
+            "exit_code": 0,
+            "error": None,
+        }
+        assert len(calls) == 2
+        first, retry = calls
+        assert first[1] == "STARTED"
+        assert retry[1] == (None if advance_before_retry else "STARTED")
+        assert first[2:] == retry[2:]
+        assert first[0].generation_id == generation.generation_id
+        assert first[0].parent_invocation_id is None
+        assert retry[0].generation_id == generation.generation_id
+        assert retry[0].invocation_id != first[0].invocation_id
+        assert retry[0].parent_invocation_id == first[0].invocation_id
+
+        expected_decisions = [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                "registry:terminal",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                "registry:terminal",
+            ),
+        ]
+        if advance_before_retry:
+            expected_decisions.append(
+                (
+                    "admission",
+                    DecisionOutcome.WOULD_BLOCK.value,
+                    DecisionReason.TASK_NOT_RUNNABLE.value,
+                    "agent-runtime:terminal-retry",
+                )
+            )
+        else:
+            expected_decisions.extend(
+                [
+                    (
+                        "admission",
+                        DecisionOutcome.WOULD_RESERVE.value,
+                        DecisionReason.CURRENT_AUTHORITY.value,
+                        "agent-runtime:terminal-retry",
+                    ),
+                    (
+                        "authorization",
+                        DecisionOutcome.WOULD_ALLOW.value,
+                        DecisionReason.CURRENT_AUTHORITY.value,
+                        "agent-runtime:terminal-retry",
+                    ),
+                ]
+            )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, outcome, reason_code, adapter "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == expected_decisions
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == (1 if advance_before_retry else 2)
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_dispatch_permits"
+        ).fetchone()[0] == (1 if advance_before_retry else 2)
+        assert raw_command not in "\n".join(db._conn.iterdump())
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
     finally:
         db.close()
 
