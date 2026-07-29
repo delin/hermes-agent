@@ -7135,6 +7135,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        _task_fence_acceptance=_task_fence_acceptance,
     )
 
 

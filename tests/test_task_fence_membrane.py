@@ -819,6 +819,48 @@ def test_model_wire_ownership_excludes_non_sdk_facades(
     assert _is_task_fence_supported_model_wire(agent) is supported
 
 
+@pytest.mark.parametrize(
+    ("api_mode", "provider", "base_url", "supported"),
+    [
+        (
+            "chat_completions",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            True,
+        ),
+        (
+            "chat_completions",
+            "google",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            True,
+        ),
+        ("anthropic_messages", "anthropic", "https://api.anthropic.com", True),
+        ("codex_responses", "openai-codex", "", True),
+        ("bedrock_converse", "bedrock", "", False),
+        ("anthropic_messages", "bedrock", "", False),
+        ("chat_completions", "moa", "moa://local", False),
+        ("chat_completions", "copilot-acp", "acp://copilot", False),
+    ],
+)
+def test_iteration_summary_owns_only_existing_provider_wires(
+    api_mode,
+    provider,
+    base_url,
+    supported,
+):
+    from agent.chat_completion_helpers import (
+        _is_task_fence_supported_iteration_summary_wire,
+    )
+
+    agent = SimpleNamespace(
+        api_mode=api_mode,
+        provider=provider,
+        base_url=base_url,
+    )
+
+    assert _is_task_fence_supported_iteration_summary_wire(agent) is supported
+
+
 def test_model_wire_fingerprint_commits_binary_payloads():
     from agent.task_fence_provider import model_wire_fingerprint
 

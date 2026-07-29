@@ -83,6 +83,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    _task_fence_acceptance=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -138,7 +139,14 @@ def finalize_turn(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        if _task_fence_acceptance is None:
+            final_response = agent._handle_max_iterations(messages, api_call_count)
+        else:
+            final_response = agent._handle_max_iterations(
+                messages,
+                api_call_count,
+                _task_fence_acceptance=_task_fence_acceptance,
+            )
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:

@@ -1880,6 +1880,375 @@ def test_real_codex_midstream_retry_starts_before_each_responses_create(
         db.close()
 
 
+def test_iteration_summary_requires_explicit_acceptance_not_ambient_policy(
+    provenance_agent,
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    provider_observed = []
+    provider_context = []
+    factories = []
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-summary-ambient-only")
+        )
+        generation = db.reserve_task_fence_generation(acceptance)
+        assert db.finish_task_fence_generation(
+            generation,
+            state="committed",
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(
+            provenance_agent,
+            [
+                _model_response(
+                    content="legacy summary",
+                    tool_calls=None,
+                    finish_reason="stop",
+                )
+            ],
+            provider_observed=provider_observed,
+            provider_inspect=lambda _envelope: provider_context.append(
+                (
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            ),
+        )
+
+        def ensure_client(*, reason):
+            factories.append(
+                (
+                    reason,
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return provenance_agent.client
+
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            patch.object(
+                provenance_agent,
+                "_ensure_primary_openai_client",
+                side_effect=ensure_client,
+            ),
+        ):
+            result = provenance_agent._handle_max_iterations(
+                [{"role": "user", "content": "summarize"}],
+                7,
+            )
+
+        assert result == "legacy summary"
+        assert provider_observed == [generation]
+        assert provider_observed[0].invocation_id is None
+        assert provider_context == [(None, False)]
+        assert factories == [
+            (
+                "iteration_limit_summary",
+                generation,
+                None,
+                False,
+            )
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_model_generations"
+        ).fetchone()[0] == 1
+        for table in (
+            "task_fence_policy_decisions",
+            "task_fence_dispatch_permits",
+            "task_fence_attempts",
+        ):
+            assert db._conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+def test_real_iteration_summary_empty_retry_owns_fresh_generations(
+    provenance_agent,
+    registered_probe_tools,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    names, _, observed_tools, _ = registered_probe_tools
+    db = SessionDB(tmp_path / "state.db")
+    provider_observed = []
+    provider_requests = []
+    provider_states = []
+    factories = []
+    request_secret = "raw-iteration-summary-prompt-must-not-be-durable"
+    api_key_secret = "test-key-1234567890"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-summary-empty-retry")
+        )
+        provenance_agent._session_db = db
+        provenance_agent.max_iterations = 1
+
+        def inspect_provider_generation(envelope):
+            assert envelope is not None
+            with db._lock:
+                generation_row = db._conn.execute(
+                    "SELECT g.state, g.closed_at, t.current_generation_id "
+                    "FROM task_fence_model_generations AS g "
+                    "JOIN task_fence_tasks AS t ON t.task_id = g.task_id "
+                    "WHERE g.generation_id = ?",
+                    (envelope.generation_id,),
+                ).fetchone()
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            provider_states.append(
+                (
+                    *tuple(generation_row),
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+
+        _prepare_real_conversation(
+            provenance_agent,
+            [
+                _model_response(
+                    content=None,
+                    tool_calls=[_tool_call(names[0], "call-summary-limit")],
+                    finish_reason="tool_calls",
+                ),
+                _model_response(
+                    content="",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+                _model_response(
+                    content="summary after empty retry",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+            ],
+            provider_observed=provider_observed,
+            provider_requests=provider_requests,
+            provider_inspect=inspect_provider_generation,
+        )
+
+        def ensure_client(*, reason):
+            envelope = current_causal_envelope()
+            factories.append(
+                (
+                    reason,
+                    envelope,
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return provenance_agent.client
+
+        with (
+            patch.object(
+                provenance_agent,
+                "_ensure_primary_openai_client",
+                side_effect=ensure_client,
+            ),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is False
+        assert result["final_response"] == "summary after empty retry"
+        assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
+        assert len(observed_tools) == 1
+        assert len(provider_observed) == 3
+        assert len(provider_requests) == 3
+        assert all(item is not None for item in provider_observed)
+        assert all(item.invocation_id is not None for item in provider_observed)
+        assert len({item.invocation_id for item in provider_observed}) == 3
+        assert len({item.generation_id for item in provider_observed}) == 3
+        assert provider_states == [
+            (
+                "started",
+                None,
+                envelope.generation_id,
+                "STARTED",
+                None,
+                False,
+            )
+            for envelope in provider_observed
+        ]
+
+        assert [entry[0] for entry in factories] == [
+            "chat_completion_request",
+            "iteration_limit_summary",
+            "iteration_limit_summary_retry",
+        ]
+        assert [entry[1].generation_id for entry in factories] == [
+            provider_observed[0].generation_id,
+            provider_observed[1].generation_id,
+            provider_observed[2].generation_id,
+        ]
+        assert all(entry[1].invocation_id is None for entry in factories)
+        assert all(entry[2] is None for entry in factories)
+        assert not any(entry[3] for entry in factories)
+        assert provider_requests[1] == provider_requests[2]
+        assert "tools" not in provider_requests[1]
+
+        generation_rows = {
+            row["generation_id"]: row
+            for row in db._conn.execute(
+                "SELECT generation_id, state, closed_at "
+                "FROM task_fence_model_generations"
+            )
+        }
+        assert set(generation_rows) == {
+            envelope.generation_id for envelope in provider_observed
+        }
+        for envelope in provider_observed:
+            assert generation_rows[envelope.generation_id]["state"] == "committed"
+        assert generation_rows[provider_observed[0].generation_id]["closed_at"] is not None
+        assert generation_rows[provider_observed[1].generation_id]["closed_at"] is not None
+        assert generation_rows[provider_observed[2].generation_id]["closed_at"] is None
+        task = db.inspect_task_fence_task(acceptance.task_id).task
+        assert task is not None
+        assert task.current_generation_id == provider_observed[2].generation_id
+
+        route = {
+            "api_mode": str(provenance_agent.api_mode or ""),
+            "provider": str(provenance_agent.provider or ""),
+            "model": str(provenance_agent.model or ""),
+            "endpoint": str(provenance_agent.base_url or ""),
+        }
+        summary_fingerprint = model_wire_fingerprint(
+            adapter="provider:openai.chat.completions.create",
+            request=provider_requests[1],
+            route=route,
+        )
+        model_decisions = db._conn.execute(
+            "SELECT decision_point, invocation_fingerprint "
+            "FROM task_fence_policy_decisions "
+            "WHERE operation_kind = 'model' ORDER BY decision_order"
+        ).fetchall()
+        assert len(model_decisions) == 6
+        assert [row["decision_point"] for row in model_decisions] == [
+            "admission",
+            "authorization",
+        ] * 3
+        assert {
+            row["invocation_fingerprint"] for row in model_decisions[2:]
+        } == {summary_fingerprint}
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 4
+
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert request_secret not in audit_dump
+        assert api_key_secret not in audit_dump
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+def test_iteration_summary_provider_failure_marks_generation_failed(
+    provenance_agent,
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    calls = []
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-summary-failure")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(provenance_agent, [])
+
+        def fail_summary(**kwargs):
+            envelope = current_causal_envelope()
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            calls.append(
+                (
+                    dict(kwargs),
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            raise RuntimeError("summary provider failed")
+
+        provenance_agent.client.chat.completions.create.side_effect = fail_summary
+        with patch.object(
+            provenance_agent,
+            "_ensure_primary_openai_client",
+            return_value=provenance_agent.client,
+        ):
+            result = provenance_agent._handle_max_iterations(
+                [{"role": "user", "content": "summarize"}],
+                7,
+                _task_fence_acceptance=acceptance,
+            )
+
+        assert result == (
+            "I reached the maximum iterations "
+            f"({provenance_agent.max_iterations}) but couldn't summarize. "
+            "Error: summary provider failed"
+        )
+        assert len(calls) == 1
+        _, envelope, attempt_state, ambient_policy, carries_authority = calls[0]
+        assert envelope.invocation_id is not None
+        assert attempt_state == "STARTED"
+        assert ambient_policy is None
+        assert carries_authority is False
+        generation = db._conn.execute(
+            "SELECT generation_id, state, closed_at "
+            "FROM task_fence_model_generations"
+        ).fetchone()
+        assert generation["generation_id"] == envelope.generation_id
+        assert generation["state"] == "failed"
+        assert generation["closed_at"] is not None
+        task = db.inspect_task_fence_task(acceptance.task_id).task
+        assert task is not None
+        assert task.current_generation_id is None
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
 def test_real_bedrock_nonstream_starts_before_converse(
     provenance_agent,
     tmp_path,

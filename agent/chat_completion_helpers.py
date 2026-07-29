@@ -23,6 +23,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional
 
@@ -118,6 +119,87 @@ def _is_task_fence_supported_model_wire(agent) -> bool:
         "bedrock_converse",
         "codex_responses",
     }
+
+
+def _is_task_fence_supported_iteration_summary_wire(agent) -> bool:
+    """Return whether the post-loop summary reaches an already owned wire."""
+
+    return (
+        getattr(agent, "api_mode", None) != "bedrock_converse"
+        and _is_task_fence_supported_model_wire(agent)
+    )
+
+
+@contextmanager
+def _task_fence_iteration_summary_attempt(agent, acceptance):
+    """Own one summary try without changing unsupported or legacy dispatch."""
+
+    if (
+        acceptance is None
+        or not _is_task_fence_supported_iteration_summary_wire(agent)
+    ):
+        from task_fence import bind_task_fence_policy
+
+        with bind_task_fence_policy(None):
+            yield None
+        return
+
+    from agent.conversation_loop import (
+        _finish_task_fence_shadow_generation,
+        _reserve_task_fence_shadow_generation,
+    )
+    from task_fence import (
+        TaskFencePolicy,
+        bind_causal_envelope,
+        bind_task_fence_policy,
+    )
+
+    generation = _reserve_task_fence_shadow_generation(agent, acceptance)
+    if generation is None:
+        with bind_task_fence_policy(None):
+            yield None
+        return
+
+    store = getattr(agent, "_session_db", None)
+    try:
+        policy = TaskFencePolicy(store)
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow summary policy unavailable: %s",
+            type(exc).__name__,
+        )
+        _finish_task_fence_shadow_generation(
+            agent,
+            generation,
+            state="failed",
+            required=True,
+        )
+        with bind_task_fence_policy(None):
+            yield None
+        return
+
+    attempt = {"policy": policy, "state": "failed"}
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            yield attempt
+    except BaseException:
+        _finish_task_fence_shadow_generation(
+            agent,
+            generation,
+            state="failed",
+            required=True,
+        )
+        raise
+    else:
+        _finish_task_fence_shadow_generation(
+            agent,
+            generation,
+            state=attempt["state"],
+            required=True,
+        )
 
 
 def _task_fence_bedrock_route(agent, request: dict, region: str) -> dict:
@@ -2133,7 +2215,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+def handle_max_iterations(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    task_fence_acceptance=None,
+) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
@@ -2250,14 +2338,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             from agent.portal_tags import nous_portal_tags as _portal_tags
             summary_extra_body["tags"] = _portal_tags()
 
-        if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
-            codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
-            _ct_sum = agent._get_transport()
-            _cnr_sum = _ct_sum.normalize_response(summary_response)
-            final_response = (_cnr_sum.content or "").strip()
-        else:
+        summary_kwargs = None
+        if agent.api_mode != "codex_responses":
             summary_kwargs = {
                 "model": agent.model,
                 "messages": api_messages,
@@ -2320,7 +2402,27 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
 
-            if agent.api_mode == "anthropic_messages":
+        with _task_fence_iteration_summary_attempt(
+            agent,
+            task_fence_acceptance,
+        ) as summary_attempt:
+            summary_policy = (
+                summary_attempt["policy"] if summary_attempt is not None else None
+            )
+            if agent.api_mode == "codex_responses":
+                codex_kwargs = agent._build_api_kwargs(api_messages)
+                codex_kwargs.pop("tools", None)
+                if summary_policy is None:
+                    summary_response = agent._run_codex_stream(codex_kwargs)
+                else:
+                    summary_response = agent._run_codex_stream(
+                        codex_kwargs,
+                        _task_fence_model_policy=summary_policy,
+                    )
+                _ct_sum = agent._get_transport()
+                _cnr_sum = _ct_sum.normalize_response(summary_response)
+                final_response = (_cnr_sum.content or "").strip()
+            elif agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(model=agent.model, messages=api_messages, tools=None,
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
@@ -2328,13 +2430,36 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                preserve_dots=agent._anthropic_preserve_dots(),
                                base_url=getattr(agent, "_anthropic_base_url", None))
                 _ant_kw = _merge_nous_portal_messages_extra_body(agent, _ant_kw)
-                summary_response = agent._anthropic_messages_create(_ant_kw)
+                if summary_policy is None:
+                    summary_response = agent._anthropic_messages_create(_ant_kw)
+                else:
+                    summary_response = agent._anthropic_messages_create(
+                        _ant_kw,
+                        _task_fence_model_policy=summary_policy,
+                    )
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
-                _summary_result = agent._get_transport().normalize_response(summary_response)
+                summary_client = agent._ensure_primary_openai_client(
+                    reason="iteration_limit_summary"
+                )
+                if summary_policy is None:
+                    summary_response = summary_client.chat.completions.create(
+                        **summary_kwargs
+                    )
+                else:
+                    summary_response = _create_openai_chat_completion(
+                        agent,
+                        summary_client,
+                        summary_kwargs,
+                        task_fence_model_policy=summary_policy,
+                    )
+                _summary_result = agent._get_transport().normalize_response(
+                    summary_response
+                )
                 final_response = (_summary_result.content or "").strip()
+            if summary_attempt is not None:
+                summary_attempt["state"] = "committed"
 
         if final_response:
             if "<think>" in final_response:
@@ -2345,41 +2470,64 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
         else:
             # Retry summary generation
-            if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
-                _ct_retry = agent._get_transport()
-                _cnr_retry = _ct_retry.normalize_response(retry_response)
-                final_response = (_cnr_retry.content or "").strip()
-            elif agent.api_mode == "anthropic_messages":
-                _tretry = agent._get_transport()
-                _ant_kw2 = _tretry.build_kwargs(model=agent.model, messages=api_messages, tools=None,
-                                is_oauth=agent._is_anthropic_oauth,
-                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
-                                preserve_dots=agent._anthropic_preserve_dots(),
-                                base_url=getattr(agent, "_anthropic_base_url", None))
-                _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
-                retry_response = agent._anthropic_messages_create(_ant_kw2)
-                _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
-                final_response = (_retry_result.content or "").strip()
-            else:
-                summary_kwargs = {
-                    "model": agent.model,
-                    "messages": api_messages,
-                }
-                if _summary_temperature is not None:
-                    summary_kwargs["temperature"] = _summary_temperature
-                if agent.max_tokens is not None:
-                    summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
-                if _lm_reasoning_effort is not None:
-                    summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
-                if summary_extra_body:
-                    summary_kwargs["extra_body"] = summary_extra_body
-
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
-                _retry_result = agent._get_transport().normalize_response(summary_response)
-                final_response = (_retry_result.content or "").strip()
+            with _task_fence_iteration_summary_attempt(
+                agent,
+                task_fence_acceptance,
+            ) as retry_attempt:
+                retry_policy = (
+                    retry_attempt["policy"] if retry_attempt is not None else None
+                )
+                if agent.api_mode == "codex_responses":
+                    codex_kwargs = agent._build_api_kwargs(api_messages)
+                    codex_kwargs.pop("tools", None)
+                    if retry_policy is None:
+                        retry_response = agent._run_codex_stream(codex_kwargs)
+                    else:
+                        retry_response = agent._run_codex_stream(
+                            codex_kwargs,
+                            _task_fence_model_policy=retry_policy,
+                        )
+                    _ct_retry = agent._get_transport()
+                    _cnr_retry = _ct_retry.normalize_response(retry_response)
+                    final_response = (_cnr_retry.content or "").strip()
+                elif agent.api_mode == "anthropic_messages":
+                    _tretry = agent._get_transport()
+                    _ant_kw2 = _tretry.build_kwargs(model=agent.model, messages=api_messages, tools=None,
+                                    is_oauth=agent._is_anthropic_oauth,
+                                    max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
+                                    preserve_dots=agent._anthropic_preserve_dots(),
+                                    base_url=getattr(agent, "_anthropic_base_url", None))
+                    _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
+                    if retry_policy is None:
+                        retry_response = agent._anthropic_messages_create(_ant_kw2)
+                    else:
+                        retry_response = agent._anthropic_messages_create(
+                            _ant_kw2,
+                            _task_fence_model_policy=retry_policy,
+                        )
+                    _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
+                    final_response = (_retry_result.content or "").strip()
+                else:
+                    retry_client = agent._ensure_primary_openai_client(
+                        reason="iteration_limit_summary_retry"
+                    )
+                    if retry_policy is None:
+                        summary_response = retry_client.chat.completions.create(
+                            **summary_kwargs
+                        )
+                    else:
+                        summary_response = _create_openai_chat_completion(
+                            agent,
+                            retry_client,
+                            summary_kwargs,
+                            task_fence_model_policy=retry_policy,
+                        )
+                    _retry_result = agent._get_transport().normalize_response(
+                        summary_response
+                    )
+                    final_response = (_retry_result.content or "").strip()
+                if retry_attempt is not None:
+                    retry_attempt["state"] = "committed"
 
             if final_response:
                 if "<think>" in final_response:
