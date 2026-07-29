@@ -334,7 +334,18 @@ def _run_agent_tool_execution_middleware(
     def _execute(next_args: dict) -> Any:
         nonlocal observed_args
         observed_args = next_args if isinstance(next_args, dict) else function_args
-        return execute(observed_args)
+        from tools.registry import _task_fence_tool_handoff
+
+        with _task_fence_tool_handoff(
+            function_name,
+            observed_args,
+            {
+                "task_id": effective_task_id or "",
+                "session_id": getattr(agent, "session_id", "") or "",
+            },
+            adapter=f"agent-runtime:{function_name}",
+        ):
+            return execute(observed_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
     from task_fence import bind_causal_envelope

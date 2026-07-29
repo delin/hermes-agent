@@ -60,11 +60,12 @@ def _audit_task_fence_tool_start(
     name: str,
     args: dict,
     *,
+    adapter: str,
     policy: Any,
     envelope: Any | None,
     kwargs: dict,
 ) -> None:
-    """Best-effort shadow observation immediately before a registry handler."""
+    """Best-effort shadow observation immediately before a tool handler."""
 
     from task_fence import (
         DecisionOutcome,
@@ -79,7 +80,7 @@ def _audit_task_fence_tool_start(
     operation = OperationDescriptor(
         invocation_id=invocation_id,
         kind=OperationKind.TOOL,
-        adapter=f"registry:{name}",
+        adapter=adapter,
         invocation_fingerprint=_task_fence_tool_fingerprint(name, args, kwargs),
     )
     admitted = policy.admit_operation(envelope, operation)
@@ -95,8 +96,12 @@ def _task_fence_tool_handoff(
     name: str,
     args: dict,
     kwargs: dict,
+    *,
+    adapter: Optional[str] = None,
 ) -> Iterator[None]:
-    """Bind one invocation and observe its handoff without gating dispatch."""
+    """Bind one invocation and observe a tool handoff without gating it."""
+
+    operation_adapter = adapter or f"registry:{name}"
 
     try:
         from task_fence import (
@@ -130,6 +135,7 @@ def _task_fence_tool_handoff(
             _audit_task_fence_tool_start(
                 name,
                 args,
+                adapter=operation_adapter,
                 policy=policy,
                 envelope=envelope,
                 kwargs=kwargs,

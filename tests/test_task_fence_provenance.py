@@ -953,6 +953,160 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
         db.close()
 
 
+def test_real_conversation_audits_inline_handler_before_entry(
+    provenance_agent,
+    monkeypatch,
+    tmp_path,
+):
+    from tools.registry import _task_fence_tool_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    final_args = {
+        "todos": [{"id": "1", "content": "rewritten", "status": "pending"}],
+        "merge": True,
+    }
+    secret = "real-inline-original-secret"
+    observed = []
+
+    def fake_todo_tool(*, todos, merge, store):
+        envelope = current_causal_envelope()
+        with db._lock:
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+        observed.append(
+            (
+                todos,
+                merge,
+                store,
+                envelope,
+                current_task_fence_policy(),
+                attempt["state"],
+            )
+        )
+        return json.dumps({"ok": True})
+
+    def rewrite_inline(_name, _args, next_call, **_kwargs):
+        return next_call(dict(final_args))
+
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-real-inline")
+        )
+        provenance_agent._session_db = db
+        provenance_agent.valid_tool_names = set(
+            provenance_agent.valid_tool_names
+        ) | {"todo"}
+        provenance_agent.session_id = "inline-session"
+        monkeypatch.setattr("tools.todo_tool.todo_tool", fake_todo_tool)
+        _prepare_real_conversation(
+            provenance_agent,
+            [
+                _model_response(
+                    content=None,
+                    tool_calls=[
+                        _tool_call(
+                            "todo",
+                            "call-real-inline",
+                            json.dumps(
+                                {"todos": [], "merge": False, "secret": secret}
+                            ),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                ),
+                _model_response(
+                    content="done",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+            ],
+        )
+
+        with (
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                side_effect=rewrite_inline,
+            ),
+        ):
+            result = provenance_agent.run_conversation(
+                "do the inline task",
+                task_id="sandbox-task",
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "done"
+        assert len(observed) == 1
+        todos, merge, store, envelope, policy, state = observed[0]
+        assert todos == final_args["todos"]
+        assert merge is True
+        assert store is provenance_agent._todo_store
+        assert envelope.task_id == acceptance.task_id
+        assert envelope.invocation_id is not None
+        assert policy is not None
+        assert state == "STARTED"
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, outcome, adapter, "
+                "invocation_fingerprint "
+                "FROM task_fence_policy_decisions "
+                "WHERE adapter = 'agent-runtime:todo' "
+                "ORDER BY decision_order"
+            )
+        ] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                "agent-runtime:todo",
+                _task_fence_tool_fingerprint(
+                    "todo",
+                    final_args,
+                    {
+                        "task_id": "sandbox-task",
+                        "session_id": "inline-session",
+                    },
+                ),
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                "agent-runtime:todo",
+                _task_fence_tool_fingerprint(
+                    "todo",
+                    final_args,
+                    {
+                        "task_id": "sandbox-task",
+                        "session_id": "inline-session",
+                    },
+                ),
+            ),
+        ]
+        audit_rows = []
+        for query in (
+            "SELECT * FROM task_fence_policy_decisions",
+            "SELECT * FROM task_fence_dispatch_permits",
+            "SELECT * FROM task_fence_attempts",
+        ):
+            audit_rows.extend(
+                tuple(row) for row in db._conn.execute(query)
+            )
+        audit_dump = repr(audit_rows)
+        assert secret not in audit_dump
+        assert "rewritten" not in audit_dump
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
 def test_transcript_and_todo_text_cannot_reconstruct_current_authority(
     provenance_agent,
     registered_probe_tools,
@@ -1495,6 +1649,156 @@ def test_sequential_inline_tool_gets_its_own_invocation(
     assert observed[0] is not None
     assert observed[0].generation_id == generation.generation_id
     assert observed[0].invocation_id is not None
+
+
+def test_concurrent_inline_tools_start_once_with_unique_invocations(
+    provenance_agent,
+    monkeypatch,
+    tmp_path,
+):
+    from tools.registry import _task_fence_tool_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-inline-concurrent")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    secrets = ("concurrent-secret-a", "concurrent-secret-b")
+    rendezvous = threading.Barrier(2)
+    observed = []
+
+    def fake_session_search(**kwargs):
+        rendezvous.wait(timeout=5)
+        envelope = current_causal_envelope()
+        with db._lock:
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+        observed.append((kwargs["query"], envelope, attempt["state"]))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(
+        "tools.session_search_tool.session_search",
+        fake_session_search,
+    )
+    provenance_agent._get_session_db_for_recall = MagicMock(return_value=object())
+    provenance_agent.valid_tool_names = set(
+        provenance_agent.valid_tool_names
+    ) | {"session_search"}
+    provenance_agent.session_id = "inline-session"
+    response = SimpleNamespace(
+        content="",
+        tool_calls=[
+            _tool_call(
+                "session_search",
+                f"call-inline-{index}",
+                json.dumps({"query": secret}),
+            )
+            for index, secret in enumerate(secrets)
+        ],
+    )
+
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(TaskFencePolicy(db)),
+        ):
+            provenance_agent._execute_tool_calls_concurrent(
+                response,
+                [],
+                "sandbox-task",
+            )
+
+        assert {item[0] for item in observed} == set(secrets)
+        assert {item[2] for item in observed} == {"STARTED"}
+        envelopes = [item[1] for item in observed]
+        assert {item.generation_id for item in envelopes} == {
+            generation.generation_id
+        }
+        assert len({item.invocation_id for item in envelopes}) == 2
+        assert all(item.parent_invocation_id is not None for item in envelopes)
+        assert len({item.parent_invocation_id for item in envelopes}) == 2
+        assert {
+            item.invocation_id for item in envelopes
+        }.isdisjoint({item.parent_invocation_id for item in envelopes})
+        attempts = db._conn.execute(
+            "SELECT d.adapter, d.invocation_fingerprint, "
+            "p.invocation_envelope_id, a.state "
+            "FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id "
+            "JOIN task_fence_policy_decisions AS d "
+            "ON d.attempt_id = a.attempt_id"
+        ).fetchall()
+        assert len(attempts) == 2
+        assert {row["adapter"] for row in attempts} == {
+            "agent-runtime:session_search"
+        }
+        assert {row["state"] for row in attempts} == {"STARTED"}
+        assert {row["invocation_envelope_id"] for row in attempts} == {
+            item.invocation_id for item in envelopes
+        }
+        assert {row["invocation_fingerprint"] for row in attempts} == {
+            _task_fence_tool_fingerprint(
+                "session_search",
+                {"query": secret},
+                {"task_id": "sandbox-task", "session_id": "inline-session"},
+            )
+            for secret in secrets
+        }
+        dump = "\n".join(db._conn.iterdump())
+        assert all(secret not in dump for secret in secrets)
+    finally:
+        db.close()
+
+
+def test_concurrent_inline_middleware_short_circuit_creates_no_attempt(
+    provenance_agent,
+    monkeypatch,
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-inline-concurrent-short-circuit")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    calls = []
+
+    monkeypatch.setattr(
+        "tools.todo_tool.todo_tool",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                return_value="managed-inline-result",
+            ),
+        ):
+            result = provenance_agent._invoke_tool(
+                "todo",
+                {"todos": []},
+                "sandbox-task",
+            )
+
+        assert result == "managed-inline-result"
+        assert calls == []
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
 
 
 def test_deferred_tool_gets_distinct_child_invocation(

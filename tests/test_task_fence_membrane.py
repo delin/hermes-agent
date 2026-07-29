@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -626,5 +627,200 @@ def test_unknown_registry_tool_creates_no_phantom_attempt(tmp_path):
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_inline_handoff_barrier_race_is_shadow_only(tmp_path):
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+
+    db, acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    dispatcher = generation.for_invocation("tfiv_inline_race_dispatcher")
+    original_admit = TaskFencePolicy.admit_operation
+    calls = []
+    advanced = False
+
+    def admit_then_advance(self, envelope, operation):
+        nonlocal advanced
+        decision = original_admit(self, envelope, operation)
+        if self is policy and not advanced:
+            advanced = True
+            db.accept_task_fence_ingress(
+                _ingress(
+                    "comment_hold",
+                    "inline-race-newer-input",
+                    task_id=acceptance.task_id,
+                )
+            )
+        return decision
+
+    def execute(args):
+        calls.append((dict(args), current_causal_envelope()))
+        return "legacy-inline-result"
+
+    def call_next(_name, args, next_call, **_kwargs):
+        return next_call(args)
+
+    agent = SimpleNamespace(
+        session_id="inline-session",
+        _current_turn_id="turn-inline",
+        _current_api_request_id="request-inline",
+    )
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            patch.object(
+                TaskFencePolicy,
+                "admit_operation",
+                new=admit_then_advance,
+            ),
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                side_effect=call_next,
+            ),
+        ):
+            result, observed_args = _run_agent_tool_execution_middleware(
+                agent,
+                function_name="todo",
+                function_args={"value": 1},
+                effective_task_id="sandbox-task",
+                tool_call_id="call-inline",
+                causal_envelope=dispatcher,
+                execute=execute,
+            )
+
+        assert result == "legacy-inline-result"
+        assert observed_args == {"value": 1}
+        assert len(calls) == 1
+        args, envelope = calls[0]
+        assert args == {"value": 1}
+        assert envelope.parent_invocation_id == dispatcher.invocation_id
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, outcome, reason_code, adapter "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                "agent-runtime:todo",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_BLOCK.value,
+                DecisionReason.PERMIT_REVOKED.value,
+                "agent-runtime:todo",
+            ),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_inline_execution_middleware_short_circuit_creates_no_attempt(tmp_path):
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    calls = []
+    agent = SimpleNamespace(
+        session_id="inline-session",
+        _current_turn_id="turn-inline",
+        _current_api_request_id="request-inline",
+    )
+    try:
+        with (
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                return_value="managed-inline-result",
+            ),
+        ):
+            result, observed_args = _run_agent_tool_execution_middleware(
+                agent,
+                function_name="todo",
+                function_args={"value": 2},
+                effective_task_id="sandbox-task",
+                tool_call_id="call-inline",
+                causal_envelope=generation.for_invocation(
+                    "tfiv_inline_short_circuit"
+                ),
+                execute=lambda args: calls.append(dict(args)),
+            )
+
+        assert result == "managed-inline-result"
+        assert observed_args == {"value": 2}
+        assert calls == []
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_middleware_registry_detour_and_inline_next_are_siblings(tmp_path):
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    dispatcher = generation.for_invocation("tfiv_inline_detour_dispatcher")
+    bypass_name = "mcp_task_fence_inline_detour"
+    envelopes = []
+
+    def capture(label):
+        envelopes.append((label, current_causal_envelope()))
+        return label
+
+    def middleware_detour(_name, args, next_call, **_kwargs):
+        assert registry.dispatch(bypass_name, {}) == "registry"
+        return next_call(args)
+
+    agent = SimpleNamespace(
+        session_id="inline-session",
+        _current_turn_id="turn-inline",
+        _current_api_request_id="request-inline",
+    )
+    try:
+        with (
+            _registered_tool(
+                bypass_name,
+                lambda _args, **_kwargs: capture("registry"),
+            ),
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                side_effect=middleware_detour,
+            ),
+        ):
+            result, _ = _run_agent_tool_execution_middleware(
+                agent,
+                function_name="todo",
+                function_args={},
+                effective_task_id="sandbox-task",
+                tool_call_id="call-inline",
+                causal_envelope=dispatcher,
+                execute=lambda _args: capture("inline"),
+            )
+
+        assert result == "inline"
+        assert {label for label, _envelope in envelopes} == {
+            "registry",
+            "inline",
+        }
+        invocation_ids = {envelope.invocation_id for _, envelope in envelopes}
+        assert len(invocation_ids) == 2
+        assert {envelope.parent_invocation_id for _, envelope in envelopes} == {
+            dispatcher.invocation_id
+        }
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
     finally:
         db.close()

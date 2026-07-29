@@ -2565,6 +2565,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    # These branches terminate in this module. The registry fallback owns its
+    # own final-handoff observation and must not be double-wrapped here.
+    is_inline_handler = True
     if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
@@ -2653,6 +2656,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
+        is_inline_handler = False
+
         def _execute(next_args: dict) -> Any:
             return _ra().handle_function_call(
                 function_name, next_args, effective_task_id,
@@ -2670,10 +2675,28 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
+    def _execute_terminal(next_args: dict) -> Any:
+        observed_args = next_args if isinstance(next_args, dict) else function_args
+        if not is_inline_handler:
+            return _execute(observed_args)
+
+        from tools.registry import _task_fence_tool_handoff
+
+        with _task_fence_tool_handoff(
+            function_name,
+            observed_args,
+            {
+                "task_id": effective_task_id or "",
+                "session_id": getattr(agent, "session_id", "") or "",
+            },
+            adapter=f"agent-runtime:{function_name}",
+        ):
+            return _execute(observed_args)
+
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _execute_terminal,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
