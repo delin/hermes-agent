@@ -13,15 +13,19 @@ from hermes_state import SessionDB
 from task_fence import (
     CONTROL_PROTOCOL_VERSION,
     CausalEnvelope,
+    DecisionOutcome,
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
     TASK_FENCE_STORE_SCHEMA_VERSION,
     TaskFenceIngressUnavailable,
+    TaskFencePolicy,
     TaskFenceProtocolRejected,
     TaskFenceProvenanceRejected,
     TaskFenceProvenanceUnavailable,
     bind_causal_envelope,
+    bind_task_fence_policy,
     current_causal_envelope,
+    current_task_fence_policy,
 )
 
 
@@ -117,6 +121,19 @@ def test_causal_envelope_is_frozen_canonical_and_context_scoped():
             assert current_causal_envelope() is None
         assert current_causal_envelope() is generation
     assert current_causal_envelope() is None
+
+
+def test_task_fence_policy_context_is_nested_and_reset():
+    outer = TaskFencePolicy(object())
+    inner = TaskFencePolicy(object())
+
+    assert current_task_fence_policy() is None
+    with bind_task_fence_policy(outer):
+        assert current_task_fence_policy() is outer
+        with bind_task_fence_policy(inner):
+            assert current_task_fence_policy() is inner
+        assert current_task_fence_policy() is outer
+    assert current_task_fence_policy() is None
 
 
 @pytest.mark.parametrize(
@@ -807,8 +824,15 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
                     "WHERE g.generation_id = ?",
                     (envelope.generation_id,),
                 ).fetchone()
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
             assert row is not None
-            return tuple(row)
+            return (*tuple(row), None if attempt is None else attempt["state"])
 
         probe["inspect"] = inspect_generation
         _prepare_real_conversation(
@@ -857,6 +881,7 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
             "committed",
             None,
             invocation.generation_id,
+            "STARTED",
         )
 
         rows = db._conn.execute(
@@ -881,16 +906,38 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
             "started",
             None,
             provider_observed[0].generation_id,
+            None,
         )
         assert provider_states[1] == (
             "started",
             None,
             provider_observed[1].generation_id,
+            None,
         )
         assert provider_observed[0].generation_id == invocation.generation_id
         assert provider_observed[1].generation_id != invocation.generation_id
         assert rows[0]["closed_at"] is not None
         assert rows[1]["closed_at"] is None
+        decisions = db._conn.execute(
+            "SELECT decision_point, outcome, reason_code, operation_kind, adapter "
+            "FROM task_fence_policy_decisions ORDER BY decision_order"
+        ).fetchall()
+        assert [tuple(row) for row in decisions] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                "current_authority",
+                "tool",
+                f"registry:{names[0]}",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                "current_authority",
+                "tool",
+                f"registry:{names[0]}",
+            ),
+        ]
 
         held = db.accept_task_fence_ingress(
             _ingress("comment_hold", "event-after-real", task_id=acceptance.task_id)
@@ -1307,15 +1354,22 @@ def test_redirect_crossing_provider_response_cancels_discarded_generation(
 def test_sequential_and_concurrent_tools_copy_generation_with_unique_invocations(
     provenance_agent,
     registered_probe_tools,
+    tmp_path,
 ):
     names, _, observed, _ = registered_probe_tools
-    generation = _generation()
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-tool-concurrency")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    policy = TaskFencePolicy(db)
 
     sequential = SimpleNamespace(
         content="",
         tool_calls=[_tool_call(names[0], "call-sequential")],
     )
-    with bind_causal_envelope(generation):
+    with bind_causal_envelope(generation), bind_task_fence_policy(policy):
         provenance_agent._execute_tool_calls_sequential(
             sequential,
             [],
@@ -1329,7 +1383,7 @@ def test_sequential_and_concurrent_tools_copy_generation_with_unique_invocations
             _tool_call(names[1], "call-concurrent-b"),
         ],
     )
-    with bind_causal_envelope(generation):
+    with bind_causal_envelope(generation), bind_task_fence_policy(policy):
         provenance_agent._execute_tool_calls_concurrent(
             concurrent,
             [],
@@ -1344,6 +1398,20 @@ def test_sequential_and_concurrent_tools_copy_generation_with_unique_invocations
         generation.generation_id
     }
     assert len({envelope.invocation_id for envelope in envelopes}) == 3
+    attempts = db._conn.execute(
+        "SELECT p.invocation_envelope_id, a.state "
+        "FROM task_fence_attempts AS a "
+        "JOIN task_fence_dispatch_permits AS p ON p.permit_id = a.permit_id"
+    ).fetchall()
+    assert len(attempts) == 3
+    assert {row["invocation_envelope_id"] for row in attempts} == {
+        envelope.invocation_id for envelope in envelopes
+    }
+    assert {row["state"] for row in attempts} == {"STARTED"}
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM task_fence_policy_decisions"
+    ).fetchone()[0] == 6
+    db.close()
 
 
 def test_regular_registry_handler_keeps_legacy_signature_and_scoped_context():

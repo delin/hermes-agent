@@ -15,16 +15,132 @@ Import chain (circular-import safe):
 """
 
 import ast
+import hashlib
 import importlib
 import json
 import logging
 import sys
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+def _task_fence_tool_fingerprint(
+    name: str,
+    args: dict,
+    kwargs: Optional[dict] = None,
+) -> str:
+    """Return a secret-free commitment to the final handler-visible call."""
+
+    operation_kwargs = {
+        key: value
+        for key, value in (kwargs or {}).items()
+        if key != "task_fence_envelope"
+    }
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    digest = hashlib.sha256()
+    for chunk in encoder.iterencode(
+        {"args": args, "kwargs": operation_kwargs, "tool": name}
+    ):
+        digest.update(chunk.encode("utf-8", errors="surrogatepass"))
+    return digest.hexdigest()
+
+
+def _audit_task_fence_tool_start(
+    name: str,
+    args: dict,
+    *,
+    policy: Any,
+    envelope: Any | None,
+    kwargs: dict,
+) -> None:
+    """Best-effort shadow observation immediately before a registry handler."""
+
+    from task_fence import (
+        DecisionOutcome,
+        OperationDescriptor,
+        OperationKind,
+    )
+    invocation_id = (
+        envelope.invocation_id
+        if envelope is not None and envelope.invocation_id is not None
+        else f"tfiv_{uuid.uuid4().hex}"
+    )
+    operation = OperationDescriptor(
+        invocation_id=invocation_id,
+        kind=OperationKind.TOOL,
+        adapter=f"registry:{name}",
+        invocation_fingerprint=_task_fence_tool_fingerprint(name, args, kwargs),
+    )
+    admitted = policy.admit_operation(envelope, operation)
+    if (
+        admitted.outcome is DecisionOutcome.WOULD_RESERVE
+        and admitted.permit_id is not None
+    ):
+        policy.authorize_and_start(envelope, operation, admitted.permit_id)
+
+
+@contextmanager
+def _task_fence_tool_handoff(
+    name: str,
+    args: dict,
+    kwargs: dict,
+) -> Iterator[None]:
+    """Bind one invocation and observe its handoff without gating dispatch."""
+
+    try:
+        from task_fence import (
+            bind_causal_envelope,
+            current_causal_envelope,
+            current_task_fence_policy,
+        )
+
+        policy = current_task_fence_policy()
+        envelope = current_causal_envelope()
+        if policy is not None:
+            if envelope is not None:
+                envelope = envelope.for_invocation()
+            if "task_fence_envelope" in kwargs:
+                kwargs["task_fence_envelope"] = envelope
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow tool context failed for %s: %s",
+            name,
+            type(exc).__name__,
+        )
+        yield
+        return
+
+    if policy is None:
+        yield
+        return
+
+    with bind_causal_envelope(envelope):
+        try:
+            _audit_task_fence_tool_start(
+                name,
+                args,
+                policy=policy,
+                envelope=envelope,
+                kwargs=kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Task Fence shadow tool observation failed for %s: %s",
+                name,
+                type(exc).__name__,
+            )
+        yield
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -624,11 +740,13 @@ class ToolRegistry:
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         try:
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
+            with _task_fence_tool_handoff(name, args, kwargs):
+                if entry.is_async:
+                    from model_tools import _run_async
+
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)

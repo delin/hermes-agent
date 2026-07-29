@@ -6160,9 +6160,21 @@ def run_conversation(
                     except Exception:
                         pass
 
-                from task_fence import bind_causal_envelope
+                from task_fence import (
+                    TaskFencePolicy,
+                    bind_causal_envelope,
+                    bind_task_fence_policy,
+                )
 
-                with bind_causal_envelope(_task_fence_generation_envelope):
+                _task_fence_policy = None
+                if _task_fence_acceptance is not None:
+                    _task_fence_store = getattr(agent, "_session_db", None)
+                    if _task_fence_store is not None:
+                        _task_fence_policy = TaskFencePolicy(_task_fence_store)
+                with (
+                    bind_causal_envelope(_task_fence_generation_envelope),
+                    bind_task_fence_policy(_task_fence_policy),
+                ):
                     agent._execute_tool_calls(
                         assistant_message,
                         messages,

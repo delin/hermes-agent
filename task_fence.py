@@ -931,12 +931,22 @@ _CURRENT_CAUSAL_ENVELOPE: ContextVar[CausalEnvelope | None] = ContextVar(
     "task_fence_causal_envelope",
     default=None,
 )
+_CURRENT_TASK_FENCE_POLICY: ContextVar[TaskFencePolicy | None] = ContextVar(
+    "task_fence_policy",
+    default=None,
+)
 
 
 def current_causal_envelope() -> CausalEnvelope | None:
     """Return process-local immutable provenance without synthesizing it."""
 
     return _CURRENT_CAUSAL_ENVELOPE.get()
+
+
+def current_task_fence_policy() -> TaskFencePolicy | None:
+    """Return the policy explicitly bound for one accepted runtime turn."""
+
+    return _CURRENT_TASK_FENCE_POLICY.get()
 
 
 @contextmanager
@@ -952,6 +962,21 @@ def bind_causal_envelope(
         yield envelope
     finally:
         _CURRENT_CAUSAL_ENVELOPE.reset(token)
+
+
+@contextmanager
+def bind_task_fence_policy(
+    policy: TaskFencePolicy | None,
+) -> Iterator[TaskFencePolicy | None]:
+    """Transport the policy facade without exposing it through tool kwargs."""
+
+    if policy is not None and not isinstance(policy, TaskFencePolicy):
+        raise TaskFenceProtocolRejected("invalid_task_fence_policy_type")
+    token = _CURRENT_TASK_FENCE_POLICY.set(policy)
+    try:
+        yield policy
+    finally:
+        _CURRENT_TASK_FENCE_POLICY.reset(token)
 
 
 def validate_ingress_envelope(envelope: IngressEnvelope) -> None:
