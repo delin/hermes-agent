@@ -3,6 +3,7 @@ import hashlib
 import json
 import socket
 import sqlite3
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1862,17 +1863,180 @@ def test_stale_worker_keeps_captured_authority_instead_of_rebasing(
         db.close()
 
 
-def test_execute_code_rpc_parent_mints_child_without_trusting_request(monkeypatch):
+def _inspect_rpc_handoff(db, envelope, policy):
+    with db._lock:
+        decisions = db._conn.execute(
+            "SELECT decision_point, outcome "
+            "FROM task_fence_policy_decisions "
+            "WHERE operation_invocation_id = ? "
+            "ORDER BY decision_order",
+            (envelope.invocation_id,),
+        ).fetchall()
+        attempt = db._conn.execute(
+            "SELECT a.state FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id "
+            "WHERE p.invocation_envelope_id = ?",
+            (envelope.invocation_id,),
+        ).fetchone()
+    return (
+        [tuple(row) for row in decisions],
+        attempt["state"] if attempt else None,
+        current_task_fence_policy() is policy,
+    )
+
+
+@pytest.fixture
+def rpc_policy_probe(
+    monkeypatch,
+    registered_probe_tools,
+    request,
+    tmp_path,
+):
+    import model_tools
+
+    names, _, observed, probe = registered_probe_tools
+    db = SessionDB(tmp_path / "state.db")
+    request.addfinalizer(db.close)
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-rpc-policy")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    parent = generation.for_invocation("tfiv_execute_code_parent")
+    policy = TaskFencePolicy(db)
+    forged = replace(
+        _generation(),
+        task_id="tft_forged_rpc_policy",
+        generation_id="tfg_forged_rpc_policy",
+    ).for_invocation("tfiv_forged_rpc_policy")
+    dispatch_observed = []
+
+    probe["inspect"] = lambda envelope: _inspect_rpc_handoff(
+        db,
+        envelope,
+        policy,
+    )
+    real_handle = model_tools.handle_function_call
+
+    def traced_handle(function_name, function_args, **kwargs):
+        dispatch_observed.append(
+            (
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                kwargs,
+            )
+        )
+        return real_handle(function_name, function_args, **kwargs)
+
+    monkeypatch.setattr(model_tools, "handle_function_call", traced_handle)
+    return SimpleNamespace(
+        db=db,
+        dispatch_observed=dispatch_observed,
+        forged=forged,
+        name=names[0],
+        observed=observed,
+        parent=parent,
+        policy=policy,
+    )
+
+
+def _assert_rpc_policy_handoff(probe, request_args):
+    from tools.registry import _task_fence_tool_fingerprint
+
+    assert len(probe.dispatch_observed) == 1
+    rpc_child, rpc_policy, dispatch_kwargs = probe.dispatch_observed[0]
+    assert rpc_policy is probe.policy
+    assert dispatch_kwargs == {"task_id": "sandbox-task"}
+    assert rpc_child.parent_invocation_id == probe.parent.invocation_id
+    assert (
+        rpc_child.task_id,
+        rpc_child.authority_event_id,
+        rpc_child.run_id,
+        rpc_child.generation_id,
+        rpc_child.control_revision,
+    ) == (
+        probe.parent.task_id,
+        probe.parent.authority_event_id,
+        probe.parent.run_id,
+        probe.parent.generation_id,
+        probe.parent.control_revision,
+    )
+    assert rpc_child.invocation_id != probe.forged.invocation_id
+
+    assert len(probe.observed) == 1
+    explicit, handoff, _, audit_state = probe.observed[0]
+    assert explicit is None
+    assert handoff.parent_invocation_id == rpc_child.invocation_id
+    assert (
+        handoff.task_id,
+        handoff.authority_event_id,
+        handoff.run_id,
+        handoff.generation_id,
+        handoff.control_revision,
+    ) == (
+        probe.parent.task_id,
+        probe.parent.authority_event_id,
+        probe.parent.run_id,
+        probe.parent.generation_id,
+        probe.parent.control_revision,
+    )
+    assert handoff.invocation_id not in {
+        probe.parent.invocation_id,
+        rpc_child.invocation_id,
+        probe.forged.invocation_id,
+    }
+    assert audit_state == (
+        [
+            ("admission", DecisionOutcome.WOULD_RESERVE.value),
+            ("authorization", DecisionOutcome.WOULD_ALLOW.value),
+        ],
+        "STARTED",
+        True,
+    )
+    attempts = probe.db._conn.execute(
+        "SELECT d.adapter, d.invocation_fingerprint, "
+        "p.invocation_envelope_id, a.state "
+        "FROM task_fence_attempts AS a "
+        "JOIN task_fence_dispatch_permits AS p "
+        "ON p.permit_id = a.permit_id "
+        "JOIN task_fence_policy_decisions AS d "
+        "ON d.attempt_id = a.attempt_id"
+    ).fetchall()
+    assert [tuple(row) for row in attempts] == [
+        (
+            f"registry:{probe.name}",
+            _task_fence_tool_fingerprint(
+                probe.name,
+                request_args,
+                {
+                    "task_id": "sandbox-task",
+                    "session_id": None,
+                    "user_task": None,
+                },
+            ),
+            handoff.invocation_id,
+            "STARTED",
+        )
+    ]
+    assert probe.db._conn.execute(
+        "SELECT COUNT(*) FROM task_fence_policy_decisions"
+    ).fetchone()[0] == 2
+    assert request_args["opaque"] not in "\n".join(probe.db._conn.iterdump())
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX local execute-code transport uses AF_UNIX",
+)
+def test_execute_code_rpc_thread_propagates_policy_to_registered_handoff(
+    rpc_policy_probe,
+):
     from tools.code_execution_tool import _rpc_server_loop
+    from tools.thread_context import propagate_context_to_thread
 
-    parent = _generation().for_invocation("tfiv_execute_code")
-    captured = []
-
-    def fake_handle(name, args, **kwargs):
-        captured.append((name, args, kwargs, current_causal_envelope()))
-        return json.dumps({"ok": True})
-
-    monkeypatch.setattr("model_tools.handle_function_call", fake_handle)
+    probe = rpc_policy_probe
+    request_args = {"opaque": "rpc-local-secret-must-not-be-durable"}
     server_side, client_side = socket.socketpair(
         socket.AF_UNIX,
         socket.SOCK_STREAM,
@@ -1886,38 +2050,45 @@ def test_execute_code_rpc_parent_mints_child_without_trusting_request(monkeypatc
             return server_side, ("peer", 0)
 
     stop = threading.Event()
-    worker = threading.Thread(
-        target=_rpc_server_loop,
-        args=(
-            Listener(),
-            "sandbox-task",
-            [],
-            [0],
-            1,
-            frozenset({"terminal"}),
-            stop,
-            "secret",
-            parent,
-        ),
-        daemon=True,
-    )
-    worker.start()
+    with bind_task_fence_policy(probe.policy):
+        worker = threading.Thread(
+            target=propagate_context_to_thread(_rpc_server_loop),
+            args=(
+                Listener(),
+                "sandbox-task",
+                [],
+                [0],
+                1,
+                frozenset({probe.name}),
+                stop,
+                "secret",
+                probe.parent,
+            ),
+            daemon=True,
+        )
+        worker.start()
+
     try:
         client_side.sendall(
             (
                 json.dumps(
                     {
-                        "tool": "terminal",
-                        "args": {"command": "pwd"},
+                        "tool": probe.name,
+                        "args": request_args,
                         "token": "secret",
-                        "causal_envelope": _generation().to_dict(),
+                        "causal_envelope": probe.forged.to_dict(),
                     }
                 )
                 + "\n"
             ).encode("utf-8")
         )
         client_side.settimeout(5)
-        assert json.loads(client_side.recv(65_536).decode("utf-8")) == {
+        response = b""
+        while b"\n" not in response:
+            chunk = client_side.recv(65_536)
+            assert chunk
+            response += chunk
+        assert json.loads(response.split(b"\n", 1)[0].decode("utf-8")) == {
             "ok": True
         }
     finally:
@@ -1926,12 +2097,8 @@ def test_execute_code_rpc_parent_mints_child_without_trusting_request(monkeypatc
         worker.join(timeout=5)
         server_side.close()
 
-    assert "causal_envelope" not in captured[0][2]
-    child = captured[0][3]
-    assert child is not None
-    assert child.generation_id == parent.generation_id
-    assert child.parent_invocation_id == parent.invocation_id
-    assert child.invocation_id != parent.invocation_id
+    assert not worker.is_alive()
+    _assert_rpc_policy_handoff(probe, request_args)
 
 
 def test_execute_code_remote_rpc_uses_trusted_parent_and_legacy_handler_shape(
@@ -2009,6 +2176,80 @@ def test_execute_code_remote_rpc_uses_trusted_parent_and_legacy_handler_shape(
         parent.invocation_id,
         forged.invocation_id,
     }
+
+
+def test_execute_code_remote_rpc_thread_propagates_policy_to_registered_handoff(
+    rpc_policy_probe,
+):
+    import base64
+    from tools.code_execution_tool import _rpc_poll_loop
+    from tools.thread_context import propagate_context_to_thread
+
+    probe = rpc_policy_probe
+    request_args = {"opaque": "rpc-remote-secret-must-not-be-durable"}
+    responses = []
+    stop = threading.Event()
+
+    class RemoteEnv:
+        def __init__(self):
+            self.listed = False
+
+        def execute(self, command, **_kwargs):
+            if command.startswith("ls -1 "):
+                if self.listed:
+                    return {"output": ""}
+                self.listed = True
+                return {"output": "/rpc/req_000001\n"}
+            if command.startswith("cat "):
+                return {
+                    "output": json.dumps(
+                        {
+                            "tool": probe.name,
+                            "args": request_args,
+                            "seq": 1,
+                            "token": "secret",
+                            "causal_envelope": probe.forged.to_dict(),
+                        }
+                    )
+                }
+            if command.startswith("echo '"):
+                encoded = command.split("'", 2)[1]
+                responses.append(
+                    json.loads(base64.b64decode(encoded).decode("utf-8"))
+                )
+            if command.startswith("rm -f "):
+                stop.set()
+            return {"output": ""}
+
+    counter = [0]
+    with bind_task_fence_policy(probe.policy):
+        worker = threading.Thread(
+            target=propagate_context_to_thread(_rpc_poll_loop),
+            args=(
+                RemoteEnv(),
+                "/rpc",
+                "sandbox-task",
+                [],
+                counter,
+                1,
+                frozenset({probe.name}),
+                stop,
+                "secret",
+                probe.parent,
+            ),
+            daemon=True,
+        )
+        worker.start()
+    worker.join(timeout=5)
+
+    try:
+        assert not worker.is_alive()
+        assert counter == [1]
+        assert responses == [{"ok": True}]
+        _assert_rpc_policy_handoff(probe, request_args)
+    finally:
+        stop.set()
+        worker.join(timeout=1)
 
 
 def test_execute_code_real_child_process_preserves_trusted_parent():
