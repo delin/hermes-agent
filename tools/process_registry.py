@@ -29,8 +29,10 @@ Usage:
     process_registry.kill(session.id)
 """
 
+import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import shlex
@@ -137,6 +139,154 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    # Live-only Task Fence completion provenance. These values never enter
+    # process events, public status, model context, or crash checkpoints.
+    _task_fence_parent_generation_id: Optional[str] = field(default=None, repr=False)
+    _task_fence_parent_runtime_epoch: Optional[int] = field(default=None, repr=False)
+    _task_fence_store_path: Optional[str] = field(default=None, repr=False)
+
+
+def _capture_task_fence_process_parent() -> "tuple[Optional[str], Optional[int], Optional[str]]":
+    """Capture only trusted live provenance before a process reader can exit."""
+
+    try:
+        from task_fence import current_causal_envelope, current_task_fence_policy
+
+        parent = current_causal_envelope()
+        policy = current_task_fence_policy()
+        if parent is None and policy is None:
+            return None, None, None
+        if parent is None or policy is None:
+            raise ValueError("incomplete Task Fence process parent")
+        store = getattr(policy, "_store", None)
+        store_path = getattr(store, "db_path", None)
+        if store_path is None:
+            raise ValueError("Task Fence store path unavailable")
+        return (
+            parent.generation_id,
+            parent.runtime_epoch,
+            os.path.abspath(os.fspath(store_path)),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow process-parent capture failed: %s",
+            type(exc).__name__,
+        )
+        return None, None, None
+
+
+def observe_task_fence_process_completion(event: Dict[str, Any]) -> None:
+    """Best-effort exact evidence after one ordinary completion delivery."""
+
+    if not isinstance(event, dict) or event.get("type") != "completion":
+        return
+    try:
+        session_id = event.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id.encode("utf-8")) > 512
+        ):
+            raise ValueError("invalid process completion evidence")
+        with process_registry._lock:
+            session = (
+                process_registry._running.get(session_id)
+                or process_registry._finished.get(session_id)
+            )
+        if session is None:
+            return
+        with session._lock:
+            parent_generation_id = session._task_fence_parent_generation_id
+            parent_runtime_epoch = session._task_fence_parent_runtime_epoch
+            store_path = session._task_fence_store_path
+            started_at = session.started_at
+            detached = session.detached
+        if (
+            parent_generation_id is None
+            and parent_runtime_epoch is None
+            and store_path is None
+        ):
+            return
+        if detached:
+            return
+        event_started_at = event.get("started_at")
+        if (
+            not isinstance(parent_generation_id, str)
+            or not parent_generation_id
+            or type(parent_runtime_epoch) is not int
+            or parent_runtime_epoch < 0
+            or not isinstance(session_id, str)
+            or not session_id
+            or len(session_id.encode("utf-8")) > 512
+            or type(started_at) not in {int, float}
+            or not math.isfinite(float(started_at))
+            or started_at < 0
+            or type(event_started_at) is not type(started_at)
+            or event_started_at != started_at
+            or (
+                event.get("exit_code") is not None
+                and type(event.get("exit_code")) is not int
+            )
+            or not isinstance(event.get("completion_reason"), str)
+            or len(event["completion_reason"].encode("utf-8")) > 128
+            or not isinstance(event.get("termination_source"), str)
+            or len(event["termination_source"].encode("utf-8")) > 128
+            or not isinstance(event.get("command"), str)
+            or not isinstance(event.get("output"), str)
+            or not isinstance(store_path, str)
+            or not store_path
+            or len(store_path.encode("utf-8")) > 4096
+            or not os.path.isabs(store_path)
+        ):
+            raise ValueError("invalid process completion evidence")
+        event_json = json.dumps(
+            event,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        event_bytes = event_json.encode("utf-8")
+        if len(event_bytes) > 1_000_000:
+            raise ValueError("process completion evidence too large")
+        identity = json.dumps(
+            (session_id, started_at),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        source_event_id = "tfpc_" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()
+        payload_hash = hashlib.sha256(event_bytes).hexdigest()
+
+        from pathlib import Path
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(Path(store_path))
+        try:
+            acceptance = db.accept_task_fence_process_completion_evidence(
+                source_event_id=source_event_id,
+                parent_generation_id=parent_generation_id,
+                parent_runtime_epoch=parent_runtime_epoch,
+                payload_hash=payload_hash,
+                opaque_payload_ref=(
+                    f"process-completion:{session_id}:{source_event_id}"
+                ),
+            )
+            if (
+                acceptance.opened_run_id is not None
+                or acceptance.closed_run_id is not None
+            ):
+                raise RuntimeError("process completion evidence changed run state")
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow process-completion evidence failed: %s",
+            type(exc).__name__,
+        )
 
 
 class ProcessRegistry:
@@ -714,6 +864,11 @@ class ProcessRegistry:
 
         safe_command = _rewrite_bg(command)
 
+        (
+            task_fence_parent_generation_id,
+            task_fence_parent_runtime_epoch,
+            task_fence_store_path,
+        ) = _capture_task_fence_process_parent()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -721,6 +876,9 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            _task_fence_parent_generation_id=task_fence_parent_generation_id,
+            _task_fence_parent_runtime_epoch=task_fence_parent_runtime_epoch,
+            _task_fence_store_path=task_fence_store_path,
         )
 
         if use_pty:
@@ -854,6 +1012,11 @@ class ProcessRegistry:
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
         """
+        (
+            task_fence_parent_generation_id,
+            task_fence_parent_runtime_epoch,
+            task_fence_store_path,
+        ) = _capture_task_fence_process_parent()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -863,6 +1026,9 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            _task_fence_parent_generation_id=task_fence_parent_generation_id,
+            _task_fence_parent_runtime_epoch=task_fence_parent_runtime_epoch,
+            _task_fence_store_path=task_fence_store_path,
         )
 
         # Run the command in the sandbox with output capture

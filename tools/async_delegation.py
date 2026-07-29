@@ -605,6 +605,10 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    elif evt.get("type") == "completion":
+        from tools.process_registry import observe_task_fence_process_completion
+
+        observe_task_fence_process_completion(evt)
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:

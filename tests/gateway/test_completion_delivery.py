@@ -363,6 +363,33 @@ def test_distinct_process_incarnations_are_not_deduplicated():
     assert adapter.handle_message.await_count == 2
 
 
+def test_process_evidence_is_observed_after_adapter_acceptance(monkeypatch):
+    order = []
+
+    async def _accepted(_event):
+        order.append("adapter")
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_accepted))
+    runner = _runner(adapter)
+    from tools import async_delegation
+
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda event, claim: order.append(
+            ("evidence", event["session_id"], claim)
+        ),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(
+            "completion",
+            _completion_event(started_at=10.0),
+        )
+    ) is True
+    assert order == ["adapter", ("evidence", "proc_reused", "")]
+
+
 def test_delivered_identity_retention_is_bounded():
     """Lifecycle dedupe cannot grow without bound in a long-running gateway."""
     adapter = SimpleNamespace(handle_message=AsyncMock())

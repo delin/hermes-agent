@@ -1,8 +1,12 @@
+from contextlib import nullcontext
 from contextvars import copy_context
 from dataclasses import FrozenInstanceError
 import hashlib
 import json
+import logging
 import queue
+import shlex
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -226,6 +230,57 @@ def _drain_completion_queue() -> None:
 
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
+
+
+def _spawn_gated_local_process(registry, tmp_path, *, label: str):
+    marker = tmp_path / f"{label}.release"
+    toxic_text = f"TASK_FENCE_PROCESS_PAYLOAD_{label}"
+    source = "\n".join(
+        (
+            "from pathlib import Path",
+            "import time",
+            f"marker = Path({str(marker)!r})",
+            "while not marker.exists():",
+            "    time.sleep(0.01)",
+            f"print({toxic_text!r})",
+        )
+    )
+    command = (
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
+    )
+    session = registry.spawn_local(
+        command=command,
+        cwd=str(tmp_path),
+        task_id="runtime-process-task",
+        session_key="process-owner-session",
+    )
+    return session, marker, toxic_text
+
+
+def _await_process_completion(
+    registry,
+    session_id: str,
+    *,
+    timeout: float = 10.0,
+):
+    deadline = time.monotonic() + timeout
+    deferred = []
+    try:
+        while time.monotonic() < deadline:
+            try:
+                event = registry.completion_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if (
+                event.get("type") == "completion"
+                and event.get("session_id") == session_id
+            ):
+                return event
+            deferred.append(event)
+    finally:
+        for event in deferred:
+            registry.completion_queue.put(event)
+    raise AssertionError(f"process completion not received for {session_id}")
 
 
 @pytest.fixture
@@ -1079,5 +1134,347 @@ def test_restored_completion_uses_exact_durable_evidence(
         )
         assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
         assert _task_fence_execution_counts(db) == execution_counts
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("with_parent", "with_policy", "warning_count"),
+    (
+        (False, False, 0),
+        (True, False, 1),
+        (False, True, 1),
+    ),
+)
+def test_process_parent_capture_requires_complete_context(
+    tmp_path,
+    caplog,
+    with_parent,
+    with_policy,
+    warning_count,
+):
+    from tools.process_registry import _capture_task_fence_process_parent
+
+    db_path = tmp_path / "state.db"
+    db, _acceptance, generation = _live_lane(db_path)
+    policy = TaskFencePolicy(db)
+    try:
+        caplog.clear()
+        with (
+            caplog.at_level(logging.WARNING, logger="tools.process_registry"),
+            bind_causal_envelope(generation) if with_parent else nullcontext(),
+            bind_task_fence_policy(policy) if with_policy else nullcontext(),
+        ):
+            captured = _capture_task_fence_process_parent()
+
+        assert captured == (None, None, None)
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith(
+                "Task Fence shadow process-parent capture failed:"
+            )
+        ]
+        assert warnings == [
+            "Task Fence shadow process-parent capture failed: ValueError"
+        ] * warning_count
+        warning_text = "\n".join(warnings)
+        assert generation.generation_id not in warning_text
+        assert str(db_path) not in warning_text
+    finally:
+        db.close()
+
+
+def test_live_process_completion_records_exact_synthetic_evidence(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from tools import process_registry as process_registry_module
+
+    registry_home = tmp_path / "registry-home"
+    registry_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(registry_home))
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(
+        process_registry_module,
+        "CHECKPOINT_PATH",
+        checkpoint,
+    )
+    registry = process_registry_module.ProcessRegistry()
+    monkeypatch.setattr(
+        process_registry_module,
+        "process_registry",
+        registry,
+    )
+
+    owner_db_path = tmp_path / "owner-home" / "state.db"
+    db, acceptance, generation = _live_lane(owner_db_path)
+    policy = TaskFencePolicy(db)
+    ambient_home = tmp_path / "ambient-home"
+    ambient_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+
+    session = None
+    marker = None
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(policy),
+        ):
+            session, marker, toxic_text = _spawn_gated_local_process(
+                registry,
+                tmp_path,
+                label="live",
+            )
+        assert session._task_fence_parent_generation_id == generation.generation_id
+        assert session._task_fence_parent_runtime_epoch == generation.runtime_epoch
+        assert session._task_fence_store_path == str(owner_db_path.resolve())
+
+        checkpoint_rows = json.loads(checkpoint.read_text(encoding="utf-8"))
+        checkpoint_row = next(
+            row for row in checkpoint_rows
+            if row["session_id"] == session.id
+        )
+        assert not any(
+            "task_fence" in key
+            or "causal_parent" in key
+            or key == "store_path"
+            for key in checkpoint_row
+        )
+
+        session.notify_on_complete = True
+        held = db.accept_task_fence_ingress(
+            _ingress(
+                "comment_hold",
+                "process-completion-late-hold",
+                task_id=acceptance.task_id,
+            )
+        )
+        held_task = db.inspect_task_fence_task(acceptance.task_id).task
+        assert held_task is not None
+        assert held_task.status == "paused"
+        assert held_task.active_execution_run_id is None
+        assert held_task.current_generation_id is None
+        execution_counts = _task_fence_execution_counts(db)
+        ingress_count = db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0]
+
+        marker.touch()
+        event = _await_process_completion(registry, session.id)
+        assert toxic_text in event["output"]
+        assert not any(key.startswith("_task_fence_") for key in event)
+        assert "causal_parent_generation_id" not in event
+        assert "causal_parent_runtime_epoch" not in event
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:process_completion'"
+        ).fetchone()[0] == 0
+
+        registry.completion_queue.put(event)
+        drained = registry.drain_notifications(
+            session_key=session.session_key,
+            owns_event=lambda candidate: (
+                candidate.get("session_id") == session.id
+            ),
+        )
+        assert len(drained) == 1
+        delivered_event, synthetic_message = drained[0]
+        assert delivered_event == event
+        assert toxic_text in synthetic_message
+        from tools.async_delegation import (
+            claim_event_delivery,
+            complete_event_delivery,
+        )
+
+        claim = claim_event_delivery(delivered_event, "process-test")
+        assert claim == ""
+        complete_event_delivery(delivered_event, claim)
+
+        identity = json.dumps(
+            (session.id, session.started_at),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        source_event_id = "tfpc_" + _hash(identity)
+        event_json = json.dumps(
+            delivered_event,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        evidence = db._conn.execute(
+            "SELECT i.source_event_id, i.conversation_id, i.task_id, "
+            "i.origin, i.ingress_class, i.intent, i.execution, "
+            "i.input_effect, i.correlation_kind, i.payload_hash, "
+            "i.opaque_payload_ref, i.causal_parent_generation_id, "
+            "i.accepted_order, s.opened_run_id, s.closed_run_id, "
+            "s.task_status, s.task_active_authority_event_id, "
+            "s.task_active_execution_run_id, s.task_current_generation_id "
+            "FROM task_fence_ingress AS i "
+            "JOIN task_fence_acceptance_snapshots AS s "
+            "ON s.event_id = i.event_id "
+            "WHERE i.source = 'runtime:process_completion'"
+        ).fetchone()
+        assert evidence is not None
+        assert tuple(evidence[:12]) == (
+            source_event_id,
+            "delegation-conversation",
+            acceptance.task_id,
+            "runtime",
+            "synthetic",
+            "keep",
+            "none",
+            "none",
+            "none",
+            _hash(event_json),
+            f"process-completion:{session.id}:{source_event_id}",
+            generation.generation_id,
+        )
+        assert evidence["accepted_order"] == held.accepted_order + 1
+        assert tuple(evidence[13:]) == (
+            None,
+            None,
+            "paused",
+            held.event_id,
+            None,
+            None,
+        )
+
+        after = db.inspect_task_fence_task(acceptance.task_id).task
+        assert after is not None
+        assert _task_fence_authority_projection(after) == (
+            _task_fence_authority_projection(held_task)
+        )
+        assert after.last_accepted_order == evidence["accepted_order"]
+        assert _task_fence_execution_counts(db) == execution_counts
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0] == ingress_count + 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 0
+        stored = repr(
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT * FROM task_fence_ingress "
+                    "WHERE source = 'runtime:process_completion'"
+                )
+            ]
+        )
+        assert toxic_text not in stored
+        assert not (ambient_home / "state.db").exists()
+
+        complete_event_delivery(delivered_event, "")
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:process_completion'"
+        ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 0
+        mutated_event = {
+            **delivered_event,
+            "output": delivered_event["output"] + "\nmutated",
+        }
+        with caplog.at_level(
+            logging.WARNING,
+            logger="tools.process_registry",
+        ):
+            complete_event_delivery(mutated_event, "")
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 1
+        assert any(
+            "TaskFenceIngressRejected" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        if marker is not None:
+            marker.touch(exist_ok=True)
+        if session is not None and not session.exited:
+            registry.kill_process(session.id)
+        db.close()
+
+
+def test_stale_pre_registration_process_notification_cannot_open_task_fence_run(
+    tmp_path,
+    caplog,
+    monkeypatch,
+):
+    from tools import process_registry as process_registry_module
+
+    runtime_home = tmp_path / "runtime-home"
+    runtime_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setattr(
+        process_registry_module,
+        "CHECKPOINT_PATH",
+        tmp_path / "processes.json",
+    )
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    registry = process_registry_module.ProcessRegistry()
+    monkeypatch.setattr(
+        process_registry_module,
+        "process_registry",
+        registry,
+    )
+    session = process_registry_module.ProcessSession(
+        id="proc_pre_registration",
+        command="ignored toxic command",
+        started_at=1234.5,
+        exited=True,
+        exit_code=0,
+        completion_reason="exited",
+        termination_source="",
+        _task_fence_parent_generation_id=generation.generation_id,
+        _task_fence_parent_runtime_epoch=generation.runtime_epoch,
+        _task_fence_store_path=str((tmp_path / "state.db").resolve()),
+    )
+    with registry._lock:
+        registry._running[session.id] = session
+    event = {
+        "type": "completion",
+        "session_id": session.id,
+        "session_key": "process-owner-session",
+        "command": session.command,
+        "exit_code": session.exit_code,
+        "completion_reason": session.completion_reason,
+        "termination_source": session.termination_source,
+        "output": "ignored toxic output",
+        "started_at": session.started_at,
+    }
+    execution_counts = _task_fence_execution_counts(db)
+    try:
+        db._conn.execute(
+            "UPDATE task_fence_control SET runtime_epoch = ? "
+            "WHERE singleton = 1",
+            (generation.runtime_epoch + 1,),
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger="tools.process_registry",
+        ):
+            from tools.async_delegation import complete_event_delivery
+
+            complete_event_delivery(event, "")
+
+        assert registry.completion_queue.empty()
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:process_completion'"
+        ).fetchone()[0] == 0
+        assert _task_fence_execution_counts(db) == execution_counts
+        assert any(
+            "TaskFenceIngressUnavailable" in record.getMessage()
+            for record in caplog.records
+        )
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 0
     finally:
         db.close()

@@ -18572,6 +18572,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return injection_result
             accepted = True
 
+            if evt.get("type") == "completion":
+                from tools.async_delegation import complete_event_delivery
+
+                complete_event_delivery(evt, "")
+
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)

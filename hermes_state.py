@@ -9431,7 +9431,47 @@ class SessionDB:
     ) -> IngressAcceptance:
         """Accept delegation evidence without letting its caller choose authority."""
 
-        source = "runtime:async_delegation"
+        return self._accept_task_fence_synthetic_evidence(
+            source="runtime:async_delegation",
+            source_event_id=source_event_id,
+            parent_generation_id=parent_generation_id,
+            parent_runtime_epoch=parent_runtime_epoch,
+            payload_hash=payload_hash,
+            opaque_payload_ref=opaque_payload_ref,
+        )
+
+    def accept_task_fence_process_completion_evidence(
+        self,
+        *,
+        source_event_id: str,
+        parent_generation_id: str,
+        parent_runtime_epoch: int,
+        payload_hash: str,
+        opaque_payload_ref: str,
+    ) -> IngressAcceptance:
+        """Accept process completion evidence without caller-selected authority."""
+
+        return self._accept_task_fence_synthetic_evidence(
+            source="runtime:process_completion",
+            source_event_id=source_event_id,
+            parent_generation_id=parent_generation_id,
+            parent_runtime_epoch=parent_runtime_epoch,
+            payload_hash=payload_hash,
+            opaque_payload_ref=opaque_payload_ref,
+        )
+
+    def _accept_task_fence_synthetic_evidence(
+        self,
+        *,
+        source: str,
+        source_event_id: str,
+        parent_generation_id: str,
+        parent_runtime_epoch: int,
+        payload_hash: str,
+        opaque_payload_ref: str,
+    ) -> IngressAcceptance:
+        """Accept one trusted-core synthetic source against an exact parent."""
+
         if not _task_fence_v2_identifier_compatible(parent_generation_id):
             raise TaskFenceProtocolRejected("invalid_parent_generation_id")
         if type(parent_runtime_epoch) is not int or parent_runtime_epoch < 0:
