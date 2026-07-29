@@ -1615,6 +1615,12 @@ class _BedrockCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         from agent.bedrock_adapter import call_converse
 
+        task_fence_model_policy = kwargs.pop(
+            "_task_fence_model_policy", None
+        )
+        task_fence_model_route = kwargs.pop(
+            "_task_fence_model_route", None
+        )
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
@@ -1640,6 +1646,20 @@ class _BedrockCompletionsAdapter:
                 "stream); caller downgrades to non-streaming.",
                 model,
             )
+        task_fence_kwargs: Dict[str, Any] = {}
+        if task_fence_model_policy is not None:
+            task_fence_kwargs = {
+                "task_fence_model_policy": task_fence_model_policy,
+                "task_fence_model_route": task_fence_model_route or {
+                    "api_mode": "bedrock_converse",
+                    "provider": "bedrock",
+                    "model": str(model or ""),
+                    "endpoint": (
+                        f"https://bedrock-runtime.{self._region}.amazonaws.com"
+                    ),
+                    "region": self._region,
+                },
+            }
         return call_converse(
             region=self._region,
             model=model,
@@ -1649,6 +1669,7 @@ class _BedrockCompletionsAdapter:
             temperature=kwargs.get("temperature"),
             top_p=kwargs.get("top_p"),
             stop_sequences=stop,
+            **task_fence_kwargs,
         )
 
 
@@ -3783,13 +3804,46 @@ def _task_fence_sync_model_create(
     base_url = str(getattr(client, "base_url", "") or "")
     base_url_lower = base_url.lower()
     provider = str(route_provider or "")
+    bedrock_hostname = base_url_hostname(base_url_lower)
+    canonical_bedrock_endpoint = (
+        bedrock_hostname.startswith("bedrock-runtime.")
+        and base_url_host_matches(base_url_lower, "amazonaws.com")
+    )
+    bedrock_model = str(kwargs.get("model") or "")
+    anthropic_bedrock_model = False
+    if canonical_bedrock_endpoint and isinstance(
+        client, (BedrockAuxiliaryClient, AnthropicAuxiliaryClient)
+    ):
+        from agent.bedrock_adapter import is_anthropic_bedrock_model
 
-    # These facades do not yet own an exact Task Fence wire boundary. Keep
-    # their legacy call shape and do not forward the private capability.
+        anthropic_bedrock_model = is_anthropic_bedrock_model(bedrock_model)
+    bedrock_converse_client = (
+        canonical_bedrock_endpoint
+        and isinstance(client, BedrockAuxiliaryClient)
+        and bool(bedrock_model)
+        and not anthropic_bedrock_model
+    )
+    anthropic_bedrock_client = (
+        canonical_bedrock_endpoint
+        and isinstance(client, AnthropicAuxiliaryClient)
+        and anthropic_bedrock_model
+    )
+
+    # Unowned facades keep their legacy call shape and never receive the
+    # private capability. Known Bedrock wrappers are admitted only for the
+    # exact model family and canonical physical endpoint they own.
     if (
-        isinstance(client, BedrockAuxiliaryClient)
-        or base_url_lower.startswith(("acp://", "acp+tcp://", "moa://"))
-        or "bedrock-runtime." in base_url_lower
+        base_url_lower.startswith(("acp://", "acp+tcp://", "moa://"))
+        or (
+            isinstance(client, BedrockAuxiliaryClient)
+            and not bedrock_converse_client
+        )
+        or (
+            "bedrock-runtime." in base_url_lower
+            and not (
+                bedrock_converse_client or anthropic_bedrock_client
+            )
+        )
     ):
         return create(**kwargs)
     try:
@@ -3807,6 +3861,19 @@ def _task_fence_sync_model_create(
         "endpoint": base_url,
     }
     private_kwargs = dict(kwargs)
+
+    if bedrock_converse_client:
+        route.update(
+            api_mode="bedrock_converse",
+            provider="bedrock",
+            region=str(getattr(client, "_region", "") or ""),
+        )
+        private_kwargs["_task_fence_model_policy"] = task_fence_model_policy
+        private_kwargs["_task_fence_model_route"] = route
+        return create(**private_kwargs)
+
+    if anthropic_bedrock_client:
+        route["provider"] = "bedrock"
 
     if isinstance(client, CodexAuxiliaryClient):
         route["api_mode"] = "codex_responses"

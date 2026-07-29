@@ -808,14 +808,21 @@ def persistent_moa_agent(
     registered_probe_tools,
     monkeypatch,
     tmp_path,
+    request,
 ):
     from run_agent import AIAgent
 
     names, _, _, _ = registered_probe_tools
+    aggregator = getattr(request, "param", None) or {
+        "provider": "openrouter",
+        "model": "aggregator-model",
+    }
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
-        """
+        f"""
+bedrock:
+  region: us-east-1
 moa:
   default_preset: task-fence
   presets:
@@ -825,8 +832,8 @@ moa:
         - provider: openrouter
           model: reference-model
       aggregator:
-        provider: openrouter
-        model: aggregator-model
+        provider: {aggregator["provider"]}
+        model: {aggregator["model"]}
 """.strip(),
         encoding="utf-8",
     )
@@ -1367,6 +1374,353 @@ def test_real_persistent_moa_stream_retry_reuses_outer_generation(
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 2
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "persistent_moa_agent",
+    [
+        {
+            "provider": "bedrock",
+            "model": "openai.gpt-oss-20b-1:0",
+        }
+    ],
+    indirect=True,
+)
+def test_real_persistent_moa_bedrock_converse_retry_reuses_outer_generation(
+    persistent_moa_agent,
+    monkeypatch,
+    tmp_path,
+):
+    import agent.auxiliary_client as auxiliary_client
+    import agent.bedrock_adapter as bedrock_adapter
+    from agent.auxiliary_client import BedrockAuxiliaryClient
+
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-persistent-moa-bedrock-converse")
+    )
+    persistent_moa_agent._session_db = db
+    model = "openai.gpt-oss-20b-1:0"
+    prompt_secret = "raw-persistent-moa-bedrock-prompt"
+    reference_secret = "raw-persistent-moa-bedrock-reference"
+    aws_secret = "raw-persistent-moa-aws-secret"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "raw-persistent-moa-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", aws_secret)
+    factories = []
+    reference_calls = []
+    handoffs = []
+    converse_calls = 0
+
+    def reference_create(**kwargs):
+        reference_calls.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        return _model_response(
+            content=reference_secret,
+            tool_calls=None,
+            finish_reason="stop",
+        )
+
+    reference_client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="raw-reference-client-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=reference_create),
+        ),
+    )
+    bedrock_client = BedrockAuxiliaryClient("us-east-1", model)
+
+    def converse(**kwargs):
+        nonlocal converse_calls
+        converse_calls += 1
+        _record_started_model_wire(db, handoffs, "converse", kwargs)
+        if converse_calls == 1:
+            raise httpx.RemoteProtocolError(
+                "peer closed connection during persistent MoA Bedrock wire"
+            )
+        return _raw_bedrock_response("persistent MoA Bedrock complete")
+
+    boto_client = SimpleNamespace(converse=converse)
+
+    def get_cached(provider, resolved_model, **_kwargs):
+        factories.append(
+            (
+                provider,
+                resolved_model,
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        if provider == "openrouter":
+            return reference_client, resolved_model
+        assert provider == "bedrock"
+        return bedrock_client, resolved_model
+
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_cached)
+    monkeypatch.setattr(auxiliary_client, "_transient_retry_count", lambda: 1)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_TRANSIENT_RETRY_BACKOFF_BASE",
+        0.0,
+    )
+    monkeypatch.setattr(
+        bedrock_adapter,
+        "_get_bedrock_runtime_client",
+        lambda _region: boto_client,
+    )
+    try:
+        with (
+            patch.object(persistent_moa_agent, "_persist_session"),
+            patch.object(persistent_moa_agent, "_save_trajectory"),
+            patch.object(persistent_moa_agent, "_cleanup_task_resources"),
+        ):
+            result = persistent_moa_agent.run_conversation(
+                prompt_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "persistent MoA Bedrock complete"
+        assert len(reference_calls) == 1
+        assert reference_calls[0][1:] == (None, None, False)
+        assert [entry[0] for entry in handoffs] == ["converse", "converse"]
+        assert {entry[3] for entry in handoffs} == {"STARTED"}
+        assert all(entry[4] is None for entry in handoffs)
+        assert not any(entry[5] for entry in handoffs)
+        envelopes = [entry[2] for entry in handoffs]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert {envelope.generation_id for envelope in envelopes} == {
+            db._conn.execute(
+                "SELECT generation_id FROM task_fence_model_generations"
+            ).fetchone()["generation_id"]
+        }
+        assert handoffs[0][1] == handoffs[1][1]
+
+        generations = db._conn.execute(
+            "SELECT state, closed_at FROM task_fence_model_generations"
+        ).fetchall()
+        assert [tuple(row) for row in generations] == [("committed", None)]
+        model_decisions = db._conn.execute(
+            "SELECT adapter, invocation_fingerprint "
+            "FROM task_fence_policy_decisions "
+            "WHERE operation_kind = 'model' ORDER BY decision_order"
+        ).fetchall()
+        assert len(model_decisions) == 4
+        assert {row["adapter"] for row in model_decisions} == {
+            "provider:bedrock.converse"
+        }
+        assert len({row["invocation_fingerprint"] for row in model_decisions}) == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        assert all(entry[3] is None for entry in factories)
+        assert not any(entry[4] for entry in factories)
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        for secret in (
+            prompt_secret,
+            reference_secret,
+            reference_client.api_key,
+            aws_secret,
+        ):
+            assert secret not in audit_dump
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "persistent_moa_agent",
+    [
+        {
+            "provider": "bedrock",
+            "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        }
+    ],
+    indirect=True,
+)
+def test_real_persistent_moa_anthropic_bedrock_fallback_reuses_outer_generation(
+    persistent_moa_agent,
+    monkeypatch,
+    tmp_path,
+):
+    import agent.auxiliary_client as auxiliary_client
+    from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-persistent-moa-anthropic-bedrock")
+    )
+    persistent_moa_agent._session_db = db
+    model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    prompt_secret = "raw-persistent-moa-anthropic-bedrock-prompt"
+    reference_secret = "raw-persistent-moa-anthropic-bedrock-reference"
+    factories = []
+    reference_calls = []
+    handoffs = []
+    final_message = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text="persistent MoA Anthropic Bedrock complete",
+            )
+        ],
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+
+    def reference_create(**kwargs):
+        reference_calls.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        return _model_response(
+            content=reference_secret,
+            tool_calls=None,
+            finish_reason="stop",
+        )
+
+    reference_client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="raw-anthropic-reference-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=reference_create),
+        ),
+    )
+
+    class UnavailableStream:
+        def __enter__(self):
+            raise RuntimeError(
+                "not authorized to perform: "
+                "bedrock:InvokeModelWithResponseStream"
+            )
+
+        def __exit__(self, *_args):
+            return False
+
+    class Messages:
+        @staticmethod
+        def stream(**kwargs):
+            _record_started_model_wire(db, handoffs, "stream", kwargs)
+            return UnavailableStream()
+
+        @staticmethod
+        def create(**kwargs):
+            _record_started_model_wire(db, handoffs, "create", kwargs)
+            return final_message
+
+    anthropic_client = AnthropicAuxiliaryClient(
+        SimpleNamespace(messages=Messages(), close=lambda: None),
+        model,
+        "aws-sdk",
+        "https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+
+    def get_cached(provider, resolved_model, **_kwargs):
+        factories.append(
+            (
+                provider,
+                resolved_model,
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        if provider == "openrouter":
+            return reference_client, resolved_model
+        assert provider == "bedrock"
+        return anthropic_client, resolved_model
+
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_cached)
+    try:
+        with (
+            patch.object(persistent_moa_agent, "_persist_session"),
+            patch.object(persistent_moa_agent, "_save_trajectory"),
+            patch.object(persistent_moa_agent, "_cleanup_task_resources"),
+        ):
+            result = persistent_moa_agent.run_conversation(
+                prompt_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert (
+            result["final_response"]
+            == "persistent MoA Anthropic Bedrock complete"
+        )
+        assert len(reference_calls) == 1
+        assert reference_calls[0][1:] == (None, None, False)
+        assert [entry[0] for entry in handoffs] == ["stream", "create"]
+        assert {entry[3] for entry in handoffs} == {"STARTED"}
+        assert all(entry[4] is None for entry in handoffs)
+        assert not any(entry[5] for entry in handoffs)
+        envelopes = [entry[2] for entry in handoffs]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert len({envelope.generation_id for envelope in envelopes}) == 1
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT state, closed_at FROM task_fence_model_generations"
+            )
+        ] == [("committed", None)]
+        assert [
+            row["adapter"]
+            for row in db._conn.execute(
+                "SELECT adapter FROM task_fence_policy_decisions "
+                "WHERE operation_kind = 'model' ORDER BY decision_order"
+            )
+        ] == [
+            "provider:anthropic.messages.stream",
+            "provider:anthropic.messages.stream",
+            "provider:anthropic.messages.create",
+            "provider:anthropic.messages.create",
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        assert all(entry[3] is None for entry in factories)
+        assert not any(entry[4] for entry in factories)
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        for secret in (
+            prompt_secret,
+            reference_secret,
+            reference_client.api_key,
+        ):
+            assert secret not in audit_dump
         assert current_causal_envelope() is None
         assert current_task_fence_policy() is None
     finally:

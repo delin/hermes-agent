@@ -1099,6 +1099,8 @@ def call_converse(
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
     guardrail_config: Optional[Dict] = None,
+    task_fence_model_policy: Any = None,
+    task_fence_model_route: Optional[Dict[str, Any]] = None,
 ) -> SimpleNamespace:
     """Call Bedrock Converse API (non-streaming) and return an OpenAI-compatible response.
 
@@ -1117,7 +1119,26 @@ def call_converse(
     )
 
     try:
-        response = client.converse(**kwargs)
+        if task_fence_model_policy is None:
+            response = client.converse(**kwargs)
+        else:
+            from agent.task_fence_provider import task_fence_model_handoff
+
+            with task_fence_model_handoff(
+                adapter="provider:bedrock.converse",
+                request=kwargs,
+                route=task_fence_model_route or {
+                    "api_mode": "bedrock_converse",
+                    "provider": "bedrock",
+                    "model": str(model or ""),
+                    "endpoint": (
+                        f"https://bedrock-runtime.{region}.amazonaws.com"
+                    ),
+                    "region": str(region or ""),
+                },
+                policy=task_fence_model_policy,
+            ):
+                response = client.converse(**kwargs)
     except Exception as exc:
         if is_stale_connection_error(exc):
             logger.warning(

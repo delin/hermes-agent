@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from contextvars import copy_context
 import hashlib
 import json
 import logging
@@ -24,6 +25,13 @@ from tools.registry import _task_fence_tool_fingerprint, registry
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _context_carries_task_fence_authority() -> bool:
+    return any(
+        isinstance(value, (SessionDB, TaskFencePolicy))
+        for _variable, value in copy_context().items()
+    )
 
 
 def _ingress(
@@ -1308,6 +1316,385 @@ def test_persistent_moa_anthropic_adapter_consumes_private_capability(
             "model": "claude-test",
             "endpoint": "https://api.anthropic.com",
         }
+    finally:
+        db.close()
+
+
+def test_persistent_moa_bedrock_auxiliary_owns_exact_converse_leaf(
+    tmp_path,
+):
+    from agent.auxiliary_client import (
+        BedrockAuxiliaryClient,
+        _task_fence_sync_model_create,
+    )
+    from agent.bedrock_adapter import build_converse_kwargs
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    model = "openai.gpt-oss-20b-1:0"
+    prompt_secret = "raw-moa-bedrock-converse-prompt"
+    observed = []
+    raw_response = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": "bedrock done"}],
+            }
+        },
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+    }
+
+    def converse(**kwargs):
+        envelope = current_causal_envelope()
+        attempt = None
+        if envelope is not None and envelope.invocation_id is not None:
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+        observed.append(
+            (
+                dict(kwargs),
+                envelope,
+                None if attempt is None else attempt["state"],
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        return raw_response
+
+    boto_client = SimpleNamespace(converse=converse)
+    client = BedrockAuxiliaryClient("us-east-1", model)
+    request = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_secret}],
+        "max_tokens": 32,
+        "temperature": 0.2,
+        "stop": "END",
+        "stream": True,
+    }
+    route = {
+        "api_mode": "bedrock_converse",
+        "provider": "bedrock",
+        "model": model,
+        "endpoint": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "region": "us-east-1",
+    }
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+            patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                return_value=boto_client,
+            ),
+        ):
+            audited = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="bedrock",
+                task_fence_model_policy=policy,
+            )
+            legacy = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="bedrock",
+            )
+
+        assert audited.choices[0].message.content == "bedrock done"
+        assert legacy.choices[0].message.content == "bedrock done"
+        assert len(observed) == 2
+        native_request = observed[0][0]
+        assert native_request == build_converse_kwargs(
+            model=model,
+            messages=request["messages"],
+            max_tokens=32,
+            temperature=0.2,
+            stop_sequences=["END"],
+        )
+        assert observed[0][1].generation_id == generation.generation_id
+        assert observed[0][1].invocation_id is not None
+        assert observed[0][2:] == ("STARTED", None, False)
+        assert observed[1] == (native_request, generation, None, None, False)
+        assert not any(key.startswith("_task_fence_") for key in native_request)
+
+        expected_fingerprint = model_wire_fingerprint(
+            adapter="provider:bedrock.converse",
+            request=native_request,
+            route=route,
+        )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            ("provider:bedrock.converse", expected_fingerprint),
+            ("provider:bedrock.converse", expected_fingerprint),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+        audit_dump = "\n".join(db._conn.iterdump())
+        assert prompt_secret not in audit_dump
+        assert client.api_key not in audit_dump
+    finally:
+        db.close()
+
+
+def test_persistent_moa_anthropic_bedrock_owns_stream_fallback_leaves(
+    tmp_path,
+):
+    from agent.auxiliary_client import (
+        AnthropicAuxiliaryClient,
+        _task_fence_sync_model_create,
+    )
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    prompt_secret = "raw-moa-anthropic-bedrock-prompt"
+    observed = []
+    final_message = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="anthropic bedrock done")],
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+
+    def inspect(stage, kwargs):
+        envelope = current_causal_envelope()
+        attempt = None
+        if envelope is not None and envelope.invocation_id is not None:
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+        observed.append(
+            (
+                stage,
+                dict(kwargs),
+                envelope,
+                None if attempt is None else attempt["state"],
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+
+    class UnavailableStream:
+        def __init__(self, kwargs):
+            self._kwargs = kwargs
+
+        def __enter__(self):
+            inspect("stream_enter", self._kwargs)
+            raise RuntimeError(
+                "not authorized to perform: "
+                "bedrock:InvokeModelWithResponseStream"
+            )
+
+        def __exit__(self, *_args):
+            return False
+
+    class Messages:
+        @staticmethod
+        def stream(**kwargs):
+            inspect("stream_factory", kwargs)
+            return UnavailableStream(kwargs)
+
+        @staticmethod
+        def create(**kwargs):
+            inspect("create", kwargs)
+            return final_message
+
+    real_client = SimpleNamespace(
+        messages=Messages(),
+        close=lambda: None,
+    )
+    client = AnthropicAuxiliaryClient(
+        real_client,
+        model,
+        "aws-sdk",
+        "https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    request = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_secret}],
+        "max_tokens": 64,
+    }
+    route = {
+        "api_mode": "anthropic_messages",
+        "provider": "bedrock",
+        "model": model,
+        "endpoint": "https://bedrock-runtime.us-east-1.amazonaws.com",
+    }
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            audited = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="bedrock",
+                task_fence_model_policy=policy,
+            )
+            legacy = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="bedrock",
+            )
+
+        assert audited.choices[0].message.content == "anthropic bedrock done"
+        assert legacy.choices[0].message.content == "anthropic bedrock done"
+        assert [entry[0] for entry in observed] == [
+            "stream_factory",
+            "stream_enter",
+            "create",
+            "stream_factory",
+            "stream_enter",
+            "create",
+        ]
+        assert observed[0][1] == observed[3][1]
+        assert observed[2][1] == observed[5][1]
+        assert {entry[3] for entry in observed[:3]} == {"STARTED"}
+        assert {entry[3] for entry in observed[3:]} == {None}
+        assert all(entry[4] is None for entry in observed)
+        assert not any(entry[5] for entry in observed)
+        stream_envelope = observed[0][2]
+        assert observed[1][2] == stream_envelope
+        create_envelope = observed[2][2]
+        assert stream_envelope.invocation_id != create_envelope.invocation_id
+        assert {
+            stream_envelope.generation_id,
+            create_envelope.generation_id,
+        } == {generation.generation_id}
+        assert all(
+            not any(key.startswith("_task_fence_") for key in entry[1])
+            for entry in observed
+        )
+
+        stream_fingerprint = model_wire_fingerprint(
+            adapter="provider:anthropic.messages.stream",
+            request=observed[0][1],
+            route=route,
+        )
+        create_fingerprint = model_wire_fingerprint(
+            adapter="provider:anthropic.messages.create",
+            request=observed[2][1],
+            route=route,
+        )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            ("provider:anthropic.messages.stream", stream_fingerprint),
+            ("provider:anthropic.messages.stream", stream_fingerprint),
+            ("provider:anthropic.messages.create", create_fingerprint),
+            ("provider:anthropic.messages.create", create_fingerprint),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        audit_dump = "\n".join(db._conn.iterdump())
+        assert prompt_secret not in audit_dump
+        assert client.api_key not in audit_dump
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "base_url", "model"),
+    [
+        (
+            "anthropic",
+            "https://bedrock-runtime.us-east-1.amazonaws.com.attacker.test",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ),
+        (
+            "anthropic",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "openai.gpt-oss-20b-1:0",
+        ),
+        (
+            "converse",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ),
+        (
+            "converse",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "",
+        ),
+    ],
+)
+def test_persistent_moa_bedrock_capability_rejects_wrapper_mismatch(
+    tmp_path,
+    wrapper,
+    base_url,
+    model,
+):
+    from agent.auxiliary_client import (
+        AnthropicAuxiliaryClient,
+        BedrockAuxiliaryClient,
+        _task_fence_sync_model_create,
+    )
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    observed = []
+
+    def create(**kwargs):
+        observed.append(dict(kwargs))
+        return "legacy-result"
+
+    if wrapper == "anthropic":
+        client = AnthropicAuxiliaryClient(
+            SimpleNamespace(messages=SimpleNamespace()),
+            model,
+            "aws-sdk",
+            base_url,
+        )
+    else:
+        client = BedrockAuxiliaryClient("us-east-1", model)
+    client.base_url = base_url
+    client.chat = SimpleNamespace(
+        completions=SimpleNamespace(create=create),
+    )
+    request = {
+        "model": model,
+        "messages": [{"role": "user", "content": "legacy input"}],
+    }
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            result = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="bedrock",
+                task_fence_model_policy=TaskFencePolicy(db),
+            )
+
+        assert result == "legacy-result"
+        assert observed == [request]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
     finally:
         db.close()
 
