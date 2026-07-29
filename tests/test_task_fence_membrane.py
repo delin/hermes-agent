@@ -861,6 +861,457 @@ def test_iteration_summary_owns_only_existing_provider_wires(
     assert _is_task_fence_supported_iteration_summary_wire(agent) is supported
 
 
+def test_persistent_moa_model_capability_is_per_call(tmp_path):
+    from agent.auxiliary_client import _task_fence_sync_model_create
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    prompt_secret = "raw-moa-aggregator-prompt-secret"
+    request = {
+        "model": "aggregator-model",
+        "messages": [{"role": "user", "content": prompt_secret}],
+    }
+    observed = []
+
+    def create(**kwargs):
+        envelope = current_causal_envelope()
+        attempt = None
+        if envelope is not None and envelope.invocation_id is not None:
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+        observed.append(
+            (
+                dict(kwargs),
+                envelope,
+                None if attempt is None else attempt["state"],
+                current_task_fence_policy(),
+            )
+        )
+        return "legacy-result"
+
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        ),
+    )
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            first = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="openrouter",
+                task_fence_model_policy=policy,
+            )
+            second = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="openrouter",
+            )
+
+        assert first == second == "legacy-result"
+        assert [entry[0] for entry in observed] == [request, request]
+        assert observed[0][1].generation_id == generation.generation_id
+        assert observed[0][1].invocation_id is not None
+        assert observed[0][2] == "STARTED"
+        assert observed[0][3] is None
+        assert observed[1] == (request, generation, None, None)
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+        assert prompt_secret not in "\n".join(db._conn.iterdump())
+    finally:
+        db.close()
+
+
+def test_persistent_moa_facade_does_not_retain_capability():
+    from agent.moa_loop import MoAChatCompletions
+
+    facade = MoAChatCompletions("task-fence-test")
+    policy = TaskFencePolicy(object())
+    prepared = {"messages": [{"role": "user", "content": "hello"}]}
+    observed = []
+
+    def call_prepared(
+        prepared_request,
+        api_kwargs,
+        *,
+        task_fence_model_policy=None,
+    ):
+        observed.append(
+            (
+                prepared_request,
+                dict(api_kwargs),
+                task_fence_model_policy,
+            )
+        )
+        return f"legacy-result-{len(observed)}"
+
+    with patch.object(
+        facade,
+        "_call_prepared_aggregator",
+        side_effect=call_prepared,
+    ):
+        first = facade.create(
+            messages=prepared["messages"],
+            _moa_prepared_request=prepared,
+            _task_fence_model_policy=policy,
+        )
+        second = facade.create(
+            messages=prepared["messages"],
+            _moa_prepared_request=prepared,
+        )
+
+    assert (first, second) == ("legacy-result-1", "legacy-result-2")
+    assert [entry[0] for entry in observed] == [prepared, prepared]
+    assert [entry[1] for entry in observed] == [
+        {"messages": prepared["messages"]},
+        {"messages": prepared["messages"]},
+    ]
+    assert [entry[2] for entry in observed] == [policy, None]
+    assert not any("task_fence" in key for key in facade.__dict__)
+    assert prepared == {
+        "messages": [{"role": "user", "content": "hello"}]
+    }
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "acp://copilot",
+        "acp+tcp://127.0.0.1:7777",
+        "moa://local",
+        "https://bedrock-runtime.us-east-1.amazonaws.com",
+    ],
+)
+def test_persistent_moa_capability_excludes_unowned_auxiliary_facades(
+    tmp_path,
+    base_url,
+):
+    from agent.auxiliary_client import _task_fence_sync_model_create
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    calls = []
+    request = {
+        "model": "unsupported-aggregator",
+        "messages": [{"role": "user", "content": "legacy input"}],
+    }
+
+    def create(**kwargs):
+        calls.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+            )
+        )
+        return "legacy-result"
+
+    client = SimpleNamespace(
+        base_url=base_url,
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        ),
+    )
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            result = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="unsupported",
+                task_fence_model_policy=TaskFencePolicy(db),
+            )
+
+        assert result == "legacy-result"
+        assert calls == [(request, generation, None)]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("client_type", "expected_private_fields"),
+    [
+        ("codex", {"_task_fence_model_policy", "_task_fence_model_route"}),
+        (
+            "anthropic",
+            {"_task_fence_model_policy", "_task_fence_model_route"},
+        ),
+        ("gemini", {"_task_fence_model_policy"}),
+    ],
+)
+def test_persistent_moa_capability_forwards_only_to_owned_auxiliary_adapter(
+    tmp_path,
+    client_type,
+    expected_private_fields,
+):
+    from agent.auxiliary_client import (
+        AnthropicAuxiliaryClient,
+        CodexAuxiliaryClient,
+        _task_fence_sync_model_create,
+    )
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    observed = []
+
+    def create(**kwargs):
+        observed.append(dict(kwargs))
+        return "legacy-result"
+
+    wrapper_type = {
+        "codex": CodexAuxiliaryClient,
+        "anthropic": AnthropicAuxiliaryClient,
+        "gemini": GeminiNativeClient,
+    }[client_type]
+    client = object.__new__(wrapper_type)
+    client.base_url = "https://owned-provider.invalid/v1"
+    client.chat = SimpleNamespace(
+        completions=SimpleNamespace(create=create),
+    )
+    request = {
+        "model": "owned-aggregator",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            result = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="owned-provider",
+                task_fence_model_policy=policy,
+            )
+
+        assert result == "legacy-result"
+        assert len(observed) == 1
+        assert all(
+            observed[0].get(key) == value
+            for key, value in request.items()
+        )
+        assert {
+            key for key in observed[0]
+            if key.startswith("_task_fence_")
+        } == expected_private_fields
+        assert request == {
+            "model": "owned-aggregator",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    finally:
+        db.close()
+
+
+def test_persistent_moa_codex_adapter_starts_before_responses_create(
+    tmp_path,
+):
+    from agent.auxiliary_client import (
+        CodexAuxiliaryClient,
+        _task_fence_sync_model_create,
+    )
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    prompt_secret = "raw-moa-codex-prompt-secret"
+    creates = []
+
+    message_item = SimpleNamespace(
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="codex done")],
+    )
+    events = [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(type="response.output_item.done", item=message_item),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                status="completed",
+                id="resp-task-fence-moa",
+                usage=SimpleNamespace(
+                    input_tokens=1,
+                    output_tokens=1,
+                    total_tokens=2,
+                ),
+            ),
+        ),
+    ]
+
+    class EventStream:
+        def __iter__(self):
+            return iter(events)
+
+        def close(self):
+            return None
+
+    def create(**kwargs):
+        envelope = current_causal_envelope()
+        attempt = db._conn.execute(
+            "SELECT a.state FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id "
+            "WHERE p.invocation_envelope_id = ?",
+            (envelope.invocation_id,),
+        ).fetchone()
+        creates.append(
+            (
+                dict(kwargs),
+                envelope,
+                attempt["state"],
+                current_task_fence_policy(),
+            )
+        )
+        return EventStream()
+
+    real_client = SimpleNamespace(
+        api_key="raw-moa-codex-api-key",
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=SimpleNamespace(create=create),
+        close=lambda: None,
+    )
+    client = CodexAuxiliaryClient(real_client, "gpt-test-codex")
+    request = {
+        "model": "gpt-test-codex",
+        "messages": [{"role": "user", "content": prompt_secret}],
+    }
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            response = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="openai-codex",
+                task_fence_model_policy=policy,
+            )
+
+        assert response.choices[0].message.content == "codex done"
+        assert len(creates) == 1
+        wire_request, envelope, state, ambient_policy = creates[0]
+        assert wire_request["stream"] is True
+        assert envelope.generation_id == generation.generation_id
+        assert envelope.invocation_id is not None
+        assert state == "STARTED"
+        assert ambient_policy is None
+        route = {
+            "api_mode": "codex_responses",
+            "provider": "openai-codex",
+            "model": "gpt-test-codex",
+            "endpoint": real_client.base_url,
+        }
+        expected = model_wire_fingerprint(
+            adapter="provider:openai.responses.create",
+            request=wire_request,
+            route=route,
+        )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            ("provider:openai.responses.create", expected),
+            ("provider:openai.responses.create", expected),
+        ]
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert prompt_secret not in audit_dump
+        assert real_client.api_key not in audit_dump
+    finally:
+        db.close()
+
+
+def test_persistent_moa_anthropic_adapter_consumes_private_capability(
+    tmp_path,
+):
+    from agent.auxiliary_client import (
+        AnthropicAuxiliaryClient,
+        _task_fence_sync_model_create,
+    )
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    observed = {}
+    final_message = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="anthropic done")],
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+
+    def create_anthropic_message(_client, kwargs, **private):
+        observed.update(request=dict(kwargs), private=dict(private))
+        return final_message
+
+    real_client = SimpleNamespace(messages=SimpleNamespace())
+    client = AnthropicAuxiliaryClient(
+        real_client,
+        "claude-test",
+        "raw-anthropic-key",
+        "https://api.anthropic.com",
+    )
+    try:
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+            patch(
+                "agent.anthropic_adapter.create_anthropic_message",
+                side_effect=create_anthropic_message,
+            ),
+        ):
+            response = _task_fence_sync_model_create(
+                client,
+                {
+                    "model": "claude-test",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                route_provider="anthropic",
+                task_fence_model_policy=policy,
+            )
+
+        assert response.choices[0].message.content == "anthropic done"
+        assert "_task_fence_model_policy" not in observed["request"]
+        assert observed["private"]["task_fence_model_policy"] is policy
+        assert observed["private"]["task_fence_model_route"] == {
+            "api_mode": "anthropic_messages",
+            "provider": "anthropic",
+            "model": "claude-test",
+            "endpoint": "https://api.anthropic.com",
+        }
+    finally:
+        db.close()
+
+
 def test_model_wire_fingerprint_commits_binary_payloads():
     from agent.task_fence_provider import model_wire_fingerprint
 

@@ -1597,7 +1597,11 @@ class MoAChatCompletions:
         return {**prepared, "messages": agg_messages}
 
     def _call_prepared_aggregator(
-        self, prepared: dict[str, Any], api_kwargs: dict[str, Any]
+        self,
+        prepared: dict[str, Any],
+        api_kwargs: dict[str, Any],
+        *,
+        task_fence_model_policy: Any = None,
     ) -> Any:
         """Send an already prepared MoA aggregator request exactly once."""
         agg_messages = prepared["messages"]
@@ -1657,6 +1661,11 @@ class MoAChatCompletions:
             agg_runtime.pop("extra_body", None),
             extra_body,
         )
+        task_fence_kwargs: dict[str, Any] = {}
+        if task_fence_model_policy is not None:
+            task_fence_kwargs["_task_fence_model_policy"] = (
+                task_fence_model_policy
+            )
         _agg_response = call_llm(
             task="moa_aggregator",
             messages=agg_messages,
@@ -1667,6 +1676,7 @@ class MoAChatCompletions:
             # Prepared requests must retain the acting aggregator's reasoning
             # policy exactly as the direct create() path does (#64187).
             reasoning_config=_aggregator_reasoning_config(aggregator),
+            **task_fence_kwargs,
             **stream_kwargs,
             **agg_runtime,
         )
@@ -1688,11 +1698,18 @@ class MoAChatCompletions:
         return _agg_response
 
     def create(self, **api_kwargs: Any) -> Any:
+        task_fence_model_policy = api_kwargs.pop(
+            "_task_fence_model_policy", None
+        )
         prepared_request = api_kwargs.pop("_moa_prepared_request", None)
         if prepared_request is not None:
             if not isinstance(prepared_request, dict):
                 raise TypeError("_moa_prepared_request must be a dict")
-            return self._call_prepared_aggregator(prepared_request, api_kwargs)
+            return self._call_prepared_aggregator(
+                prepared_request,
+                api_kwargs,
+                task_fence_model_policy=task_fence_model_policy,
+            )
 
         from hermes_cli.config import load_config
         from hermes_cli.moa_config import resolve_moa_preset

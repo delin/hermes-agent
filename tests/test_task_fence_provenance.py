@@ -803,6 +803,61 @@ def provenance_agent(registered_probe_tools):
         yield agent
 
 
+@pytest.fixture
+def persistent_moa_agent(
+    registered_probe_tools,
+    monkeypatch,
+    tmp_path,
+):
+    from run_agent import AIAgent
+
+    names, _, _, _ = registered_probe_tools
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: task-fence
+  presets:
+    task-fence:
+      fanout: user_turn
+      reference_models:
+        - provider: openrouter
+          model: reference-model
+      aggregator:
+        provider: openrouter
+        model: aggregator-model
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=[_tool_schema(name) for name in names],
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="moa-virtual-provider",
+            base_url="http://127.0.0.1/v1",
+            model="task-fence",
+            provider="moa",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            max_iterations=4,
+        )
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent._disable_streaming = True
+        agent.tool_delay = 0
+        agent.save_trajectories = False
+        agent.compression_enabled = False
+        yield agent
+
+
 def _prepare_real_conversation(
     agent,
     responses,
@@ -861,6 +916,665 @@ def _raw_bedrock_response(content: str) -> dict:
         "stopReason": "end_turn",
         "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
     }
+
+
+def _record_started_model_wire(db, observed, label, kwargs):
+    envelope = current_causal_envelope()
+    attempt = db._conn.execute(
+        "SELECT a.state FROM task_fence_attempts AS a "
+        "JOIN task_fence_dispatch_permits AS p "
+        "ON p.permit_id = a.permit_id "
+        "WHERE p.invocation_envelope_id = ?",
+        (envelope.invocation_id,),
+    ).fetchone()
+    observed.append(
+        (
+            label,
+            dict(kwargs),
+            envelope,
+            attempt["state"],
+            current_task_fence_policy(),
+            _context_carries_task_fence_authority(),
+        )
+    )
+
+
+def test_persistent_moa_requires_accepted_prepared_capability(
+    persistent_moa_agent,
+    monkeypatch,
+    tmp_path,
+):
+    import agent.auxiliary_client as auxiliary_client
+
+    db = SessionDB(tmp_path / "ambient.db")
+    ambient_acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-moa-ambient-only")
+    )
+    ambient_generation = db.reserve_task_fence_generation(ambient_acceptance)
+    persistent_moa_agent._session_db = db
+    factories = []
+    creates = []
+
+    def create(**kwargs):
+        creates.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        content = (
+            "reference advice"
+            if kwargs.get("model") == "reference-model"
+            else "legacy aggregator result"
+        )
+        return _model_response(
+            content=content,
+            tool_calls=None,
+            finish_reason="stop",
+        )
+
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="raw-shared-client-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        ),
+    )
+
+    def get_cached(provider, model, **_kwargs):
+        factories.append(
+            (
+                provider,
+                model,
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        return client, model
+
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_cached)
+    try:
+        with (
+            bind_causal_envelope(ambient_generation),
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            patch.object(persistent_moa_agent, "_persist_session"),
+            patch.object(persistent_moa_agent, "_save_trajectory"),
+            patch.object(persistent_moa_agent, "_cleanup_task_resources"),
+        ):
+            result = persistent_moa_agent.run_conversation(
+                "legacy persistent MoA without acceptance"
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "legacy aggregator result"
+        assert [entry[0]["model"] for entry in creates] == [
+            "reference-model",
+            "aggregator-model",
+        ]
+        assert all(entry[2] is None for entry in creates)
+        assert not any(entry[3] for entry in creates)
+        assert all(entry[3] is None for entry in factories)
+        assert not any(entry[4] for entry in factories)
+        assert all(
+            "_task_fence_model_policy" not in entry[0]
+            for entry in creates
+        )
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_model_generations"
+        ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+def test_real_persistent_moa_retries_physical_aggregator_in_outer_generation(
+    persistent_moa_agent,
+    registered_probe_tools,
+    monkeypatch,
+    tmp_path,
+):
+    import agent.auxiliary_client as auxiliary_client
+
+    names, _, observed_tools, probe = registered_probe_tools
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-persistent-moa")
+    )
+    persistent_moa_agent._session_db = db
+    prompt_secret = "raw-persistent-moa-prompt-secret"
+    reference_secret = "raw-reference-advice-secret"
+    api_key_secret = "raw-shared-moa-client-key"
+    factories = []
+    creates = []
+    aggregator_calls = 0
+
+    def inspect_tool_generation(envelope):
+        generation = db._conn.execute(
+            "SELECT state, closed_at FROM task_fence_model_generations "
+            "WHERE generation_id = ?",
+            (envelope.generation_id,),
+        ).fetchone()
+        attempt = db._conn.execute(
+            "SELECT a.state FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id "
+            "WHERE p.invocation_envelope_id = ?",
+            (envelope.invocation_id,),
+        ).fetchone()
+        return (
+            generation["state"],
+            generation["closed_at"],
+            attempt["state"],
+        )
+
+    probe["inspect"] = inspect_tool_generation
+
+    def create(**kwargs):
+        nonlocal aggregator_calls
+        envelope = current_causal_envelope()
+        attempt = None
+        if envelope is not None and envelope.invocation_id is not None:
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+        creates.append(
+            (
+                dict(kwargs),
+                envelope,
+                None if attempt is None else attempt["state"],
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        if kwargs.get("model") == "reference-model":
+            return _model_response(
+                content=reference_secret,
+                tool_calls=None,
+                finish_reason="stop",
+            )
+        aggregator_calls += 1
+        if aggregator_calls == 1:
+            raise httpx.RemoteProtocolError(
+                "peer closed connection during persistent MoA wire"
+            )
+        if aggregator_calls == 2:
+            return _model_response(
+                content=None,
+                tool_calls=[_tool_call(names[0], "call-persistent-moa")],
+                finish_reason="tool_calls",
+            )
+        return _model_response(
+            content="persistent MoA complete",
+            tool_calls=None,
+            finish_reason="stop",
+        )
+
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key_secret,
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        ),
+    )
+
+    def get_cached(provider, model, **_kwargs):
+        factories.append(
+            (
+                provider,
+                model,
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                _context_carries_task_fence_authority(),
+            )
+        )
+        return client, model
+
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_cached)
+    monkeypatch.setattr(auxiliary_client, "_transient_retry_count", lambda: 1)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_TRANSIENT_RETRY_BACKOFF_BASE",
+        0.0,
+    )
+    try:
+        with (
+            patch.object(persistent_moa_agent, "_persist_session"),
+            patch.object(persistent_moa_agent, "_save_trajectory"),
+            patch.object(persistent_moa_agent, "_cleanup_task_resources"),
+        ):
+            result = persistent_moa_agent.run_conversation(
+                prompt_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "persistent MoA complete"
+        reference_entries = [
+            entry for entry in creates
+            if entry[0].get("model") == "reference-model"
+        ]
+        aggregator_entries = [
+            entry for entry in creates
+            if entry[0].get("model") == "aggregator-model"
+        ]
+        assert len(reference_entries) == 1
+        assert reference_entries[0][1] is None
+        assert reference_entries[0][2] is None
+        assert len(aggregator_entries) == 3
+        assert {entry[2] for entry in aggregator_entries} == {"STARTED"}
+        assert all(entry[3] is None for entry in creates)
+        assert not any(entry[4] for entry in creates)
+        envelopes = [entry[1] for entry in aggregator_entries]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 3
+        assert envelopes[0].generation_id == envelopes[1].generation_id
+        assert envelopes[2].generation_id != envelopes[0].generation_id
+        assert all(envelope.parent_invocation_id is None for envelope in envelopes)
+
+        assert len(observed_tools) == 1
+        _explicit, tool_envelope, _thread_id, tool_state = observed_tools[0]
+        assert tool_envelope.generation_id == envelopes[0].generation_id
+        assert tool_envelope.invocation_id not in {
+            envelope.invocation_id for envelope in envelopes
+        }
+        assert tool_state[0] == "committed"
+        assert tool_state[1] is None
+        assert tool_state[2] == "STARTED"
+
+        rows = db._conn.execute(
+            "SELECT generation_id, state, closed_at "
+            "FROM task_fence_model_generations ORDER BY opened_at, generation_id"
+        ).fetchall()
+        assert len(rows) == 2
+        assert {row["state"] for row in rows} == {"committed"}
+        assert rows[0]["closed_at"] is not None
+        assert rows[1]["closed_at"] is None
+        model_decisions = db._conn.execute(
+            "SELECT decision_point, adapter, invocation_fingerprint "
+            "FROM task_fence_policy_decisions "
+            "WHERE operation_kind = 'model' ORDER BY decision_order"
+        ).fetchall()
+        assert len(model_decisions) == 6
+        assert {
+            row["adapter"] for row in model_decisions
+        } == {"provider:openai.chat.completions.create"}
+        assert len({
+            row["invocation_fingerprint"]
+            for row in model_decisions[:4]
+        }) == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 4
+        assert all(entry[3] is None for entry in factories)
+        assert not any(entry[4] for entry in factories)
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert prompt_secret not in audit_dump
+        assert reference_secret not in audit_dump
+        assert api_key_secret not in audit_dump
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+def test_real_persistent_moa_stream_retry_reuses_outer_generation(
+    persistent_moa_agent,
+    monkeypatch,
+    tmp_path,
+):
+    import agent.auxiliary_client as auxiliary_client
+
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-persistent-moa-stream")
+    )
+    persistent_moa_agent._session_db = db
+    persistent_moa_agent._disable_streaming = False
+    persistent_moa_agent.stream_delta_callback = lambda _delta: None
+    creates = []
+    stream_count = 0
+
+    class Stream:
+        def __init__(self, *, fail):
+            self.fail = fail
+            self.chunks = iter(
+                [
+                    _stream_chunk(
+                        content="persistent MoA stream complete",
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.fail:
+                self.fail = False
+                raise httpx.RemoteProtocolError(
+                    "peer closed connection during persistent MoA stream"
+                )
+            return next(self.chunks)
+
+        def close(self):
+            return None
+
+    def create(**kwargs):
+        nonlocal stream_count
+        envelope = current_causal_envelope()
+        if kwargs.get("model") == "reference-model":
+            creates.append(
+                (
+                    "reference",
+                    dict(kwargs),
+                    envelope,
+                    None,
+                    current_task_fence_policy(),
+                )
+            )
+            return _model_response(
+                content="stream reference advice",
+                tool_calls=None,
+                finish_reason="stop",
+            )
+
+        attempt = db._conn.execute(
+            "SELECT a.state FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id "
+            "WHERE p.invocation_envelope_id = ?",
+            (envelope.invocation_id,),
+        ).fetchone()
+        stream_count += 1
+        creates.append(
+            (
+                "aggregator",
+                dict(kwargs),
+                envelope,
+                attempt["state"],
+                current_task_fence_policy(),
+            )
+        )
+        return Stream(fail=stream_count == 1)
+
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="raw-stream-client-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        ),
+    )
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_get_cached_client",
+        lambda _provider, model, **_kwargs: (client, model),
+    )
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+    try:
+        with (
+            patch.object(persistent_moa_agent, "_persist_session"),
+            patch.object(persistent_moa_agent, "_save_trajectory"),
+            patch.object(persistent_moa_agent, "_cleanup_task_resources"),
+        ):
+            result = persistent_moa_agent.run_conversation(
+                "stream persistent MoA",
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "persistent MoA stream complete"
+        reference_entries = [entry for entry in creates if entry[0] == "reference"]
+        aggregator_entries = [entry for entry in creates if entry[0] == "aggregator"]
+        assert len(reference_entries) == 1
+        assert reference_entries[0][2] is None
+        assert len(aggregator_entries) == 2
+        assert all(entry[1]["stream"] is True for entry in aggregator_entries)
+        assert {entry[3] for entry in aggregator_entries} == {"STARTED"}
+        assert all(entry[4] is None for entry in creates)
+        envelopes = [entry[2] for entry in aggregator_entries]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert len({envelope.generation_id for envelope in envelopes}) == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_model_generations"
+        ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT state FROM task_fence_model_generations"
+        ).fetchone()["state"] == "committed"
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+def test_persistent_moa_auth_rebuild_starts_fresh_child(
+    monkeypatch,
+    tmp_path,
+):
+    import agent.auxiliary_client as auxiliary_client
+
+    class AuthError(Exception):
+        status_code = 401
+
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-persistent-moa-auth-rebuild")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    policy = TaskFencePolicy(db)
+    observed = []
+
+    def stale_create(**kwargs):
+        _record_started_model_wire(db, observed, "stale", kwargs)
+        raise AuthError("stale aggregator credential")
+
+    def fresh_create(**kwargs):
+        _record_started_model_wire(db, observed, "fresh", kwargs)
+        return _model_response(
+            content="fresh aggregator result",
+            tool_calls=None,
+            finish_reason="stop",
+        )
+
+    stale_client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="stale-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=stale_create),
+        ),
+    )
+    fresh_client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="fresh-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fresh_create),
+        ),
+    )
+    clients = iter(
+        [
+            (stale_client, "aggregator-model"),
+            (fresh_client, "aggregator-model"),
+        ]
+    )
+    try:
+        with (
+            patch.object(
+                auxiliary_client,
+                "_resolve_task_provider_model",
+                return_value=(
+                    "openrouter",
+                    "aggregator-model",
+                    "https://openrouter.ai/api/v1",
+                    "stale-key",
+                    "chat_completions",
+                ),
+            ),
+            patch.object(
+                auxiliary_client,
+                "_get_cached_client",
+                side_effect=lambda *_args, **_kwargs: next(clients),
+            ),
+            patch.object(
+                auxiliary_client,
+                "_refresh_provider_credentials",
+                return_value=True,
+            ),
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            response = auxiliary_client.call_llm(
+                task="moa_aggregator",
+                provider="openrouter",
+                model="aggregator-model",
+                messages=[{"role": "user", "content": "aggregate"}],
+                _task_fence_model_policy=policy,
+            )
+
+        assert response.choices[0].message.content == "fresh aggregator result"
+        assert [entry[0] for entry in observed] == ["stale", "fresh"]
+        envelopes = [entry[2] for entry in observed]
+        assert len({entry.invocation_id for entry in envelopes}) == 2
+        assert {entry.generation_id for entry in envelopes} == {
+            generation.generation_id
+        }
+        assert {entry[3] for entry in observed} == {"STARTED"}
+        assert all(entry[4] is None for entry in observed)
+        assert not any(entry[5] for entry in observed)
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+    finally:
+        db.close()
+
+
+def test_persistent_moa_fallback_starts_fresh_child(
+    monkeypatch,
+    tmp_path,
+):
+    import agent.auxiliary_client as auxiliary_client
+
+    class PaymentError(Exception):
+        status_code = 402
+
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-persistent-moa-fallback")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    policy = TaskFencePolicy(db)
+    observed = []
+
+    def primary_create(**kwargs):
+        _record_started_model_wire(db, observed, "primary", kwargs)
+        raise PaymentError("payment required")
+
+    def fallback_create(**kwargs):
+        _record_started_model_wire(db, observed, "fallback", kwargs)
+        return _model_response(
+            content="fallback aggregator result",
+            tool_calls=None,
+            finish_reason="stop",
+        )
+
+    primary_client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="primary-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=primary_create),
+        ),
+    )
+    fallback_client = SimpleNamespace(
+        base_url="https://fallback.invalid/v1",
+        api_key="fallback-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fallback_create),
+        ),
+    )
+    try:
+        with (
+            patch.object(
+                auxiliary_client,
+                "_resolve_task_provider_model",
+                return_value=(
+                    "openrouter",
+                    "aggregator-model",
+                    "https://openrouter.ai/api/v1",
+                    "primary-key",
+                    "chat_completions",
+                ),
+            ),
+            patch.object(
+                auxiliary_client,
+                "_get_cached_client",
+                return_value=(primary_client, "aggregator-model"),
+            ),
+            patch.object(
+                auxiliary_client,
+                "_recover_provider_pool",
+                return_value=False,
+            ),
+            patch.object(
+                auxiliary_client,
+                "_try_configured_fallback_chain",
+                return_value=(
+                    fallback_client,
+                    "fallback-model",
+                    "fallback-provider",
+                ),
+            ),
+            patch.object(auxiliary_client, "_mark_provider_unhealthy"),
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+        ):
+            response = auxiliary_client.call_llm(
+                task="moa_aggregator",
+                provider="openrouter",
+                model="aggregator-model",
+                messages=[{"role": "user", "content": "aggregate"}],
+                _task_fence_model_policy=policy,
+            )
+
+        assert response.choices[0].message.content == "fallback aggregator result"
+        assert [entry[0] for entry in observed] == ["primary", "fallback"]
+        envelopes = [entry[2] for entry in observed]
+        assert len({entry.invocation_id for entry in envelopes}) == 2
+        assert {entry.generation_id for entry in envelopes} == {
+            generation.generation_id
+        }
+        assert {entry[3] for entry in observed} == {"STARTED"}
+        assert all(entry[4] is None for entry in observed)
+        assert not any(entry[5] for entry in observed)
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+    finally:
+        db.close()
 
 
 def test_real_conversation_records_generation_and_binds_emitted_tool(

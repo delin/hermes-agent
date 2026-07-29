@@ -1785,7 +1785,14 @@ def run_conversation(
             if _moa_prepared_request is None:
                 _prepare_moa_request = getattr(_moa_completions, "prepare", None)
                 if callable(_prepare_moa_request):
-                    _moa_prepared_request = _prepare_moa_request(api_messages)
+                    # Advisors are not acting-model descendants. Keep any
+                    # caller-supplied ambient policy out of their parallel
+                    # workers; the accepted turn capability is introduced
+                    # later, only for the prepared acting-aggregator call.
+                    from task_fence import bind_task_fence_policy
+
+                    with bind_task_fence_policy(None):
+                        _moa_prepared_request = _prepare_moa_request(api_messages)
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
 
@@ -2294,7 +2301,16 @@ def run_conversation(
                     provider_policy = None
                     if (
                         _task_fence_acceptance is not None
-                        and _is_task_fence_supported_model_wire(agent)
+                        and (
+                            _is_task_fence_supported_model_wire(agent)
+                            or (
+                                agent.provider == "moa"
+                                and isinstance(
+                                    next_api_kwargs.get("_moa_prepared_request"),
+                                    dict,
+                                )
+                            )
+                        )
                     ):
                         provider_store = getattr(agent, "_session_db", None)
                         if provider_store is not None:

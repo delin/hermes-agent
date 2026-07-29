@@ -958,6 +958,12 @@ class _CodexCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        task_fence_model_policy = kwargs.pop(
+            "_task_fence_model_policy", None
+        )
+        task_fence_model_route = kwargs.pop(
+            "_task_fence_model_route", None
+        )
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
@@ -1212,7 +1218,22 @@ class _CodexCompletionsAdapter:
                 _notify_aux_progress()
                 _check_cancelled()
 
-            event_stream = self._client.responses.create(**stream_kwargs)
+            from agent.task_fence_provider import task_fence_model_handoff
+
+            with task_fence_model_handoff(
+                adapter="provider:openai.responses.create",
+                request=stream_kwargs,
+                route=task_fence_model_route or {
+                    "api_mode": "codex_responses",
+                    "provider": "openai-codex",
+                    "model": str(stream_kwargs.get("model") or ""),
+                    "endpoint": str(
+                        getattr(self._client, "base_url", "") or ""
+                    ),
+                },
+                policy=task_fence_model_policy,
+            ):
+                event_stream = self._client.responses.create(**stream_kwargs)
             try:
                 final = _consume_codex_event_stream(
                     event_stream,
@@ -1393,6 +1414,12 @@ class _AnthropicCompletionsAdapter:
         from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
         from agent.transports import get_transport
 
+        task_fence_model_policy = kwargs.pop(
+            "_task_fence_model_policy", None
+        )
+        task_fence_model_route = kwargs.pop(
+            "_task_fence_model_route", None
+        )
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
@@ -1489,6 +1516,8 @@ class _AnthropicCompletionsAdapter:
                 (lambda _event: _notify_aux_progress())
                 if _aux_progress_active() else None
             ),
+            task_fence_model_policy=task_fence_model_policy,
+            task_fence_model_route=task_fence_model_route,
         )
         _transport = get_transport("anthropic_messages")
         _nr = _transport.normalize_response(
@@ -3738,6 +3767,81 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     return False
 
 
+def _task_fence_sync_model_create(
+    client: Any,
+    kwargs: Dict[str, Any],
+    *,
+    route_provider: Optional[str],
+    task_fence_model_policy: Any = None,
+) -> Any:
+    """Call one supported physical sync model wire with per-call authority."""
+
+    create = client.chat.completions.create
+    if task_fence_model_policy is None:
+        return create(**kwargs)
+
+    base_url = str(getattr(client, "base_url", "") or "")
+    base_url_lower = base_url.lower()
+    provider = str(route_provider or "")
+
+    # These facades do not yet own an exact Task Fence wire boundary. Keep
+    # their legacy call shape and do not forward the private capability.
+    if (
+        isinstance(client, BedrockAuxiliaryClient)
+        or base_url_lower.startswith(("acp://", "acp+tcp://", "moa://"))
+        or "bedrock-runtime." in base_url_lower
+    ):
+        return create(**kwargs)
+    try:
+        from agent.copilot_acp_client import CopilotACPClient
+
+        if isinstance(client, CopilotACPClient):
+            return create(**kwargs)
+    except ImportError:
+        pass
+
+    route = {
+        "api_mode": "chat_completions",
+        "provider": provider,
+        "model": str(kwargs.get("model") or ""),
+        "endpoint": base_url,
+    }
+    private_kwargs = dict(kwargs)
+
+    if isinstance(client, CodexAuxiliaryClient):
+        route["api_mode"] = "codex_responses"
+        private_kwargs["_task_fence_model_policy"] = task_fence_model_policy
+        private_kwargs["_task_fence_model_route"] = route
+        return create(**private_kwargs)
+
+    if isinstance(client, AnthropicAuxiliaryClient):
+        route["api_mode"] = "anthropic_messages"
+        private_kwargs["_task_fence_model_policy"] = task_fence_model_policy
+        private_kwargs["_task_fence_model_route"] = route
+        return create(**private_kwargs)
+
+    try:
+        from agent.gemini_native_adapter import GeminiNativeClient
+
+        if isinstance(client, GeminiNativeClient):
+            private_kwargs["_task_fence_model_policy"] = (
+                task_fence_model_policy
+            )
+            return create(**private_kwargs)
+    except ImportError:
+        pass
+
+    from agent.task_fence_provider import task_fence_model_handoff
+
+    with task_fence_model_handoff(
+        adapter="provider:openai.chat.completions.create",
+        request=kwargs,
+        route=route,
+        policy=task_fence_model_policy,
+    ):
+        return create(**kwargs)
+
+
 def _retry_same_provider_sync(
     *,
     task: Optional[str],
@@ -3756,6 +3860,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    task_fence_model_policy: Any = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -3801,7 +3906,13 @@ def _retry_same_provider_sync(
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
+        _task_fence_sync_model_create(
+            retry_client,
+            retry_kwargs,
+            route_provider=resolved_provider,
+            task_fence_model_policy=task_fence_model_policy,
+        ),
+        task,
     )
 
 
@@ -4033,6 +4144,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    task_fence_model_policy: Any = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -4071,7 +4183,14 @@ def _call_fallback_candidate_sync(
         base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
-            fb_client.chat.completions.create(**fb_kwargs), task)
+            _task_fence_sync_model_create(
+                fb_client,
+                fb_kwargs,
+                route_provider=fb_label,
+                task_fence_model_policy=task_fence_model_policy,
+            ),
+            task,
+        )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -4088,7 +4207,14 @@ def _call_fallback_candidate_sync(
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
                 try:
                     return _validate_llm_response(
-                        retry_client.chat.completions.create(**retry_kwargs), task)
+                        _task_fence_sync_model_create(
+                            retry_client,
+                            retry_kwargs,
+                            route_provider=fb_provider,
+                            task_fence_model_policy=task_fence_model_policy,
+                        ),
+                        task,
+                    )
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
@@ -7440,6 +7566,8 @@ def _create_with_progress(
     task: Optional[str] = None,
     *,
     force_stream: bool = False,
+    task_fence_model_policy: Any = None,
+    task_fence_route_provider: Optional[str] = None,
 ) -> Any:
     """chat.completions.create() that streams when a progress hook is active
     or the provider only accepts streamed requests.
@@ -7459,14 +7587,24 @@ def _create_with_progress(
     """
     _notify_aux_progress()  # request dispatched counts as progress
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        return client.chat.completions.create(**kwargs)
+        return _task_fence_sync_model_create(
+            client,
+            kwargs,
+            route_provider=task_fence_route_provider,
+            task_fence_model_policy=task_fence_model_policy,
+        )
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        chunks = _task_fence_sync_model_create(
+            client,
+            stream_kwargs,
+            route_provider=task_fence_route_provider,
+            task_fence_model_policy=task_fence_model_policy,
+        )
     except Exception as exc:
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
@@ -7488,7 +7626,12 @@ def _create_with_progress(
             "Auxiliary %s: streamed request failed (%s); retrying "
             "non-streaming", task or "call", exc,
         )
-        return client.chat.completions.create(**kwargs)
+        return _task_fence_sync_model_create(
+            client,
+            kwargs,
+            route_provider=task_fence_route_provider,
+            task_fence_model_policy=task_fence_model_policy,
+        )
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
     # return a complete response even when stream=True was requested.
@@ -7699,6 +7842,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    _task_fence_model_policy: Any = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -7738,6 +7882,14 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    # This private capability belongs only to the prepared persistent-MoA
+    # acting path. A shared task label is not authority: one-shot synthesis
+    # and every ordinary auxiliary caller omit the capability entirely.
+    task_fence_model_policy = (
+        _task_fence_model_policy
+        if task == "moa_aggregator"
+        else None
+    )
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -7857,7 +8009,12 @@ def call_llm(
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options
-        return client.chat.completions.create(**kwargs)
+        return _task_fence_sync_model_create(
+            client,
+            kwargs,
+            route_provider=resolved_provider,
+            task_fence_model_policy=task_fence_model_policy,
+        )
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
@@ -7885,6 +8042,8 @@ def call_llm(
                     force_stream=_provider_requires_stream(
                         resolved_provider, _base_info or resolved_base_url,
                     ),
+                    task_fence_model_policy=task_fence_model_policy,
+                    task_fence_route_provider=resolved_provider,
                 ),
                 task,
                 provider=resolved_provider, base_url=_base_info)
@@ -7924,6 +8083,8 @@ def call_llm(
                             force_stream=_provider_requires_stream(
                                 resolved_provider, _base_info or resolved_base_url,
                             ),
+                            task_fence_model_policy=task_fence_model_policy,
+                            task_fence_route_provider=resolved_provider,
                         ),
                         task)
                 except Exception as retry_transient:
@@ -7942,7 +8103,14 @@ def call_llm(
             )
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**retry_kwargs), task)
+                    _task_fence_sync_model_create(
+                        client,
+                        retry_kwargs,
+                        route_provider=resolved_provider,
+                        task_fence_model_policy=task_fence_model_policy,
+                    ),
+                    task,
+                )
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -7980,7 +8148,14 @@ def call_llm(
             kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                    _task_fence_sync_model_create(
+                        client,
+                        kwargs,
+                        route_provider=resolved_provider,
+                        task_fence_model_policy=task_fence_model_policy,
+                    ),
+                    task,
+                )
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -8010,7 +8185,14 @@ def call_llm(
                 kwargs["model"] = healed_model
                 try:
                     return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                        _task_fence_sync_model_create(
+                            client,
+                            kwargs,
+                            route_provider=resolved_provider,
+                            task_fence_model_policy=task_fence_model_policy,
+                        ),
+                        task,
+                    )
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -8043,7 +8225,14 @@ def call_llm(
                     kwargs["model"] = refreshed_model
                 try:
                     return _validate_llm_response(
-                        refreshed_client.chat.completions.create(**kwargs), task)
+                        _task_fence_sync_model_create(
+                            refreshed_client,
+                            kwargs,
+                            route_provider=resolved_provider or "nous",
+                            task_fence_model_policy=task_fence_model_policy,
+                        ),
+                        task,
+                    )
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -8071,7 +8260,14 @@ def call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 return _validate_llm_response(
-                    refreshed_client.chat.completions.create(**kwargs), task)
+                    _task_fence_sync_model_create(
+                        refreshed_client,
+                        kwargs,
+                        route_provider=resolved_provider or "nous",
+                        task_fence_model_policy=task_fence_model_policy,
+                    ),
+                    task,
+                )
 
         # ── Auth refresh retry ───────────────────────────────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
@@ -8105,6 +8301,7 @@ def call_llm(
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     extra_headers=extra_headers,
+                    task_fence_model_policy=task_fence_model_policy,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -8121,7 +8318,14 @@ def call_llm(
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
                     return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                        _task_fence_sync_model_create(
+                            client,
+                            kwargs,
+                            route_provider=resolved_provider,
+                            task_fence_model_policy=task_fence_model_policy,
+                        ),
+                        task,
+                    )
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -8149,6 +8353,7 @@ def call_llm(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
                         extra_headers=extra_headers,
+                        task_fence_model_policy=task_fence_model_policy,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
@@ -8283,7 +8488,8 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    task_fence_model_policy=task_fence_model_policy)
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
@@ -8298,7 +8504,8 @@ def call_llm(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        task_fence_model_policy=task_fence_model_policy)
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible

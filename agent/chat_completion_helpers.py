@@ -221,7 +221,14 @@ def _create_openai_chat_completion(
     *,
     task_fence_model_policy=None,
 ):
-    """Call one exact OpenAI-compatible SDK handoff in shadow audit scope."""
+    """Call one exact OpenAI-compatible or prepared-MoA handoff."""
+
+    if getattr(agent, "provider", None) == "moa":
+        if task_fence_model_policy is None:
+            return request_client.chat.completions.create(**api_kwargs)
+        moa_kwargs = dict(api_kwargs)
+        moa_kwargs["_task_fence_model_policy"] = task_fence_model_policy
+        return request_client.chat.completions.create(**moa_kwargs)
 
     if is_native_gemini_base_url(getattr(agent, "base_url", None)):
         if task_fence_model_policy is None:
@@ -664,7 +671,12 @@ def _dispatch_nonstreaming_api_request(
         # MoA is a virtual chat-completions provider backed by the
         # in-process MoAClient facade. Do not rebuild a request-local
         # OpenAI client from the virtual runtime metadata.
-        return agent.client.chat.completions.create(**api_kwargs)
+        return _create_openai_chat_completion(
+            agent,
+            agent.client,
+            api_kwargs,
+            task_fence_model_policy=task_fence_model_policy,
+        )
     request_client = make_client("chat_completion_request")
     return _create_openai_chat_completion(
         agent,
