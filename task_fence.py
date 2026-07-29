@@ -1,12 +1,14 @@
 """Typed ingress and causal contracts for the Task Fence control protocol.
 
 This module defines bounded, secret-free data that may cross trusted runtime
-boundaries. It does not authorize dispatch and deliberately contains no
-prompt, transcript, tool argument, or result payload fields.
+boundaries. Its policy facade computes audit-only decisions; callers do not
+gate legacy dispatch in this increment. It deliberately contains no prompt,
+transcript, tool argument, or result payload fields.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -15,7 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Iterator, Mapping
+from typing import Iterator, Mapping, Protocol
 
 
 CONTROL_PROTOCOL_VERSION = 1
@@ -29,6 +31,8 @@ _MAX_EVIDENCE_REFS = 32
 _MAX_CAUSAL_ENVELOPE_BYTES = 16_384
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
 
 
 class Origin(str, Enum):
@@ -77,6 +81,47 @@ class ResolutionDisposition(str, Enum):
 class TerminalReason(str, Enum):
     STOPPED = "stopped"
     CANCELLED = "cancelled"
+
+
+class OperationKind(str, Enum):
+    MODEL = "model"
+    TOOL = "tool"
+
+
+class DecisionOutcome(str, Enum):
+    WOULD_RESERVE = "would_reserve"
+    WOULD_ALLOW = "would_allow"
+    WOULD_BLOCK = "would_block"
+    HALT_DISPATCH = "halt_dispatch"
+
+
+class DecisionReason(str, Enum):
+    CURRENT_AUTHORITY = "current_authority"
+    MISSING_PROVENANCE = "missing_provenance"
+    STORE_UNAVAILABLE = "store_unavailable"
+    STORE_INCOMPATIBLE = "store_incompatible"
+    AUDIT_DEGRADED = "audit_degraded"
+    COHORT_MISMATCH = "cohort_mismatch"
+    COHORT_HALTED = "cohort_halted"
+    UNSUPPORTED_MODE = "unsupported_mode"
+    TASK_NOT_FOUND = "task_not_found"
+    TASK_NOT_RUNNABLE = "task_not_runnable"
+    STALE_AUTHORITY = "stale_authority"
+    NEWER_INPUT_PENDING = "newer_input_pending"
+    INVOCATION_CONFLICT = "invocation_conflict"
+    PERMIT_NOT_FOUND = "permit_not_found"
+    PERMIT_ALREADY_CONSUMED = "permit_already_consumed"
+    PERMIT_REVOKED = "permit_revoked"
+    PERMIT_EXPIRED = "permit_expired"
+    PERMIT_OPERATION_MISMATCH = "permit_operation_mismatch"
+    PERMIT_GENERATION_MISMATCH = "permit_generation_mismatch"
+    PERMIT_RUNTIME_EPOCH_MISMATCH = "permit_runtime_epoch_mismatch"
+
+
+class AttemptTerminal(str, Enum):
+    SUCCEEDED = "SUCCEEDED"
+    FAILED_DEFINITE = "FAILED_DEFINITE"
+    OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -248,6 +293,78 @@ class TaskFenceProvenanceUnavailable(RuntimeError):
         super().__init__(reason)
 
 
+class TaskFencePolicyRejected(TaskFenceProtocolRejected):
+    """A dispatch-policy operation conflicts with durable protocol state."""
+
+
+class TaskFencePolicyUnavailable(RuntimeError):
+    """A terminal policy write could not use the durable control store."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class OperationDescriptor:
+    """Secret-free identity of one post-default external operation."""
+
+    invocation_id: str
+    kind: OperationKind
+    adapter: str
+    invocation_fingerprint: str
+
+    def __post_init__(self) -> None:
+        validate_operation_descriptor(self)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "invocation_id": self.invocation_id,
+            "kind": self.kind.value,
+            "adapter": self.adapter,
+            "invocation_fingerprint": self.invocation_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class DispatchDecision:
+    """Stable shadow observation returned by the shared policy service."""
+
+    outcome: DecisionOutcome
+    reason: DecisionReason
+    permit_id: str | None = None
+    attempt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, DecisionOutcome) or not isinstance(
+            self.reason,
+            DecisionReason,
+        ):
+            raise TaskFenceProtocolRejected("invalid_dispatch_decision")
+        current = self.reason is DecisionReason.CURRENT_AUTHORITY
+        allowed = self.outcome in {
+            DecisionOutcome.WOULD_RESERVE,
+            DecisionOutcome.WOULD_ALLOW,
+        }
+        if current != allowed:
+            raise TaskFenceProtocolRejected("invalid_dispatch_decision_reason")
+        for field in ("permit_id", "attempt_id"):
+            _bounded_text(
+                getattr(self, field),
+                field=field,
+                max_bytes=_MAX_IDENTIFIER_BYTES,
+                optional=True,
+            )
+        if self.outcome is DecisionOutcome.WOULD_RESERVE:
+            valid_shape = self.permit_id is not None and self.attempt_id is None
+        elif self.outcome is DecisionOutcome.WOULD_ALLOW:
+            valid_shape = self.permit_id is not None and self.attempt_id is not None
+        else:
+            valid_shape = self.attempt_id is None
+        if not valid_shape:
+            raise TaskFenceProtocolRejected("invalid_dispatch_decision_shape")
+
+
 def validate_action(action: TaskFenceAction) -> None:
     if not isinstance(action, TaskFenceAction):
         raise TaskFenceProtocolRejected("invalid_action_type")
@@ -300,6 +417,24 @@ def _canonical_refs(
     if len(set(values)) != len(values):
         raise TaskFenceProtocolRejected(f"duplicate_{field}")
     return tuple(sorted(values))
+
+
+def validate_operation_descriptor(operation: OperationDescriptor) -> None:
+    if not isinstance(operation, OperationDescriptor):
+        raise TaskFenceProtocolRejected("invalid_operation_descriptor_type")
+    if not isinstance(operation.kind, OperationKind):
+        raise TaskFenceProtocolRejected("invalid_operation_kind")
+    for field in ("invocation_id", "adapter"):
+        _bounded_text(
+            getattr(operation, field),
+            field=field,
+            max_bytes=_MAX_IDENTIFIER_BYTES,
+        )
+    if not (
+        isinstance(operation.invocation_fingerprint, str)
+        and _SHA256_RE.fullmatch(operation.invocation_fingerprint)
+    ):
+        raise TaskFenceProtocolRejected("invalid_invocation_fingerprint")
 
 
 @dataclass(frozen=True)
@@ -671,6 +806,129 @@ class CausalEnvelope:
         ):
             raise TaskFenceProtocolRejected("mixed_causal_parentage")
         return child
+
+
+def operation_binding_fingerprint(
+    envelope: CausalEnvelope,
+    operation: OperationDescriptor,
+) -> str:
+    """Commit to complete causal authority and post-default operation identity."""
+
+    if not isinstance(envelope, CausalEnvelope):
+        raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
+    validate_operation_descriptor(operation)
+    payload = json.dumps(
+        {
+            "causal_envelope": envelope.to_dict(),
+            "operation": operation.to_dict(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+class _TaskFencePolicyStore(Protocol):
+    def _admit_task_fence_operation(
+        self,
+        envelope: CausalEnvelope,
+        operation: OperationDescriptor,
+    ) -> DispatchDecision: ...
+
+    def _authorize_and_start_task_fence_operation(
+        self,
+        envelope: CausalEnvelope,
+        operation: OperationDescriptor,
+        permit_id: str,
+    ) -> DispatchDecision: ...
+
+    def _finish_task_fence_attempt(
+        self,
+        attempt_id: str,
+        terminal: AttemptTerminal,
+        evidence_reference: str | None,
+    ) -> None: ...
+
+
+class TaskFencePolicy:
+    """Shared audit-only policy facade; decisions do not gate legacy dispatch."""
+
+    def __init__(self, store: _TaskFencePolicyStore):
+        self._store = store
+
+    def admit_operation(
+        self,
+        envelope: CausalEnvelope | None,
+        operation: OperationDescriptor,
+    ) -> DispatchDecision:
+        validate_operation_descriptor(operation)
+        if envelope is None:
+            return DispatchDecision(
+                DecisionOutcome.WOULD_BLOCK,
+                DecisionReason.MISSING_PROVENANCE,
+            )
+        if not isinstance(envelope, CausalEnvelope):
+            raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
+        return self._store._admit_task_fence_operation(envelope, operation)
+
+    def authorize_and_start(
+        self,
+        envelope: CausalEnvelope | None,
+        operation: OperationDescriptor,
+        permit_id: str,
+    ) -> DispatchDecision:
+        validate_operation_descriptor(operation)
+        _bounded_text(
+            permit_id,
+            field="permit_id",
+            max_bytes=_MAX_IDENTIFIER_BYTES,
+        )
+        if envelope is None:
+            return DispatchDecision(
+                DecisionOutcome.WOULD_BLOCK,
+                DecisionReason.MISSING_PROVENANCE,
+                permit_id=permit_id,
+            )
+        if not isinstance(envelope, CausalEnvelope):
+            raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
+        return self._store._authorize_and_start_task_fence_operation(
+            envelope,
+            operation,
+            permit_id,
+        )
+
+    def finish_attempt(
+        self,
+        attempt_id: str,
+        terminal: AttemptTerminal,
+        evidence_reference: str | None,
+    ) -> None:
+        _bounded_text(
+            attempt_id,
+            field="attempt_id",
+            max_bytes=_MAX_IDENTIFIER_BYTES,
+        )
+        if not isinstance(terminal, AttemptTerminal):
+            raise TaskFenceProtocolRejected("invalid_attempt_terminal")
+        if (
+            terminal
+            in {AttemptTerminal.SUCCEEDED, AttemptTerminal.FAILED_DEFINITE}
+            and evidence_reference is None
+        ):
+            raise TaskFencePolicyRejected("missing_terminal_evidence")
+        _bounded_text(
+            evidence_reference,
+            field="evidence_reference",
+            max_bytes=_MAX_OPAQUE_REFERENCE_BYTES,
+            optional=True,
+        )
+        self._store._finish_task_fence_attempt(
+            attempt_id,
+            terminal,
+            evidence_reference,
+        )
 
 
 _CURRENT_CAUSAL_ENVELOPE: ContextVar[CausalEnvelope | None] = ContextVar(

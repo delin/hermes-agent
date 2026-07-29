@@ -43,9 +43,15 @@ from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
 from task_fence import (
+    AttemptTerminal,
     CausalEnvelope,
     CONTROL_PROTOCOL_VERSION,
+    DecisionOutcome,
+    DecisionReason,
+    DispatchDecision,
+    OperationDescriptor,
     TASK_FENCE_ACTIONS,
+    TASK_FENCE_POLICY_VERSION,
     TASK_FENCE_STORE_SCHEMA_VERSION,
     CorrelationKind,
     ExecutionEffect,
@@ -59,12 +65,16 @@ from task_fence import (
     TaskFenceIngressSidecar,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
+    TaskFencePolicyRejected,
+    TaskFencePolicyUnavailable,
     TaskFenceProtocolRejected,
     TaskFenceProvenanceRejected,
     TaskFenceProvenanceUnavailable,
     TaskFenceTaskControl,
+    operation_binding_fingerprint,
     validate_action,
     validate_ingress_envelope,
+    validate_operation_descriptor,
 )
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
@@ -323,6 +333,10 @@ _TASK_FENCE_MAX_V2_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_MAX_V2_MIGRATION_HISTORY_WORK = 1_000_000
 _TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset({2, 3})
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
+_TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
+# Fixed audit-only bound; no config until a real consumer sets a latency budget.
+_TASK_FENCE_POLICY_PERMIT_TTL_SECONDS = 24 * 60 * 60
+_TASK_FENCE_POLICY_EVIDENCE_MAX_BYTES = 2_048
 _TASK_FENCE_TASK_SELECT_COLUMNS = (
     "task_id, conversation_id, cohort_key, store_schema_version, "
     "control_protocol_version, intent_epoch, control_revision, status, "
@@ -344,6 +358,21 @@ def _task_fence_v2_identifier_compatible(
         return False
     try:
         return len(value.encode("utf-8")) <= _TASK_FENCE_V2_IDENTIFIER_MAX_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
+def _task_fence_policy_evidence_compatible(
+    value: object,
+    *,
+    optional: bool,
+) -> bool:
+    if value is None:
+        return optional
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= _TASK_FENCE_POLICY_EVIDENCE_MAX_BYTES
     except UnicodeEncodeError:
         return False
 
@@ -7295,6 +7324,1158 @@ class SessionDB:
             raise TaskFenceProvenanceUnavailable(
                 "generation_finish_database_error"
             ) from exc
+
+    @staticmethod
+    def _task_fence_policy_token(
+        outcome: DecisionOutcome,
+        reason: DecisionReason,
+    ) -> str:
+        return f"{outcome.value}:{reason.value}"
+
+    @staticmethod
+    def _task_fence_policy_block(
+        reason: DecisionReason,
+        *,
+        permit_id: Optional[str] = None,
+    ) -> DispatchDecision:
+        halt_reasons = {
+            DecisionReason.STORE_UNAVAILABLE,
+            DecisionReason.STORE_INCOMPATIBLE,
+            DecisionReason.COHORT_MISMATCH,
+            DecisionReason.COHORT_HALTED,
+            DecisionReason.UNSUPPORTED_MODE,
+        }
+        return DispatchDecision(
+            (
+                DecisionOutcome.HALT_DISPATCH
+                if reason in halt_reasons
+                else DecisionOutcome.WOULD_BLOCK
+            ),
+            reason,
+            permit_id=permit_id,
+        )
+
+    def _task_fence_policy_cohort_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_cohort_key: Optional[str],
+        now: float,
+    ) -> Tuple[Optional[DecisionReason], Optional[str], bool]:
+        control = conn.execute(
+            "SELECT mode_generation, ever_enforced "
+            "FROM main.task_fence_control WHERE singleton = 1"
+        ).fetchone()
+        if (
+            control is None
+            or type(control["mode_generation"]) is not int
+            or control["mode_generation"] < 0
+            or type(control["ever_enforced"]) is not int
+            or control["ever_enforced"] not in (0, 1)
+        ):
+            return DecisionReason.STORE_INCOMPATIBLE, None, False
+
+        cohort_key = task_cohort_key
+        implicit = cohort_key is None
+        if implicit:
+            cohort_key = _TASK_FENCE_IMPLICIT_AUDIT_COHORT
+            conn.execute(
+                "INSERT INTO main.task_fence_cohorts ("
+                "cohort_key, mode, mode_generation, activation_state, "
+                "audit_degraded, created_at, updated_at"
+                ") VALUES (?, 'audit', ?, 'inactive', 0, ?, ?) "
+                "ON CONFLICT(cohort_key) DO NOTHING",
+                (cohort_key, control["mode_generation"], now, now),
+            )
+
+        cohort = conn.execute(
+            "SELECT mode, mode_generation, activation_state, audit_degraded "
+            "FROM main.task_fence_cohorts WHERE cohort_key = ?",
+            (cohort_key,),
+        ).fetchone()
+        if (
+            cohort is None
+            or cohort["mode"] not in {"audit", "enforce", "halt_dispatch"}
+            or type(cohort["mode_generation"]) is not int
+            or cohort["mode_generation"] < 0
+            or cohort["activation_state"] not in {"inactive", "active", "halted"}
+            or type(cohort["audit_degraded"]) is not int
+            or cohort["audit_degraded"] not in (0, 1)
+        ):
+            return DecisionReason.STORE_INCOMPATIBLE, cohort_key, False
+        if implicit and (
+            cohort["mode"] != "audit"
+            or cohort["activation_state"] != "inactive"
+        ):
+            return DecisionReason.COHORT_MISMATCH, cohort_key, False
+        if cohort["mode_generation"] != control["mode_generation"]:
+            return DecisionReason.COHORT_MISMATCH, cohort_key, False
+        if (
+            cohort["mode"] == "halt_dispatch"
+            or cohort["activation_state"] == "halted"
+            or (control["ever_enforced"] == 1 and cohort["mode"] == "audit")
+        ):
+            return DecisionReason.COHORT_HALTED, cohort_key, False
+        if cohort["mode"] != "audit":
+            return DecisionReason.UNSUPPORTED_MODE, cohort_key, False
+        return None, cohort_key, control["ever_enforced"] == 0
+
+    def _task_fence_policy_authority_reason_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        envelope: CausalEnvelope,
+        operation: OperationDescriptor,
+        *,
+        now: float,
+    ) -> Optional[DecisionReason]:
+        store = self._inspect_task_fence_store_unlocked(include_counts=False)
+        if not store.compatible:
+            return DecisionReason.STORE_INCOMPATIBLE
+
+        control = conn.execute(
+            "SELECT runtime_epoch FROM main.task_fence_control "
+            "WHERE singleton = 1"
+        ).fetchone()
+        if (
+            control is None
+            or type(control["runtime_epoch"]) is not int
+            or control["runtime_epoch"] < 0
+        ):
+            return DecisionReason.STORE_INCOMPATIBLE
+        if control["runtime_epoch"] != envelope.runtime_epoch:
+            return DecisionReason.STALE_AUTHORITY
+
+        task = conn.execute(
+            "SELECT task_id, cohort_key, store_schema_version, "
+            "control_protocol_version, intent_epoch, control_revision, status, "
+            "active_authority_event_id, active_execution_run_id, "
+            "current_generation_id, current_runtime_epoch "
+            "FROM main.task_fence_tasks WHERE task_id = ?",
+            (envelope.task_id,),
+        ).fetchone()
+        if task is None:
+            return DecisionReason.TASK_NOT_FOUND
+        cohort_reason, _cohort_key, _audit_fallback = (
+            self._task_fence_policy_cohort_unlocked(
+                conn,
+                task_cohort_key=task["cohort_key"],
+                now=now,
+            )
+        )
+        if cohort_reason is not None:
+            return cohort_reason
+        if task["status"] != "running":
+            return DecisionReason.TASK_NOT_RUNNABLE
+        if (
+            task["store_schema_version"] != envelope.store_schema_version
+            or task["control_protocol_version"]
+            != envelope.control_protocol_version
+            or task["intent_epoch"] != envelope.intent_epoch
+            or task["control_revision"] != envelope.control_revision
+            or task["active_authority_event_id"]
+            != envelope.authority_event_id
+            or task["active_execution_run_id"] != envelope.run_id
+            or task["current_generation_id"] != envelope.generation_id
+            or task["current_runtime_epoch"] != envelope.runtime_epoch
+        ):
+            return DecisionReason.STALE_AUTHORITY
+
+        run = conn.execute(
+            "SELECT task_id, authority_event_id, intent_epoch, control_revision, "
+            "runtime_epoch, bound_input_hash, state "
+            "FROM main.task_fence_execution_runs WHERE run_id = ?",
+            (envelope.run_id,),
+        ).fetchone()
+        if run is None or (
+            run["task_id"] != envelope.task_id
+            or run["authority_event_id"] != envelope.authority_event_id
+            or run["intent_epoch"] != envelope.intent_epoch
+            or run["control_revision"] != envelope.control_revision
+            or run["runtime_epoch"] != envelope.runtime_epoch
+            or run["bound_input_hash"] != envelope.input_manifest_hash
+            or run["state"] != "open"
+        ):
+            return DecisionReason.STALE_AUTHORITY
+
+        generation = conn.execute(
+            "SELECT task_id, run_id, intent_epoch, control_revision, "
+            "runtime_epoch, input_manifest_hash, snapshot_event_id, state, "
+            "closed_at FROM main.task_fence_model_generations "
+            "WHERE generation_id = ?",
+            (envelope.generation_id,),
+        ).fetchone()
+        if generation is None or (
+            generation["task_id"] != envelope.task_id
+            or generation["run_id"] != envelope.run_id
+            or generation["intent_epoch"] != envelope.intent_epoch
+            or generation["control_revision"] != envelope.control_revision
+            or generation["runtime_epoch"] != envelope.runtime_epoch
+            or generation["input_manifest_hash"]
+            != envelope.input_manifest_hash
+            or generation["snapshot_event_id"] != envelope.snapshot_event_id
+            or generation["state"]
+            != ("started" if operation.kind.value == "model" else "committed")
+            or generation["closed_at"] is not None
+        ):
+            return DecisionReason.STALE_AUTHORITY
+
+        snapshot = conn.execute(
+            "SELECT i.accepted_order, s.task_id, s.task_cohort_key, "
+            "s.task_store_schema_version, "
+            "s.task_control_protocol_version, s.task_intent_epoch, "
+            "s.task_control_revision, s.task_status, "
+            "s.task_active_authority_event_id, "
+            "s.task_active_execution_run_id, s.task_current_runtime_epoch "
+            "FROM main.task_fence_acceptance_snapshots AS s "
+            "JOIN main.task_fence_ingress AS i ON i.event_id = s.event_id "
+            "WHERE s.event_id = ?",
+            (envelope.snapshot_event_id,),
+        ).fetchone()
+        if snapshot is None or (
+            snapshot["accepted_order"] != envelope.accepted_order
+            or snapshot["task_id"] != envelope.task_id
+            or snapshot["task_cohort_key"] != task["cohort_key"]
+            or snapshot["task_store_schema_version"]
+            != envelope.store_schema_version
+            or snapshot["task_control_protocol_version"]
+            != envelope.control_protocol_version
+            or snapshot["task_intent_epoch"] != envelope.intent_epoch
+            or snapshot["task_control_revision"] != envelope.control_revision
+            or snapshot["task_status"] != "running"
+            or snapshot["task_active_authority_event_id"]
+            != envelope.authority_event_id
+            or snapshot["task_active_execution_run_id"] != envelope.run_id
+            or snapshot["task_current_runtime_epoch"] != envelope.runtime_epoch
+        ):
+            return DecisionReason.STALE_AUTHORITY
+
+        if conn.execute(
+            "SELECT 1 FROM main.task_fence_task_inputs "
+            "WHERE task_id = ? AND state = 'pending' LIMIT 1",
+            (envelope.task_id,),
+        ).fetchone() is not None:
+            return DecisionReason.NEWER_INPUT_PENDING
+        exact_run_inputs = self._task_fence_exact_run_input_ids_unlocked(
+            conn,
+            task_id=envelope.task_id,
+            run_id=envelope.run_id,
+            expected_hash=envelope.input_manifest_hash,
+            allowed_states=frozenset(
+                {"bound" if operation.kind.value == "model" else "presented"}
+            ),
+        )
+        if isinstance(exact_run_inputs, _TaskFenceIngressFailure):
+            raise sqlite3.IntegrityError(exact_run_inputs.reason)
+        return None
+
+    @staticmethod
+    def _task_fence_policy_permit_columns(
+        operation: OperationDescriptor,
+    ) -> Tuple[str, Optional[str], Optional[str], str]:
+        return (
+            operation.adapter,
+            None,
+            None,
+            operation.kind.value,
+        )
+
+    @staticmethod
+    def _task_fence_policy_permit_mismatch_reason(
+        permit: sqlite3.Row,
+        envelope: CausalEnvelope,
+        operation: OperationDescriptor,
+        binding_fingerprint: str,
+    ) -> Optional[DecisionReason]:
+        if permit["generation_id"] != envelope.generation_id:
+            return DecisionReason.PERMIT_GENERATION_MISMATCH
+        if permit["runtime_epoch"] != envelope.runtime_epoch:
+            return DecisionReason.PERMIT_RUNTIME_EPOCH_MISMATCH
+        executor, tool_name, method, audience = (
+            SessionDB._task_fence_policy_permit_columns(operation)
+        )
+        if (
+            permit["task_id"] != envelope.task_id
+            or permit["authority_event_id"] != envelope.authority_event_id
+            or permit["run_id"] != envelope.run_id
+            or permit["intent_epoch"] != envelope.intent_epoch
+            or permit["control_revision"] != envelope.control_revision
+            or permit["invocation_envelope_id"] != operation.invocation_id
+            or permit["invocation_fingerprint"] != binding_fingerprint
+            or permit["executor"] != executor
+            or permit["tool_name"] != tool_name
+            or permit["method"] != method
+            or permit["audience"] != audience
+            or permit["parent_attempt_id"] is not None
+            or permit["policy_version"] != TASK_FENCE_POLICY_VERSION
+        ):
+            return DecisionReason.PERMIT_OPERATION_MISMATCH
+        return None
+
+    @staticmethod
+    def _task_fence_policy_permit_state_reason(
+        state: object,
+    ) -> DecisionReason:
+        return {
+            "consumed": DecisionReason.PERMIT_ALREADY_CONSUMED,
+            "revoked": DecisionReason.PERMIT_REVOKED,
+            "expired": DecisionReason.PERMIT_EXPIRED,
+        }.get(state, DecisionReason.STORE_INCOMPATIBLE)
+
+    def _task_fence_policy_permit_storage_compatible_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        permit: sqlite3.Row,
+    ) -> bool:
+        identifier_fields = (
+            "permit_id",
+            "task_id",
+            "authority_event_id",
+            "run_id",
+            "generation_id",
+            "invocation_envelope_id",
+            "executor",
+            "audience",
+        )
+        if any(
+            not _task_fence_v2_identifier_compatible(permit[field])
+            for field in identifier_fields
+        ):
+            return False
+        if (
+            permit["tool_name"] is not None
+            or permit["method"] is not None
+            or permit["parent_attempt_id"] is not None
+            or permit["audience"] not in {"model", "tool"}
+        ):
+            return False
+        if (
+            not isinstance(permit["invocation_fingerprint"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", permit["invocation_fingerprint"])
+            is None
+            or permit["policy_version"] != TASK_FENCE_POLICY_VERSION
+            or any(
+                type(permit[field]) is not int or permit[field] < 0
+                for field in ("intent_epoch", "control_revision", "runtime_epoch")
+            )
+        ):
+            return False
+
+        def finite_number(value: object) -> bool:
+            return type(value) in {int, float} and math.isfinite(float(value))
+
+        state = permit["state"]
+        reserved_at = permit["reserved_at"]
+        expires_at = permit["expires_at"]
+        consumed_at = permit["consumed_at"]
+        if (
+            state not in {"reserved", "consumed", "revoked", "expired"}
+            or not finite_number(reserved_at)
+            or reserved_at < 0
+            or not finite_number(expires_at)
+            or expires_at <= reserved_at
+        ):
+            return False
+        if state == "consumed":
+            if (
+                not finite_number(consumed_at)
+                or consumed_at < reserved_at
+                or consumed_at >= expires_at
+            ):
+                return False
+        elif consumed_at is not None:
+            return False
+
+        reserved_token = self._task_fence_policy_token(
+            DecisionOutcome.WOULD_RESERVE,
+            DecisionReason.CURRENT_AUTHORITY,
+        )
+        expected_tokens = {
+            "reserved": {reserved_token},
+            "consumed": {
+                self._task_fence_policy_token(
+                    DecisionOutcome.WOULD_ALLOW,
+                    DecisionReason.CURRENT_AUTHORITY,
+                )
+            },
+            "expired": {
+                self._task_fence_policy_token(
+                    DecisionOutcome.WOULD_BLOCK,
+                    DecisionReason.PERMIT_EXPIRED,
+                )
+            },
+            "revoked": {
+                reserved_token,
+                self._task_fence_policy_token(
+                    DecisionOutcome.WOULD_BLOCK,
+                    DecisionReason.PERMIT_REVOKED,
+                ),
+                *(
+                    self._task_fence_policy_token(
+                        DecisionOutcome.WOULD_BLOCK,
+                        reason,
+                    )
+                    for reason in (
+                        DecisionReason.TASK_NOT_FOUND,
+                        DecisionReason.TASK_NOT_RUNNABLE,
+                        DecisionReason.STALE_AUTHORITY,
+                        DecisionReason.NEWER_INPUT_PENDING,
+                    )
+                ),
+            },
+        }
+        if permit["policy_decision"] not in expected_tokens[state]:
+            return False
+
+        attempts = conn.execute(
+            "SELECT attempt_id, parent_attempt_id, recovery_classification, "
+            "state, disposition, handoff_ref, acknowledgement_ref, "
+            "prepared_at, started_at, terminal_at "
+            "FROM main.task_fence_attempts "
+            "WHERE permit_id = ? ORDER BY attempt_id LIMIT 2",
+            (permit["permit_id"],),
+        ).fetchall()
+        if state != "consumed":
+            return not attempts
+        if len(attempts) != 1:
+            return False
+        if attempts[0]["started_at"] != consumed_at:
+            return False
+        return self._task_fence_policy_attempt_storage_compatible_unlocked(
+            conn,
+            attempts[0],
+            binding_fingerprint=permit["invocation_fingerprint"],
+        )
+
+    @staticmethod
+    def _task_fence_attempt_transition_chain_compatible_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        state: str,
+        evidence_reference: Optional[str],
+        binding_fingerprint: str,
+        started_at: float,
+        terminal_at: Optional[float],
+    ) -> bool:
+        rows = conn.execute(
+            "SELECT from_state, to_state, disposition, evidence_ref, "
+            "transitioned_at FROM main.task_fence_attempt_transitions "
+            "WHERE attempt_id = ? ORDER BY transition_order LIMIT 3",
+            (attempt_id,),
+        ).fetchall()
+        if any(
+            type(row["transitioned_at"]) not in {int, float}
+            or not math.isfinite(float(row["transitioned_at"]))
+            or row["transitioned_at"] < 0
+            for row in rows
+        ):
+            return False
+        shapes = tuple(tuple(row[:4]) for row in rows)
+        started = (
+            (
+                None,
+                "STARTED",
+                DecisionOutcome.WOULD_ALLOW.value,
+                binding_fingerprint,
+            ),
+        )
+        if state == "STARTED":
+            return (
+                terminal_at is None
+                and shapes == started
+                and rows[0]["transitioned_at"] == started_at
+            )
+        if state in {terminal.value for terminal in AttemptTerminal}:
+            return (
+                terminal_at is not None
+                and shapes
+                == (
+                    *started,
+                    ("STARTED", state, state, evidence_reference),
+                )
+                and rows[0]["transitioned_at"] == started_at
+                and rows[1]["transitioned_at"] == terminal_at
+            )
+        return False
+
+    def _task_fence_policy_attempt_storage_compatible_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        attempt: sqlite3.Row,
+        *,
+        binding_fingerprint: str,
+    ) -> bool:
+        def finite_number(value: object) -> bool:
+            return type(value) in {int, float} and math.isfinite(float(value))
+
+        state = attempt["state"]
+        terminal_states = {terminal.value for terminal in AttemptTerminal}
+        if (
+            not _task_fence_v2_identifier_compatible(attempt["attempt_id"])
+            or attempt["parent_attempt_id"] is not None
+            or attempt["recovery_classification"] != "may_effect"
+            or state not in {"STARTED", *terminal_states}
+            or attempt["handoff_ref"] is not None
+            or not finite_number(attempt["prepared_at"])
+            or not finite_number(attempt["started_at"])
+            or attempt["prepared_at"] < 0
+            or attempt["started_at"] < 0
+            or attempt["prepared_at"] != attempt["started_at"]
+        ):
+            return False
+        if state == "STARTED":
+            if (
+                attempt["disposition"] is not None
+                or attempt["acknowledgement_ref"] is not None
+                or attempt["terminal_at"] is not None
+            ):
+                return False
+        elif (
+            attempt["disposition"] != state
+            or not _task_fence_policy_evidence_compatible(
+                attempt["acknowledgement_ref"],
+                optional=state == AttemptTerminal.OUTCOME_UNKNOWN.value,
+            )
+            or not finite_number(attempt["terminal_at"])
+            or attempt["terminal_at"] < attempt["started_at"]
+        ):
+            return False
+        return self._task_fence_attempt_transition_chain_compatible_unlocked(
+            conn,
+            attempt_id=attempt["attempt_id"],
+            state=state,
+            evidence_reference=attempt["acknowledgement_ref"],
+            binding_fingerprint=binding_fingerprint,
+            started_at=attempt["started_at"],
+            terminal_at=attempt["terminal_at"],
+        )
+
+    @staticmethod
+    def _task_fence_policy_task_id_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        task_id: Optional[str],
+        permit_id: Optional[str],
+        attempt_id: Optional[str],
+    ) -> Optional[str]:
+        resolved_task_id = None
+        if attempt_id is not None:
+            row = conn.execute(
+                "SELECT p.task_id FROM main.task_fence_attempts AS a "
+                "JOIN main.task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id WHERE a.attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            resolved_task_id = row[0] if row is not None else None
+        if resolved_task_id is None and permit_id is not None:
+            row = conn.execute(
+                "SELECT task_id FROM main.task_fence_dispatch_permits "
+                "WHERE permit_id = ?",
+                (permit_id,),
+            ).fetchone()
+            resolved_task_id = row[0] if row is not None else None
+        return resolved_task_id if resolved_task_id is not None else task_id
+
+    def _task_fence_latch_audit_degraded(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        permit_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+    ) -> bool:
+        if self.read_only or self._conn is None:
+            return False
+
+        def _latch(conn: sqlite3.Connection) -> bool:
+            now = time.time()
+            store = self._inspect_task_fence_store_unlocked(include_counts=False)
+            if not store.compatible:
+                return False
+            resolved_task_id = self._task_fence_policy_task_id_unlocked(
+                conn,
+                task_id=task_id,
+                permit_id=permit_id,
+                attempt_id=attempt_id,
+            )
+            if resolved_task_id is None:
+                return False
+            task = conn.execute(
+                "SELECT cohort_key FROM main.task_fence_tasks WHERE task_id = ?",
+                (resolved_task_id,),
+            ).fetchone()
+            if task is None:
+                return False
+            _reason, cohort_key, audit_fallback = (
+                self._task_fence_policy_cohort_unlocked(
+                    conn,
+                    task_cohort_key=task["cohort_key"],
+                    now=now,
+                )
+            )
+            if cohort_key is None:
+                return False
+            updated = conn.execute(
+                "UPDATE main.task_fence_cohorts "
+                "SET audit_degraded = 1, updated_at = ? "
+                "WHERE cohort_key = ?",
+                (now, cohort_key),
+            )
+            return updated.rowcount == 1 and audit_fallback
+
+        try:
+            return self._execute_write(_latch)
+        except Exception:
+            return False
+
+    def _task_fence_known_never_enforced_audit(
+        self,
+        *,
+        task_id: Optional[str],
+        permit_id: Optional[str],
+    ) -> bool:
+        if self._conn is None:
+            return False
+        try:
+            with self._lock:
+                store = self._inspect_task_fence_store_unlocked(
+                    include_counts=False
+                )
+                if not store.compatible:
+                    return False
+                control = self._conn.execute(
+                    "SELECT mode_generation, ever_enforced "
+                    "FROM main.task_fence_control WHERE singleton = 1"
+                ).fetchone()
+                if (
+                    control is None
+                    or type(control["mode_generation"]) is not int
+                    or control["mode_generation"] < 0
+                    or type(control["ever_enforced"]) is not int
+                    or control["ever_enforced"] != 0
+                ):
+                    return False
+                resolved_task_id = self._task_fence_policy_task_id_unlocked(
+                    self._conn,
+                    task_id=task_id,
+                    permit_id=permit_id,
+                    attempt_id=None,
+                )
+                if resolved_task_id is None:
+                    return False
+                task = self._conn.execute(
+                    "SELECT cohort_key FROM main.task_fence_tasks "
+                    "WHERE task_id = ?",
+                    (resolved_task_id,),
+                ).fetchone()
+                if task is None:
+                    return False
+                implicit = task["cohort_key"] is None
+                cohort_key = (
+                    _TASK_FENCE_IMPLICIT_AUDIT_COHORT
+                    if implicit
+                    else task["cohort_key"]
+                )
+                cohort = self._conn.execute(
+                    "SELECT mode, mode_generation, activation_state, "
+                    "audit_degraded FROM main.task_fence_cohorts "
+                    "WHERE cohort_key = ?",
+                    (cohort_key,),
+                ).fetchone()
+                if cohort is None:
+                    return implicit
+                return bool(
+                    cohort["mode"] == "audit"
+                    and cohort["mode_generation"] == control["mode_generation"]
+                    and (
+                        cohort["activation_state"] == "inactive"
+                        or (
+                            not implicit
+                            and cohort["activation_state"] == "active"
+                        )
+                    )
+                    and type(cohort["audit_degraded"]) is int
+                    and cohort["audit_degraded"] in (0, 1)
+                )
+        except Exception:
+            return False
+
+    def _task_fence_policy_failure_decision(
+        self,
+        *,
+        task_id: str,
+        permit_id: Optional[str] = None,
+    ) -> DispatchDecision:
+        if self._task_fence_latch_audit_degraded(
+            task_id=task_id,
+            permit_id=permit_id,
+        ):
+            return DispatchDecision(
+                DecisionOutcome.WOULD_BLOCK,
+                DecisionReason.AUDIT_DEGRADED,
+                permit_id=permit_id,
+            )
+        if self._task_fence_known_never_enforced_audit(
+            task_id=task_id,
+            permit_id=permit_id,
+        ):
+            return DispatchDecision(
+                DecisionOutcome.WOULD_BLOCK,
+                DecisionReason.STORE_UNAVAILABLE,
+                permit_id=permit_id,
+            )
+        return DispatchDecision(
+            DecisionOutcome.HALT_DISPATCH,
+            DecisionReason.STORE_UNAVAILABLE,
+            permit_id=permit_id,
+        )
+
+    def _admit_task_fence_operation(
+        self,
+        envelope: CausalEnvelope,
+        operation: OperationDescriptor,
+    ) -> DispatchDecision:
+        """Reserve one exact audit permit without starting an attempt."""
+
+        validate_operation_descriptor(operation)
+        if not isinstance(envelope, CausalEnvelope):
+            raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
+        if self.read_only or self._conn is None:
+            return self._task_fence_policy_failure_decision(
+                task_id=envelope.task_id
+            )
+        if envelope.invocation_id is None:
+            return self._task_fence_policy_block(
+                DecisionReason.MISSING_PROVENANCE
+            )
+        if operation.invocation_id != envelope.invocation_id:
+            return self._task_fence_policy_block(
+                DecisionReason.PERMIT_OPERATION_MISMATCH
+            )
+
+        permit_id = f"tfp_{uuid.uuid4().hex}"
+        binding_fingerprint = operation_binding_fingerprint(envelope, operation)
+        executor, tool_name, method, audience = (
+            self._task_fence_policy_permit_columns(operation)
+        )
+
+        def _admit(conn: sqlite3.Connection) -> DispatchDecision:
+            now = time.time()
+            authority_reason = self._task_fence_policy_authority_reason_unlocked(
+                conn,
+                envelope,
+                operation,
+                now=now,
+            )
+            if authority_reason is DecisionReason.STORE_INCOMPATIBLE:
+                raise sqlite3.IntegrityError(
+                    "Task Fence policy authority projection is incompatible"
+                )
+            if authority_reason is not None:
+                return self._task_fence_policy_block(authority_reason)
+
+            existing = conn.execute(
+                "SELECT permit_id, task_id, authority_event_id, run_id, "
+                "generation_id, intent_epoch, control_revision, runtime_epoch, "
+                "invocation_envelope_id, invocation_fingerprint, executor, "
+                "tool_name, method, audience, parent_attempt_id, policy_decision, "
+                "policy_version, expires_at, state, reserved_at, consumed_at "
+                "FROM main.task_fence_dispatch_permits "
+                "WHERE invocation_envelope_id = ?",
+                (operation.invocation_id,),
+            ).fetchone()
+            if existing is not None:
+                if not self._task_fence_policy_permit_storage_compatible_unlocked(
+                    conn,
+                    existing,
+                ):
+                    raise sqlite3.IntegrityError(
+                        "Task Fence permit projection is incompatible"
+                    )
+                mismatch = self._task_fence_policy_permit_mismatch_reason(
+                    existing,
+                    envelope,
+                    operation,
+                    binding_fingerprint,
+                )
+                if mismatch is not None:
+                    return self._task_fence_policy_block(
+                        DecisionReason.INVOCATION_CONFLICT,
+                        permit_id=existing["permit_id"],
+                    )
+                if existing["state"] != "reserved":
+                    return self._task_fence_policy_block(
+                        self._task_fence_policy_permit_state_reason(
+                            existing["state"]
+                        ),
+                        permit_id=existing["permit_id"],
+                    )
+                if existing["expires_at"] <= now:
+                    conn.execute(
+                        "UPDATE main.task_fence_dispatch_permits "
+                        "SET state = 'expired', policy_decision = ? "
+                        "WHERE permit_id = ? AND state = 'reserved'",
+                        (
+                            self._task_fence_policy_token(
+                                DecisionOutcome.WOULD_BLOCK,
+                                DecisionReason.PERMIT_EXPIRED,
+                            ),
+                            existing["permit_id"],
+                        ),
+                    )
+                    return self._task_fence_policy_block(
+                        DecisionReason.PERMIT_EXPIRED,
+                        permit_id=existing["permit_id"],
+                    )
+                return DispatchDecision(
+                    DecisionOutcome.WOULD_RESERVE,
+                    DecisionReason.CURRENT_AUTHORITY,
+                    permit_id=existing["permit_id"],
+                )
+
+            conn.execute(
+                "INSERT INTO main.task_fence_dispatch_permits ("
+                "permit_id, task_id, authority_event_id, run_id, generation_id, "
+                "intent_epoch, control_revision, runtime_epoch, "
+                "invocation_envelope_id, invocation_fingerprint, executor, "
+                "tool_name, method, audience, parent_attempt_id, policy_decision, "
+                "policy_version, expires_at, state, reserved_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, "
+                "?, 'reserved', ?)",
+                (
+                    permit_id,
+                    envelope.task_id,
+                    envelope.authority_event_id,
+                    envelope.run_id,
+                    envelope.generation_id,
+                    envelope.intent_epoch,
+                    envelope.control_revision,
+                    envelope.runtime_epoch,
+                    operation.invocation_id,
+                    binding_fingerprint,
+                    executor,
+                    tool_name,
+                    method,
+                    audience,
+                    self._task_fence_policy_token(
+                        DecisionOutcome.WOULD_RESERVE,
+                        DecisionReason.CURRENT_AUTHORITY,
+                    ),
+                    TASK_FENCE_POLICY_VERSION,
+                    now + _TASK_FENCE_POLICY_PERMIT_TTL_SECONDS,
+                    now,
+                ),
+            )
+            return DispatchDecision(
+                DecisionOutcome.WOULD_RESERVE,
+                DecisionReason.CURRENT_AUTHORITY,
+                permit_id=permit_id,
+            )
+
+        try:
+            return self._execute_write(_admit)
+        except sqlite3.DatabaseError:
+            return self._task_fence_policy_failure_decision(
+                task_id=envelope.task_id
+            )
+
+    def _authorize_and_start_task_fence_operation(
+        self,
+        envelope: CausalEnvelope,
+        operation: OperationDescriptor,
+        permit_id: str,
+    ) -> DispatchDecision:
+        """Consume an exact permit and commit STARTED before adapter handoff."""
+
+        validate_operation_descriptor(operation)
+        if not isinstance(envelope, CausalEnvelope):
+            raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
+        if not isinstance(permit_id, str) or not permit_id:
+            raise TaskFenceProtocolRejected("invalid_permit_id")
+        if self.read_only or self._conn is None:
+            return self._task_fence_policy_failure_decision(
+                task_id=envelope.task_id,
+                permit_id=permit_id,
+            )
+
+        attempt_id = f"tfa_{uuid.uuid4().hex}"
+        binding_fingerprint = operation_binding_fingerprint(envelope, operation)
+
+        def _authorize(conn: sqlite3.Connection) -> DispatchDecision:
+            now = time.time()
+            permit = conn.execute(
+                "SELECT permit_id, task_id, authority_event_id, run_id, "
+                "generation_id, intent_epoch, control_revision, runtime_epoch, "
+                "invocation_envelope_id, invocation_fingerprint, executor, "
+                "tool_name, method, audience, parent_attempt_id, policy_decision, "
+                "policy_version, expires_at, state, reserved_at, consumed_at "
+                "FROM main.task_fence_dispatch_permits WHERE permit_id = ?",
+                (permit_id,),
+            ).fetchone()
+            if permit is None:
+                return self._task_fence_policy_block(
+                    DecisionReason.PERMIT_NOT_FOUND,
+                    permit_id=permit_id,
+                )
+            if not self._task_fence_policy_permit_storage_compatible_unlocked(
+                conn,
+                permit,
+            ):
+                raise sqlite3.IntegrityError(
+                    "Task Fence permit projection is incompatible"
+                )
+            mismatch = self._task_fence_policy_permit_mismatch_reason(
+                permit,
+                envelope,
+                operation,
+                binding_fingerprint,
+            )
+            if mismatch is not None:
+                return self._task_fence_policy_block(
+                    mismatch,
+                    permit_id=permit_id,
+                )
+            if permit["state"] != "reserved":
+                reason = self._task_fence_policy_permit_state_reason(
+                    permit["state"]
+                )
+                if permit["state"] == "revoked":
+                    conn.execute(
+                        "UPDATE main.task_fence_dispatch_permits "
+                        "SET policy_decision = ? WHERE permit_id = ? "
+                        "AND state = 'revoked'",
+                        (
+                            self._task_fence_policy_token(
+                                DecisionOutcome.WOULD_BLOCK,
+                                reason,
+                            ),
+                            permit_id,
+                        ),
+                    )
+                return self._task_fence_policy_block(
+                    reason,
+                    permit_id=permit_id,
+                )
+            if permit["expires_at"] <= now:
+                conn.execute(
+                    "UPDATE main.task_fence_dispatch_permits "
+                    "SET state = 'expired', policy_decision = ? "
+                    "WHERE permit_id = ? AND state = 'reserved'",
+                    (
+                        self._task_fence_policy_token(
+                            DecisionOutcome.WOULD_BLOCK,
+                            DecisionReason.PERMIT_EXPIRED,
+                        ),
+                        permit_id,
+                    ),
+                )
+                return self._task_fence_policy_block(
+                    DecisionReason.PERMIT_EXPIRED,
+                    permit_id=permit_id,
+                )
+
+            authority_reason = self._task_fence_policy_authority_reason_unlocked(
+                conn,
+                envelope,
+                operation,
+                now=now,
+            )
+            if authority_reason is DecisionReason.STORE_INCOMPATIBLE:
+                raise sqlite3.IntegrityError(
+                    "Task Fence policy authority projection is incompatible"
+                )
+            if authority_reason is not None:
+                if authority_reason not in {
+                    DecisionReason.STORE_INCOMPATIBLE,
+                    DecisionReason.COHORT_MISMATCH,
+                    DecisionReason.COHORT_HALTED,
+                    DecisionReason.UNSUPPORTED_MODE,
+                }:
+                    conn.execute(
+                        "UPDATE main.task_fence_dispatch_permits "
+                        "SET state = 'revoked', policy_decision = ? "
+                        "WHERE permit_id = ? AND state = 'reserved'",
+                        (
+                            self._task_fence_policy_token(
+                                DecisionOutcome.WOULD_BLOCK,
+                                authority_reason,
+                            ),
+                            permit_id,
+                        ),
+                    )
+                return self._task_fence_policy_block(
+                    authority_reason,
+                    permit_id=permit_id,
+                )
+
+            consumed = conn.execute(
+                "UPDATE main.task_fence_dispatch_permits "
+                "SET state = 'consumed', consumed_at = ?, policy_decision = ? "
+                "WHERE permit_id = ? AND state = 'reserved' AND expires_at > ?",
+                (
+                    now,
+                    self._task_fence_policy_token(
+                        DecisionOutcome.WOULD_ALLOW,
+                        DecisionReason.CURRENT_AUTHORITY,
+                    ),
+                    permit_id,
+                    now,
+                ),
+            )
+            if consumed.rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    "Task Fence permit consumption changed"
+                )
+            conn.execute(
+                "INSERT INTO main.task_fence_attempts ("
+                "attempt_id, permit_id, parent_attempt_id, "
+                "recovery_classification, state, handoff_ref, "
+                "prepared_at, started_at"
+                ") VALUES (?, ?, ?, 'may_effect', 'STARTED', ?, ?, ?)",
+                (
+                    attempt_id,
+                    permit_id,
+                    permit["parent_attempt_id"],
+                    None,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO main.task_fence_attempt_transitions ("
+                "attempt_id, from_state, to_state, disposition, evidence_ref, "
+                "transitioned_at"
+                ") VALUES (?, NULL, 'STARTED', ?, ?, ?)",
+                (
+                    attempt_id,
+                    DecisionOutcome.WOULD_ALLOW.value,
+                    binding_fingerprint,
+                    now,
+                ),
+            )
+            return DispatchDecision(
+                DecisionOutcome.WOULD_ALLOW,
+                DecisionReason.CURRENT_AUTHORITY,
+                permit_id=permit_id,
+                attempt_id=attempt_id,
+            )
+
+        try:
+            return self._execute_write(_authorize)
+        except sqlite3.DatabaseError:
+            return self._task_fence_policy_failure_decision(
+                task_id=envelope.task_id,
+                permit_id=permit_id,
+            )
+
+    def _finish_task_fence_attempt(
+        self,
+        attempt_id: str,
+        terminal: AttemptTerminal,
+        evidence_reference: Optional[str],
+    ) -> None:
+        """Record exact terminal evidence without rebasing old authority."""
+
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise TaskFenceProtocolRejected("invalid_attempt_id")
+        if not isinstance(terminal, AttemptTerminal):
+            raise TaskFenceProtocolRejected("invalid_attempt_terminal")
+        if not _task_fence_policy_evidence_compatible(
+            evidence_reference,
+            optional=True,
+        ):
+            raise TaskFenceProtocolRejected("invalid_evidence_reference")
+        if (
+            evidence_reference is None
+            and terminal is not AttemptTerminal.OUTCOME_UNKNOWN
+        ):
+            raise TaskFencePolicyRejected("missing_terminal_evidence")
+        if self.read_only or self._conn is None:
+            raise TaskFencePolicyUnavailable("store_unavailable")
+
+        def _finish(conn: sqlite3.Connection) -> None:
+            now = time.time()
+            store = self._inspect_task_fence_store_unlocked(include_counts=False)
+            if not store.compatible:
+                raise TaskFencePolicyUnavailable("store_incompatible")
+            attempt = conn.execute(
+                "SELECT attempt_id, permit_id, parent_attempt_id, "
+                "recovery_classification, state, disposition, handoff_ref, "
+                "acknowledgement_ref, "
+                "prepared_at, started_at, terminal_at "
+                "FROM main.task_fence_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise TaskFencePolicyRejected("attempt_not_found")
+            permit = conn.execute(
+                "SELECT permit_id, task_id, authority_event_id, run_id, "
+                "generation_id, intent_epoch, control_revision, runtime_epoch, "
+                "invocation_envelope_id, invocation_fingerprint, executor, "
+                "tool_name, method, audience, parent_attempt_id, policy_decision, "
+                "policy_version, expires_at, state, reserved_at, consumed_at "
+                "FROM main.task_fence_dispatch_permits WHERE permit_id = ?",
+                (attempt["permit_id"],),
+            ).fetchone()
+            if (
+                permit is None
+                or not self._task_fence_policy_permit_storage_compatible_unlocked(
+                    conn,
+                    permit,
+                )
+            ):
+                raise sqlite3.IntegrityError(
+                    "Task Fence permit/attempt projection is incompatible"
+                )
+            if attempt["state"] == terminal.value:
+                if (
+                    attempt["disposition"] == terminal.value
+                    and attempt["acknowledgement_ref"] == evidence_reference
+                ):
+                    return
+                raise TaskFencePolicyRejected("attempt_terminal_conflict")
+            if attempt["state"] != "STARTED":
+                raise TaskFencePolicyRejected("attempt_not_started")
+            updated = conn.execute(
+                "UPDATE main.task_fence_attempts "
+                "SET state = ?, disposition = ?, acknowledgement_ref = ?, "
+                "terminal_at = ? WHERE attempt_id = ? AND state = 'STARTED'",
+                (
+                    terminal.value,
+                    terminal.value,
+                    evidence_reference,
+                    now,
+                    attempt_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    "Task Fence attempt terminal state changed"
+                )
+            conn.execute(
+                "INSERT INTO main.task_fence_attempt_transitions ("
+                "attempt_id, from_state, to_state, disposition, evidence_ref, "
+                "transitioned_at"
+                ") VALUES (?, 'STARTED', ?, ?, ?, ?)",
+                (
+                    attempt_id,
+                    terminal.value,
+                    terminal.value,
+                    evidence_reference,
+                    now,
+                ),
+            )
+
+        try:
+            self._execute_write(_finish)
+        except (TaskFencePolicyRejected, TaskFencePolicyUnavailable):
+            raise
+        except sqlite3.DatabaseError as exc:
+            degraded = self._task_fence_latch_audit_degraded(
+                attempt_id=attempt_id
+            )
+            raise TaskFencePolicyUnavailable(
+                "audit_degraded" if degraded else "store_unavailable"
+            ) from None
 
     def accept_task_fence_ingress(
         self,
