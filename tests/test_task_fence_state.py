@@ -15,7 +15,6 @@ from hermes_state import (
 
 
 EXPECTED_TASK_FENCE_TABLES = {
-    "task_fence_acceptance_pending_inputs",
     "task_fence_acceptance_snapshots",
     "task_fence_attempt_transitions",
     "task_fence_attempts",
@@ -139,7 +138,7 @@ def _insert_task(
     )
 
 
-def test_fresh_store_initializes_exact_task_fence_v2_schema(tmp_path):
+def test_fresh_store_initializes_exact_current_task_fence_schema(tmp_path):
     path = tmp_path / "state.db"
     db = SessionDB(path)
     try:
@@ -226,7 +225,7 @@ def test_writable_open_migrates_store_without_task_fence_tables(tmp_path):
     } == EXPECTED_TASK_FENCE_TABLES
 
 
-def test_exact_pristine_v1_store_migrates_atomically_to_v2(tmp_path):
+def test_exact_pristine_v1_store_migrates_atomically_to_current(tmp_path):
     path = tmp_path / "state.db"
     db = SessionDB(path)
     db._conn.execute("CREATE TABLE unrelated_v1_guard (value TEXT)")
@@ -248,7 +247,10 @@ def test_exact_pristine_v1_store_migrates_atomically_to_v2(tmp_path):
         migrated.close()
 
     assert inspection.compatible is True
-    assert inspection.observed_store_schema_version == 2
+    assert (
+        inspection.observed_store_schema_version
+        == TASK_FENCE_STORE_SCHEMA_VERSION
+    )
     assert unrelated == "preserved"
     assert _task_fence_schema_objects(path) == (
         hermes_state._expected_task_fence_schema_objects()
@@ -440,10 +442,10 @@ def test_v1_migration_ddl_failure_rolls_back_to_exact_v1(
     objects_before = _task_fence_schema_objects(path)
     monkeypatch.setattr(
         hermes_state,
-        "TASK_FENCE_SCHEMA_V2_EXTENSION_SQL",
-        hermes_state.TASK_FENCE_SCHEMA_V2_EXTENSION_SQL
-        + "CREATE TABLE task_fence_v2_partial (value INTEGER);"
-        + "INVALID TASK FENCE V2;",
+        "TASK_FENCE_SCHEMA_POST_V1_SQL",
+        hermes_state.TASK_FENCE_SCHEMA_POST_V1_SQL
+        + "CREATE TABLE task_fence_v3_partial (value INTEGER);"
+        + "INVALID TASK FENCE V3;",
     )
 
     failed = SessionDB(path)

@@ -12,6 +12,7 @@ from task_fence import (
     TASK_FENCE_ACTIONS,
     CorrelationKind,
     ExecutionEffect,
+    IngressAcceptance,
     IngressClass,
     IngressEnvelope,
     InputEffect,
@@ -24,6 +25,11 @@ from task_fence import (
     TaskFenceProtocolRejected,
     TerminalReason,
     validate_action,
+)
+
+
+_TASK_FENCE_V2_DDL_SHA256 = (
+    "283bc43a083c97421e712fd29dfc802677558a35c75a890836831e1e3fdac847"
 )
 
 
@@ -67,6 +73,31 @@ def _connection(db: SessionDB) -> sqlite3.Connection:
     return conn
 
 
+def _task_fence_table_state(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[str, tuple[tuple, ...]], ...]:
+    table_names = tuple(
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM main.sqlite_master "
+            "WHERE type = 'table' AND name GLOB 'task_fence_*' "
+            "ORDER BY name"
+        )
+    )
+    return tuple(
+        (
+            table_name,
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    f'SELECT * FROM main."{table_name}" ORDER BY rowid'
+                )
+            ),
+        )
+        for table_name in table_names
+    )
+
+
 def _rewrite_append_only_row(
     db: SessionDB,
     *,
@@ -93,6 +124,123 @@ def _rewrite_append_only_row(
         conn.rollback()
         raise
     assert db.inspect_task_fence_store().compatible is True
+
+
+def _downgrade_current_store_to_exact_v2(
+    path,
+    acceptances: tuple[IngressAcceptance, ...],
+) -> None:
+    reference = sqlite3.connect(":memory:")
+    reference.executescript(hermes_state.TASK_FENCE_SCHEMA_V2_SQL)
+
+    def _reference_sql(name: str) -> str:
+        row = reference.execute(
+            "SELECT sql FROM main.sqlite_master WHERE name = ?",
+            (name,),
+        ).fetchone()
+        assert row is not None and isinstance(row[0], str)
+        return row[0]
+
+    pending_table_sql = _reference_sql(
+        "task_fence_acceptance_pending_inputs"
+    )
+    pending_trigger_sql = tuple(
+        _reference_sql(name)
+        for name in (
+            "task_fence_acceptance_pending_inputs_no_replace",
+            "task_fence_acceptance_pending_inputs_no_update",
+            "task_fence_acceptance_pending_inputs_no_delete",
+        )
+    )
+    snapshot_update_trigger_sql = _reference_sql(
+        "task_fence_acceptance_snapshots_no_update"
+    )
+    reference.close()
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "DROP INDEX main.idx_task_fence_ingress_task_run_order"
+        )
+        conn.execute(
+            "DROP INDEX main.idx_task_fence_ingress_task_input_history"
+        )
+        conn.execute(pending_table_sql)
+        conn.execute(
+            "DROP TRIGGER main.task_fence_acceptance_snapshots_no_update"
+        )
+        conn.execute(
+            "UPDATE main.task_fence_acceptance_snapshots "
+            "SET task_store_schema_version = 2 "
+            "WHERE task_store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE main.task_fence_tasks SET store_schema_version = 2 "
+            "WHERE store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE main.task_fence_control SET store_schema_version = 2 "
+            "WHERE singleton = 1 AND store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.executemany(
+            "INSERT INTO main.task_fence_acceptance_pending_inputs "
+            "(event_id, ordinal, input_event_id) VALUES (?, ?, ?)",
+            (
+                (acceptance.event_id, ordinal, input_event_id)
+                for acceptance in acceptances
+                for ordinal, input_event_id in enumerate(
+                    acceptance.pending_input_ids
+                )
+            ),
+        )
+        for trigger_sql in pending_trigger_sql:
+            conn.execute(trigger_sql)
+        conn.execute(snapshot_update_trigger_sql)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v2_schema_objects()
+    finally:
+        check.close()
+
+
+def _rewrite_exact_v2_row(
+    path,
+    *,
+    trigger_name: str,
+    statement: str,
+    params: tuple,
+) -> None:
+    conn = sqlite3.connect(path, isolation_level=None)
+    trigger = conn.execute(
+        "SELECT sql FROM main.sqlite_master "
+        "WHERE type = 'trigger' AND name = ?",
+        (trigger_name,),
+    ).fetchone()
+    assert trigger is not None and isinstance(trigger[0], str)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(f'DROP TRIGGER main."{trigger_name}"')
+        conn.execute(statement, params)
+        conn.execute(trigger[0])
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _seed_started_generation_and_permit(
@@ -189,6 +337,15 @@ def test_production_ingress_union_is_closed_and_envelopes_are_bounded() -> None:
     envelope = _envelope("initial_submit", "message-1")
     with pytest.raises(FrozenInstanceError):
         envelope.source_event_id = "changed"  # type: ignore[misc]
+
+
+def test_archived_v2_migration_source_is_frozen() -> None:
+    assert (
+        hashlib.sha256(
+            hermes_state.TASK_FENCE_SCHEMA_V2_SQL.encode("utf-8")
+        ).hexdigest()
+        == _TASK_FENCE_V2_DDL_SHA256
+    )
 
 
 def test_initial_submit_commits_task_input_and_run_before_return(tmp_path) -> None:
@@ -487,30 +644,11 @@ def test_replay_preserves_fifo_pending_projection_after_inputs_are_bound(
         _envelope("change_and_run", "message-run", task_id=initial.task_id)
     )
     conn = _connection(db)
-    for statement, params in (
-        (
-            "INSERT INTO main.task_fence_acceptance_pending_inputs "
-            "(event_id, ordinal, input_event_id) VALUES (?, 2, ?)",
-            (second_pending.event_id, initial.event_id),
-        ),
-        (
-            "UPDATE main.task_fence_acceptance_pending_inputs "
-            "SET input_event_id = ? WHERE event_id = ? AND ordinal = 0",
-            (initial.event_id, second_pending.event_id),
-        ),
-        (
-            "DELETE FROM main.task_fence_acceptance_pending_inputs "
-            "WHERE event_id = ? AND ordinal = 0",
-            (second_pending.event_id,),
-        ),
-        (
-            "INSERT OR REPLACE INTO main.task_fence_acceptance_pending_inputs "
-            "(event_id, ordinal, input_event_id) VALUES (?, 0, ?)",
-            (second_pending.event_id, initial.event_id),
-        ),
-    ):
-        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-            conn.execute(statement, params)
+    assert conn.execute(
+        "SELECT 1 FROM main.sqlite_master "
+        "WHERE type = 'table' "
+        "AND name = 'task_fence_acceptance_pending_inputs'"
+    ).fetchone() is None
     replay = db.accept_task_fence_ingress(second_envelope)
 
     assert replay == replace(second_pending, replayed=True)
@@ -519,6 +657,765 @@ def test_replay_preserves_fifo_pending_projection_after_inputs_are_bound(
         second_pending.event_id,
     )
     db.close()
+
+
+def test_pending_history_replay_is_exact_across_append_discard_bind_and_reopen(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    history: list[tuple[IngressEnvelope, object]] = []
+
+    initial_envelope = _envelope("initial_submit", "history-initial")
+    initial = db.accept_task_fence_ingress(initial_envelope)
+    assert initial.task_id is not None
+    history.append((initial_envelope, initial))
+
+    first_envelope = _envelope(
+        "comment_hold",
+        "history-a",
+        task_id=initial.task_id,
+    )
+    first = db.accept_task_fence_ingress(first_envelope)
+    history.append((first_envelope, first))
+
+    second_envelope = _envelope(
+        "comment_hold",
+        "history-b",
+        task_id=initial.task_id,
+    )
+    second = db.accept_task_fence_ingress(second_envelope)
+    history.append((second_envelope, second))
+
+    note_envelope = _envelope(
+        "explicit_note",
+        "history-note",
+        task_id=initial.task_id,
+    )
+    note = db.accept_task_fence_ingress(note_envelope)
+    history.append((note_envelope, note))
+
+    discard_envelope = _envelope(
+        "discard_pending",
+        "history-discard-a",
+        task_id=initial.task_id,
+        correlation_ids=(first.event_id,),
+    )
+    discarded = db.accept_task_fence_ingress(discard_envelope)
+    history.append((discard_envelope, discarded))
+
+    third_envelope = _envelope(
+        "comment_hold",
+        "history-c",
+        task_id=initial.task_id,
+    )
+    third = db.accept_task_fence_ingress(third_envelope)
+    history.append((third_envelope, third))
+
+    run_envelope = _envelope(
+        "change_and_run",
+        "history-run",
+        task_id=initial.task_id,
+    )
+    resumed = db.accept_task_fence_ingress(run_envelope)
+    history.append((run_envelope, resumed))
+
+    fourth_envelope = _envelope(
+        "comment_hold",
+        "history-d",
+        task_id=initial.task_id,
+    )
+    fourth = db.accept_task_fence_ingress(fourth_envelope)
+    history.append((fourth_envelope, fourth))
+
+    assert initial.pending_input_ids == ()
+    assert first.pending_input_ids == (first.event_id,)
+    assert second.pending_input_ids == (first.event_id, second.event_id)
+    assert note.pending_input_ids == (first.event_id, second.event_id)
+    assert discarded.pending_input_ids == (second.event_id,)
+    assert third.pending_input_ids == (second.event_id, third.event_id)
+    assert resumed.pending_input_ids == ()
+    assert fourth.pending_input_ids == (fourth.event_id,)
+    db.close()
+
+    reopened = SessionDB(path)
+    try:
+        for envelope, accepted in history:
+            assert reopened.accept_task_fence_ingress(envelope) == replace(
+                accepted,
+                replayed=True,
+            )
+    finally:
+        reopened.close()
+
+
+def test_pending_history_rows_grow_linearly(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "linear-initial")
+    )
+    assert initial.task_id is not None
+    latest = initial
+    event_count = 100
+    baseline_rows = sum(
+        len(rows) for _table_name, rows in _task_fence_table_state(_connection(db))
+    )
+    halfway_rows = 0
+    for index in range(event_count):
+        latest = db.accept_task_fence_ingress(
+            _envelope(
+                "comment_hold",
+                f"linear-{index:03d}",
+                task_id=initial.task_id,
+            )
+        )
+        if index + 1 == event_count // 2:
+            halfway_rows = sum(
+                len(rows)
+                for _table_name, rows in _task_fence_table_state(_connection(db))
+            )
+
+    conn = _connection(db)
+    final_rows = sum(
+        len(rows) for _table_name, rows in _task_fence_table_state(conn)
+    )
+    assert halfway_rows - baseline_rows == 3 * (event_count // 2)
+    assert final_rows - halfway_rows == 3 * (event_count // 2)
+    assert len(latest.pending_input_ids) == event_count
+    assert _scalar(conn, "SELECT COUNT(*) FROM task_fence_ingress") == (
+        event_count + 1
+    )
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM task_fence_acceptance_snapshots",
+    ) == (event_count + 1)
+    assert _scalar(conn, "SELECT COUNT(*) FROM task_fence_task_inputs") == (
+        event_count + 1
+    )
+    assert conn.execute(
+        "SELECT 1 FROM main.sqlite_master "
+        "WHERE type = 'table' "
+        "AND name = 'task_fence_acceptance_pending_inputs'"
+    ).fetchone() is None
+    db.close()
+
+
+def test_pending_history_reconstruction_is_bounded_before_collision(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "bounded-initial")
+    )
+    assert initial.task_id is not None
+    events = []
+    acceptances = []
+    for index in range(4):
+        envelope = _envelope(
+            "comment_hold",
+            f"bounded-{index}",
+            task_id=initial.task_id,
+        )
+        events.append(envelope)
+        acceptances.append(db.accept_task_fence_ingress(envelope))
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_PENDING_HISTORY_WORK",
+        3,
+    )
+    traced_statements: list[str] = []
+    _connection(db).set_trace_callback(traced_statements.append)
+    try:
+        assert db.accept_task_fence_ingress(events[2]) == replace(
+            acceptances[2],
+            replayed=True,
+        )
+        for envelope in (
+            events[3],
+            replace(events[3], payload_hash=_hash("changed")),
+        ):
+            with pytest.raises(
+                TaskFenceIngressUnavailable,
+                match="pending_history_limit_exceeded",
+            ):
+                db.accept_task_fence_ingress(envelope)
+    finally:
+        _connection(db).set_trace_callback(None)
+    history_queries = tuple(
+        " ".join(statement.split())
+        for statement in traced_statements
+        if "FROM main.task_fence_ingress" in statement
+        and "input_effect IN ('append', 'discard_selected')" in statement
+    )
+    assert history_queries
+    assert all("LIMIT 4" in statement for statement in history_queries)
+    assert _scalar(
+        _connection(db),
+        "SELECT COUNT(*) FROM task_fence_ingress_collisions",
+    ) == 0
+    db.close()
+
+
+@pytest.mark.parametrize("corruption", ("missing_pending", "stale_pending"))
+def test_run_rejects_mutable_pending_divergence_before_history_reset(
+    tmp_path,
+    corruption,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", f"{corruption}-initial")
+    )
+    assert initial.task_id is not None
+    conn = _connection(db)
+
+    if corruption == "missing_pending":
+        held = db.accept_task_fence_ingress(
+            _envelope(
+                "comment_hold",
+                "missing-pending-held",
+                task_id=initial.task_id,
+            )
+        )
+        conn.execute(
+            "UPDATE main.task_fence_task_inputs "
+            "SET state = 'bound' WHERE event_id = ?",
+            (held.event_id,),
+        )
+        next_envelope = _envelope(
+            "resume",
+            "missing-pending-resume",
+            task_id=initial.task_id,
+        )
+    else:
+        conn.execute(
+            "UPDATE main.task_fence_task_inputs "
+            "SET state = 'pending', bound_run_id = NULL WHERE event_id = ?",
+            (initial.event_id,),
+        )
+        next_envelope = _envelope(
+            "change_and_run",
+            "stale-pending-run",
+            task_id=initial.task_id,
+        )
+
+    task_before = db.inspect_task_fence_task(initial.task_id).task
+    ingress_count = _scalar(conn, "SELECT COUNT(*) FROM task_fence_ingress")
+    snapshot_count = _scalar(
+        conn,
+        "SELECT COUNT(*) FROM task_fence_acceptance_snapshots",
+    )
+    run_count = _scalar(conn, "SELECT COUNT(*) FROM task_fence_execution_runs")
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="incompatible_acceptance_projection",
+    ):
+        db.accept_task_fence_ingress(next_envelope)
+
+    assert db.inspect_task_fence_task(initial.task_id).task == task_before
+    assert _scalar(conn, "SELECT COUNT(*) FROM task_fence_ingress") == ingress_count
+    assert _scalar(
+        conn,
+        "SELECT COUNT(*) FROM task_fence_acceptance_snapshots",
+    ) == snapshot_count
+    assert _scalar(conn, "SELECT COUNT(*) FROM task_fence_execution_runs") == run_count
+    db.close()
+
+
+def test_post_mutation_pending_failure_rolls_back_exact_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "rollback-initial")
+    )
+    assert initial.task_id is not None
+    db.accept_task_fence_ingress(
+        _envelope(
+            "comment_hold",
+            "rollback-held",
+            task_id=initial.task_id,
+        )
+    )
+    conn = _connection(db)
+    state_before = _task_fence_table_state(conn)
+    original = SessionDB._task_fence_current_pending_input_ids_unlocked
+    call_count = 0
+
+    def fail_post_mutation(connection, *, task_id):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            return hermes_state._TaskFenceIngressFailure(
+                "injected_post_mutation_failure",
+                unavailable=True,
+            )
+        return original(connection, task_id=task_id)
+
+    monkeypatch.setattr(
+        SessionDB,
+        "_task_fence_current_pending_input_ids_unlocked",
+        staticmethod(fail_post_mutation),
+    )
+    with pytest.raises(
+        TaskFenceIngressUnavailable,
+        match="acceptance_database_error",
+    ):
+        db.accept_task_fence_ingress(
+            _envelope(
+                "change_and_run",
+                "rollback-change-and-run",
+                task_id=initial.task_id,
+            )
+        )
+
+    assert call_count == 2
+    assert _task_fence_table_state(conn) == state_before
+    db.close()
+
+
+def test_populated_v2_migrates_with_byte_equivalent_historical_replay(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    history: list[tuple[IngressEnvelope, IngressAcceptance]] = []
+
+    initial_envelope = _envelope("initial_submit", "v2-initial")
+    initial = db.accept_task_fence_ingress(initial_envelope)
+    assert initial.task_id is not None
+    history.append((initial_envelope, initial))
+
+    first_envelope = _envelope(
+        "comment_hold",
+        "v2-a",
+        task_id=initial.task_id,
+    )
+    first = db.accept_task_fence_ingress(first_envelope)
+    history.append((first_envelope, first))
+
+    second_envelope = _envelope(
+        "comment_hold",
+        "v2-b",
+        task_id=initial.task_id,
+    )
+    second = db.accept_task_fence_ingress(second_envelope)
+    history.append((second_envelope, second))
+
+    discard_envelope = _envelope(
+        "discard_pending",
+        "v2-discard-a",
+        task_id=initial.task_id,
+        correlation_ids=(first.event_id,),
+    )
+    discarded = db.accept_task_fence_ingress(discard_envelope)
+    history.append((discard_envelope, discarded))
+
+    run_envelope = _envelope(
+        "change_and_run",
+        "v2-run",
+        task_id=initial.task_id,
+    )
+    resumed = db.accept_task_fence_ingress(run_envelope)
+    history.append((run_envelope, resumed))
+    db.close()
+
+    _downgrade_current_store_to_exact_v2(
+        path,
+        tuple(acceptance for _envelope_value, acceptance in history),
+    )
+    migrated = SessionDB(path)
+    try:
+        inspection = migrated.inspect_task_fence_store()
+        assert inspection.compatible is True
+        assert (
+            inspection.observed_store_schema_version
+            == TASK_FENCE_STORE_SCHEMA_VERSION
+        )
+        assert hermes_state._read_task_fence_schema_objects(
+            _connection(migrated)
+        ) == hermes_state._expected_task_fence_schema_objects()
+        assert _connection(migrated).execute(
+            "SELECT 1 FROM main.sqlite_master "
+            "WHERE name = 'task_fence_acceptance_pending_inputs'"
+        ).fetchone() is None
+
+        for envelope, acceptance in history:
+            historical_projection = acceptance.task_projection
+            if historical_projection is not None:
+                historical_projection = replace(
+                    historical_projection,
+                    store_schema_version=2,
+                )
+            expected = replace(
+                acceptance,
+                task_projection=historical_projection,
+                replayed=True,
+            )
+            assert migrated.accept_task_fence_ingress(envelope) == expected
+
+        before = migrated.inspect_task_fence_task(initial.task_id).task
+        assert before is not None
+        with pytest.raises(
+            TaskFenceIngressRejected,
+            match="source_event_id_collision",
+        ):
+            migrated.accept_task_fence_ingress(
+                replace(initial_envelope, payload_hash=_hash("changed"))
+            )
+        after = migrated.inspect_task_fence_task(initial.task_id).task
+        assert after == before
+        assert _scalar(
+            _connection(migrated),
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions",
+        ) == 1
+    finally:
+        migrated.close()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("reduction", "task_version", "control_version"),
+)
+def test_populated_v2_migration_fault_rolls_back_exact_state(
+    tmp_path,
+    monkeypatch,
+    failure_stage: str,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "fault-v2-initial")
+    )
+    assert initial.task_id is not None
+    held = db.accept_task_fence_ingress(
+        _envelope(
+            "comment_hold",
+            "fault-v2-held",
+            task_id=initial.task_id,
+        )
+    )
+    db.close()
+    _downgrade_current_store_to_exact_v2(path, (initial, held))
+    objects_before = hermes_state._expected_task_fence_v2_schema_objects()
+    state_connection = sqlite3.connect(path)
+    try:
+        state_before = _task_fence_table_state(state_connection)
+    finally:
+        state_connection.close()
+
+    if failure_stage == "reduction":
+        monkeypatch.setattr(
+            hermes_state,
+            "TASK_FENCE_SCHEMA_V3_REDUCTION_SQL",
+            hermes_state.TASK_FENCE_SCHEMA_V3_REDUCTION_SQL
+            + "INVALID TASK FENCE V3 REDUCTION;",
+        )
+        failed = SessionDB(path)
+        try:
+            assert failed._task_fence_schema_init_failed is True
+        finally:
+            failed.close()
+    else:
+        target = {
+            "task_version": "task_fence_tasks",
+            "control_version": "task_fence_control",
+        }[failure_stage]
+        probe = SessionDB.__new__(SessionDB)
+        probe._conn = sqlite3.connect(path, isolation_level=None)
+        probe._conn.row_factory = sqlite3.Row
+        probe._conn.execute("PRAGMA foreign_keys=ON")
+        probe._task_fence_schema_init_failed = False
+        probe._conn.execute(
+            "CREATE TEMP TRIGGER fail_task_fence_v2_migration "
+            f"BEFORE UPDATE ON main.{target} BEGIN "
+            "SELECT RAISE(ABORT, 'injected v2 migration failure'); END"
+        )
+        try:
+            probe._init_task_fence_schema()
+            assert probe._task_fence_schema_init_failed is True
+        finally:
+            probe._conn.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == objects_before
+        assert _scalar(
+            check,
+            "SELECT store_schema_version FROM task_fence_control",
+        ) == 2
+        assert check.execute(
+            "SELECT DISTINCT store_schema_version FROM task_fence_tasks"
+        ).fetchall() == [(2,)]
+        assert _scalar(
+            check,
+            "SELECT COUNT(*) FROM task_fence_acceptance_pending_inputs",
+        ) == 1
+        assert _task_fence_table_state(check) == state_before
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        check.close()
+
+
+def test_inconsistent_populated_v2_is_left_exactly_untouched(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "invalid-v2-initial")
+    )
+    assert initial.task_id is not None
+    first = db.accept_task_fence_ingress(
+        _envelope("comment_hold", "invalid-v2-a", task_id=initial.task_id)
+    )
+    second = db.accept_task_fence_ingress(
+        _envelope("comment_hold", "invalid-v2-b", task_id=initial.task_id)
+    )
+    db.close()
+    _downgrade_current_store_to_exact_v2(path, (initial, first, second))
+    _rewrite_exact_v2_row(
+        path,
+        trigger_name="task_fence_acceptance_pending_inputs_no_delete",
+        statement=(
+            "DELETE FROM main.task_fence_acceptance_pending_inputs "
+            "WHERE event_id = ? AND ordinal = 0"
+        ),
+        params=(second.event_id,),
+    )
+    objects_before = hermes_state._expected_task_fence_v2_schema_objects()
+
+    rejected = SessionDB(path)
+    try:
+        inspection = rejected.inspect_task_fence_store()
+        assert inspection.compatible is False
+        assert inspection.reason == "unsupported_store_schema"
+    finally:
+        rejected.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == objects_before
+        assert _scalar(
+            check,
+            "SELECT store_schema_version FROM task_fence_control",
+        ) == 2
+        assert _scalar(
+            check,
+            "SELECT COUNT(*) FROM task_fence_acceptance_pending_inputs",
+        ) == 2
+    finally:
+        check.close()
+
+
+def test_semantically_stale_populated_v2_is_left_exactly_untouched(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "stale-v2-initial")
+    )
+    assert initial.task_id is not None
+    held = db.accept_task_fence_ingress(
+        _envelope("comment_hold", "stale-v2-held", task_id=initial.task_id)
+    )
+    latest = db.accept_task_fence_ingress(
+        _envelope("change_and_run", "stale-v2-run", task_id=initial.task_id)
+    )
+    assert held.task_projection is not None
+    db.close()
+    _downgrade_current_store_to_exact_v2(path, (initial, held, latest))
+
+    stale_task = replace(held.task_projection, store_schema_version=2)
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE main.task_fence_tasks SET conversation_id = ?, "
+            "cohort_key = ?, store_schema_version = ?, "
+            "control_protocol_version = ?, intent_epoch = ?, "
+            "control_revision = ?, status = ?, active_authority_event_id = ?, "
+            "active_execution_run_id = ?, current_generation_id = ?, "
+            "current_runtime_epoch = ?, last_accepted_order = ?, "
+            "last_transition_event_id = ?, created_at = ?, updated_at = ? "
+            "WHERE task_id = ?",
+            (
+                stale_task.conversation_id,
+                stale_task.cohort_key,
+                stale_task.store_schema_version,
+                stale_task.control_protocol_version,
+                stale_task.intent_epoch,
+                stale_task.control_revision,
+                stale_task.status,
+                stale_task.active_authority_event_id,
+                stale_task.active_execution_run_id,
+                stale_task.current_generation_id,
+                stale_task.current_runtime_epoch,
+                stale_task.last_accepted_order,
+                stale_task.last_transition_event_id,
+                stale_task.created_at,
+                stale_task.updated_at,
+                stale_task.task_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE main.task_fence_task_inputs "
+            "SET state = 'pending', bound_run_id = NULL WHERE event_id = ?",
+            (held.event_id,),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    state_before = _task_fence_table_state(conn)
+    conn.close()
+
+    rejected = SessionDB(path)
+    try:
+        inspection = rejected.inspect_task_fence_store()
+        assert inspection.compatible is False
+        assert inspection.reason == "unsupported_store_schema"
+    finally:
+        rejected.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v2_schema_objects()
+        assert _task_fence_table_state(check) == state_before
+    finally:
+        check.close()
+
+
+def test_oversized_v2_migration_is_bounded_and_untouched(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "oversized-v2-initial")
+    )
+    assert initial.task_id is not None
+    held = db.accept_task_fence_ingress(
+        _envelope(
+            "comment_hold",
+            "oversized-v2-held",
+            task_id=initial.task_id,
+        )
+    )
+    db.close()
+    _downgrade_current_store_to_exact_v2(path, (initial, held))
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES",
+        1,
+    )
+
+    rejected = SessionDB(path)
+    try:
+        assert rejected.inspect_task_fence_store().compatible is False
+    finally:
+        rejected.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v2_schema_objects()
+        assert _scalar(
+            check,
+            "SELECT store_schema_version FROM task_fence_control",
+        ) == 2
+    finally:
+        check.close()
+
+
+def test_concurrent_populated_v2_migrators_publish_only_complete_v3(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial_envelope = _envelope("initial_submit", "race-v2-initial")
+    initial = db.accept_task_fence_ingress(initial_envelope)
+    assert initial.task_id is not None
+    held_envelope = _envelope(
+        "comment_hold",
+        "race-v2-held",
+        task_id=initial.task_id,
+    )
+    held = db.accept_task_fence_ingress(held_envelope)
+    db.close()
+    _downgrade_current_store_to_exact_v2(path, (initial, held))
+
+    expected_v2 = hermes_state._expected_task_fence_v2_schema_objects()
+    expected_v3 = hermes_state._expected_task_fence_schema_objects()
+    original_read = hermes_state._read_task_fence_schema_objects
+    barrier = threading.Barrier(2)
+    first_reads: set[int] = set()
+    reads_lock = threading.Lock()
+
+    def synchronized_read(conn):
+        observed = original_read(conn)
+        connection_id = id(conn)
+        should_wait = False
+        with reads_lock:
+            if (
+                observed == expected_v2
+                and not conn.in_transaction
+                and connection_id not in first_reads
+            ):
+                first_reads.add(connection_id)
+                should_wait = True
+        if should_wait:
+            barrier.wait(timeout=5)
+        return observed
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_read_task_fence_schema_objects",
+        synchronized_read,
+    )
+
+    def migrate() -> bool:
+        candidate = SessionDB(path)
+        try:
+            return candidate.inspect_task_fence_store().compatible
+        finally:
+            candidate.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(lambda _index: migrate(), range(2)))
+
+    assert results == (True, True)
+    assert len(first_reads) == 2
+    check = sqlite3.connect(path)
+    try:
+        assert original_read(check) == expected_v3
+    finally:
+        check.close()
+    verify = SessionDB(path)
+    try:
+        historical_projection = held.task_projection
+        assert historical_projection is not None
+        assert verify.accept_task_fence_ingress(held_envelope) == replace(
+            held,
+            task_projection=replace(
+                historical_projection,
+                store_schema_version=2,
+            ),
+            replayed=True,
+        )
+    finally:
+        verify.close()
 
 
 def test_task_bound_and_taskless_advisory_snapshots_are_historical(
@@ -850,7 +1747,7 @@ def test_historical_acceptance_rejects_blob_timestamp(tmp_path) -> None:
     db.close()
 
 
-def test_historical_pending_projection_rejects_cross_task_input(tmp_path) -> None:
+def test_historical_pending_projection_rejects_cross_task_discard(tmp_path) -> None:
     db = SessionDB(tmp_path / "state.db")
     task_a_initial_envelope = replace(
         _envelope("initial_submit", "a-initial"),
@@ -879,21 +1776,32 @@ def test_historical_pending_projection_rejects_cross_task_input(tmp_path) -> Non
         conversation_id="conversation-b",
     )
     task_b_pending = db.accept_task_fence_ingress(task_b_pending_envelope)
+    task_b_discard_envelope = replace(
+        _envelope(
+            "discard_pending",
+            "b-discard",
+            task_id=task_b.task_id,
+            correlation_ids=(task_b_pending.event_id,),
+        ),
+        source="gateway:test:conversation-b",
+        conversation_id="conversation-b",
+    )
+    task_b_discard = db.accept_task_fence_ingress(task_b_discard_envelope)
     _rewrite_append_only_row(
         db,
-        trigger_name="task_fence_acceptance_pending_inputs_no_update",
+        trigger_name="task_fence_ingress_correlations_no_update",
         statement=(
-            "UPDATE main.task_fence_acceptance_pending_inputs "
-            "SET input_event_id = ? WHERE event_id = ? AND ordinal = 0"
+            "UPDATE main.task_fence_ingress_correlations "
+            "SET correlation_id = ? WHERE event_id = ?"
         ),
-        params=(task_a_pending.event_id, task_b_pending.event_id),
+        params=(task_a_pending.event_id, task_b_discard.event_id),
     )
 
     with pytest.raises(
         TaskFenceIngressUnavailable,
         match="incompatible_acceptance_projection",
     ):
-        db.accept_task_fence_ingress(task_b_pending_envelope)
+        db.accept_task_fence_ingress(task_b_discard_envelope)
     db.close()
 
 
@@ -1120,6 +2028,57 @@ def test_duplicate_acceptance_serializes_across_two_connections(tmp_path) -> Non
         verify.close()
 
 
+def test_pending_history_serializes_across_two_connections(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    initial_db = SessionDB(path)
+    initial = initial_db.accept_task_fence_ingress(
+        _envelope("initial_submit", "pending-race-initial")
+    )
+    assert initial.task_id is not None
+    initial_db.close()
+    first = SessionDB(path)
+    second = SessionDB(path)
+    barrier = threading.Barrier(2)
+    envelopes = (
+        _envelope("comment_hold", "pending-race-a", task_id=initial.task_id),
+        _envelope("comment_hold", "pending-race-b", task_id=initial.task_id),
+    )
+
+    def accept(pair):
+        candidate, envelope = pair
+        barrier.wait(timeout=5)
+        return candidate.accept_task_fence_ingress(envelope)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(accept, zip((first, second), envelopes)))
+    finally:
+        first.close()
+        second.close()
+
+    earlier, later = sorted(results, key=lambda item: item.accepted_order)
+    assert earlier.pending_input_ids == (earlier.event_id,)
+    assert later.pending_input_ids == (earlier.event_id, later.event_id)
+    envelope_by_source = {item.source_event_id: item for item in envelopes}
+    reopened = SessionDB(path)
+    try:
+        for accepted in (earlier, later):
+            envelope = envelope_by_source[
+                _scalar(
+                    _connection(reopened),
+                    "SELECT source_event_id FROM task_fence_ingress "
+                    "WHERE event_id = ?",
+                    (accepted.event_id,),
+                )
+            ]
+            assert reopened.accept_task_fence_ingress(envelope) == replace(
+                accepted,
+                replayed=True,
+            )
+    finally:
+        reopened.close()
+
+
 def test_distinct_replace_run_acceptances_have_one_serial_order(tmp_path) -> None:
     path = tmp_path / "state.db"
     SessionDB(path).close()
@@ -1210,7 +2169,6 @@ def test_mid_transaction_sqlite_abort_rolls_back_every_authority_write(
         "task_fence_ingress",
         "task_fence_task_inputs",
         "task_fence_execution_runs",
-        "task_fence_acceptance_pending_inputs",
         "task_fence_acceptance_snapshots",
     ):
         assert _scalar(
@@ -1284,8 +2242,9 @@ def test_existing_authority_rolls_back_on_late_projection_failure(tmp_path) -> N
     db.close()
 
 
-def test_pending_snapshot_child_failure_rolls_back_existing_authority(
+def test_pre_mutation_pending_failure_preserves_existing_authority(
     tmp_path,
+    monkeypatch,
 ) -> None:
     db = SessionDB(tmp_path / "state.db")
     initial = db.accept_task_fence_ingress(
@@ -1294,15 +2253,20 @@ def test_pending_snapshot_child_failure_rolls_back_existing_authority(
     assert initial.task_id is not None
     assert initial.opened_run_id is not None
     conn = _connection(db)
-    conn.execute(
-        "CREATE TEMP TRIGGER fail_task_fence_pending_snapshot "
-        "BEFORE INSERT ON main.task_fence_acceptance_pending_inputs BEGIN "
-        "SELECT RAISE(ABORT, 'injected pending snapshot failure'); END"
+    monkeypatch.setattr(
+        SessionDB,
+        "_task_fence_pending_input_ids_at_unlocked",
+        staticmethod(
+            lambda *_args, **_kwargs: hermes_state._TaskFenceIngressFailure(
+                "pending_history_unavailable",
+                unavailable=True,
+            )
+        ),
     )
 
     with pytest.raises(
         TaskFenceIngressUnavailable,
-        match="acceptance_database_error",
+        match="pending_history_unavailable",
     ):
         db.accept_task_fence_ingress(
             _envelope("comment_hold", "message-2", task_id=initial.task_id)
@@ -1321,10 +2285,6 @@ def test_pending_snapshot_child_failure_rolls_back_existing_authority(
         conn,
         "SELECT COUNT(*) FROM main.task_fence_acceptance_snapshots",
     ) == 1
-    assert _scalar(
-        conn,
-        "SELECT COUNT(*) FROM main.task_fence_acceptance_pending_inputs",
-    ) == 0
     assert _scalar(
         conn,
         "SELECT COUNT(*) FROM main.task_fence_execution_runs "

@@ -309,10 +309,16 @@ SCHEMA_VERSION = 23
 # Task Fence is independently versioned from the general session schema.  The
 # control protocol must be able to reject an unknown control-store layout
 # without conflating it with unrelated session/FTS migrations.
-TASK_FENCE_STORE_SCHEMA_VERSION = 2
+TASK_FENCE_STORE_SCHEMA_VERSION = 3
 TASK_FENCE_CONTROL_PROTOCOL_VERSION = CONTROL_PROTOCOL_VERSION
 TASK_FENCE_TABLE_PREFIX = "task_fence_"
 _TASK_FENCE_V2_IDENTIFIER_MAX_BYTES = 512
+_TASK_FENCE_MAX_PENDING_HISTORY_WORK = 8_192
+_TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES = 10_000
+_TASK_FENCE_MAX_V2_MIGRATION_PENDING_ROWS = 1_000_000
+_TASK_FENCE_MAX_V2_MIGRATION_ROWS = 1_000_000
+_TASK_FENCE_MAX_V2_MIGRATION_HISTORY_WORK = 1_000_000
+_TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset({2, 3})
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
 _TASK_FENCE_TASK_SELECT_COLUMNS = (
     "task_id, conversation_id, cohort_key, store_schema_version, "
@@ -387,6 +393,12 @@ class _TaskFenceIngressFailure:
     reason: str
     unavailable: bool = False
     incident_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _TaskFencePendingHistory:
+    input_ids: Tuple[str, ...]
+    work_units: int
 
 
 def _task_fence_inspection_failure_reason(exc: Exception) -> str:
@@ -2265,14 +2277,34 @@ BEGIN
 END;
 """
 
-TASK_FENCE_SCHEMA_SQL = (
+TASK_FENCE_SCHEMA_V2_SQL = (
     TASK_FENCE_SCHEMA_V1_SQL + TASK_FENCE_SCHEMA_V2_EXTENSION_SQL
 )
+
+# Schema v3 reconstructs historical pending membership from the immutable
+# ingress/correlation log. The v2 child table copied the whole pending list at
+# every acceptance and therefore grew quadratically for a long paused task.
+TASK_FENCE_SCHEMA_V3_REDUCTION_SQL = """
+CREATE INDEX IF NOT EXISTS main.idx_task_fence_ingress_task_run_order
+    ON task_fence_ingress(task_id, accepted_order)
+    WHERE execution = 'run';
+CREATE INDEX IF NOT EXISTS main.idx_task_fence_ingress_task_input_history
+    ON task_fence_ingress(task_id, accepted_order)
+    WHERE input_effect IN ('append', 'discard_selected');
+DROP TABLE IF EXISTS main.task_fence_acceptance_pending_inputs;
+"""
+TASK_FENCE_SCHEMA_POST_V1_SQL = (
+    TASK_FENCE_SCHEMA_V2_EXTENSION_SQL + TASK_FENCE_SCHEMA_V3_REDUCTION_SQL
+)
+TASK_FENCE_SCHEMA_SQL = TASK_FENCE_SCHEMA_V1_SQL + TASK_FENCE_SCHEMA_POST_V1_SQL
 
 _task_fence_expected_schema_objects: Optional[Tuple[Tuple[str, str, str, str], ...]] = (
     None
 )
 _task_fence_expected_v1_schema_objects: Optional[
+    Tuple[Tuple[str, str, str, str], ...]
+] = None
+_task_fence_expected_v2_schema_objects: Optional[
     Tuple[Tuple[str, str, str, str], ...]
 ] = None
 _task_fence_expected_schema_objects_lock = threading.Lock()
@@ -2336,6 +2368,19 @@ def _expected_task_fence_v1_schema_objects() -> Tuple[
                 _task_fence_schema_objects_for_sql(TASK_FENCE_SCHEMA_V1_SQL)
             )
         return _task_fence_expected_v1_schema_objects
+
+
+def _expected_task_fence_v2_schema_objects() -> Tuple[
+    Tuple[str, str, str, str], ...
+]:
+    """Lazily build the exact populated-shadow migration source signature."""
+    global _task_fence_expected_v2_schema_objects
+    with _task_fence_expected_schema_objects_lock:
+        if _task_fence_expected_v2_schema_objects is None:
+            _task_fence_expected_v2_schema_objects = (
+                _task_fence_schema_objects_for_sql(TASK_FENCE_SCHEMA_V2_SQL)
+            )
+        return _task_fence_expected_v2_schema_objects
 
 
 def _expected_task_fence_schema_objects() -> Tuple[Tuple[str, str, str, str], ...]:
@@ -4365,7 +4410,125 @@ class SessionDB:
                 return False
         return True
 
-    def _migrate_task_fence_v1_to_v2_unlocked(
+    @staticmethod
+    def _task_fence_foreign_keys_clean_unlocked(
+        conn: sqlite3.Connection,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        table_names = tuple(
+            name
+            for object_type, name, _table, _sql in schema_objects
+            if object_type == "table"
+        )
+        for table_name in table_names:
+            if _TASK_FENCE_TABLE_NAME_RE.fullmatch(table_name) is None:
+                raise sqlite3.DatabaseError(
+                    "invalid trusted Task Fence table name"
+                )
+            if conn.execute(
+                f"PRAGMA main.foreign_key_check('{table_name}')"
+            ).fetchone() is not None:
+                return False
+        return True
+
+    def _task_fence_v2_is_migratable_unlocked(
+        self,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        metadata = self._conn.execute(
+            "SELECT singleton, store_schema_version, control_protocol_version, "
+            "runtime_epoch, mode_generation, ever_enforced, "
+            "tested_artifact_commit, tested_artifact_checksum, "
+            "dependency_lock_fingerprint "
+            "FROM main.task_fence_control ORDER BY singleton LIMIT 2"
+        ).fetchall()
+        if len(metadata) != 1 or tuple(metadata[0]) != (
+            1,
+            2,
+            TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+        ):
+            return False
+        remaining_rows = _TASK_FENCE_MAX_V2_MIGRATION_ROWS
+        row_counts: Dict[str, int] = {}
+        table_names = tuple(
+            name
+            for object_type, name, _table, _sql in schema_objects
+            if object_type == "table"
+        )
+        for table_name in table_names:
+            if _TASK_FENCE_TABLE_NAME_RE.fullmatch(table_name) is None:
+                raise sqlite3.DatabaseError(
+                    "invalid trusted Task Fence table name"
+                )
+            safe_table = table_name.replace('"', '""')
+            count = self._conn.execute(
+                f'SELECT COUNT(*) FROM ('
+                f'SELECT 1 FROM main."{safe_table}" LIMIT ?)',
+                (remaining_rows + 1,),
+            ).fetchone()[0]
+            if type(count) is not int or count > remaining_rows:
+                return False
+            row_counts[table_name] = count
+            remaining_rows -= count
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_cohorts "
+            "WHERE mode != 'audit' OR activation_state != 'inactive' "
+            "OR audit_degraded != 0 LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_tasks "
+            "WHERE store_schema_version != 2 LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        snapshot_count = row_counts["task_fence_acceptance_snapshots"]
+        pending_row_count = row_counts[
+            "task_fence_acceptance_pending_inputs"
+        ]
+        if (
+            snapshot_count > _TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES
+            or pending_row_count > _TASK_FENCE_MAX_V2_MIGRATION_PENDING_ROWS
+            or row_counts["task_fence_ingress"] != snapshot_count
+        ):
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_ingress AS i "
+            "LEFT JOIN main.task_fence_acceptance_snapshots AS s "
+            "ON s.event_id = i.event_id WHERE s.event_id IS NULL LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_tasks AS t "
+            "LEFT JOIN main.task_fence_ingress AS i ON i.task_id = t.task_id "
+            "WHERE i.event_id IS NULL LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_ingress AS i "
+            "LEFT JOIN main.task_fence_task_inputs AS ti "
+            "ON ti.event_id = i.event_id AND ti.task_id = i.task_id "
+            "WHERE i.input_effect = 'append' AND ti.event_id IS NULL LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_task_inputs AS ti "
+            "LEFT JOIN main.task_fence_ingress AS i "
+            "ON i.event_id = ti.event_id AND i.task_id = ti.task_id "
+            "WHERE i.event_id IS NULL OR i.input_effect != 'append' LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        return self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            schema_objects,
+        )
+
+    def _migrate_task_fence_v1_to_current_unlocked(
         self,
         cursor: sqlite3.Cursor,
         schema_objects: Tuple[Tuple[str, str, str, str], ...],
@@ -4378,7 +4541,7 @@ class SessionDB:
 
         self._execute_task_fence_schema_sql(
             cursor,
-            TASK_FENCE_SCHEMA_V2_EXTENSION_SQL,
+            TASK_FENCE_SCHEMA_POST_V1_SQL,
         )
         updated = cursor.execute(
             "UPDATE main.task_fence_control "
@@ -4412,13 +4575,173 @@ class SessionDB:
             raise sqlite3.DatabaseError("Task Fence v1 migration metadata mismatch")
         return True
 
+    def _migrate_task_fence_v2_to_v3_unlocked(
+        self,
+        cursor: sqlite3.Cursor,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        if not self._task_fence_v2_is_migratable_unlocked(schema_objects):
+            return False
+
+        snapshots = self._conn.execute(
+            "SELECT i.event_id, i.accepted_order, i.task_id "
+            "FROM main.task_fence_ingress AS i "
+            "JOIN main.task_fence_acceptance_snapshots AS s "
+            "ON s.event_id = i.event_id "
+            "ORDER BY i.accepted_order LIMIT ?",
+            (_TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES + 1,),
+        ).fetchall()
+        if len(snapshots) > _TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES:
+            return False
+        historical_by_order: Dict[int, IngressAcceptance] = {}
+        latest_order_by_task: Dict[str, int] = {}
+        remaining_history_work = _TASK_FENCE_MAX_V2_MIGRATION_HISTORY_WORK
+        for snapshot in snapshots:
+            historical = self._task_fence_acceptance_unlocked(
+                self._conn,
+                snapshot["event_id"],
+                replayed=True,
+                use_v2_pending_rows=True,
+            )
+            if isinstance(historical, _TaskFenceIngressFailure):
+                return False
+            reconstructed = self._task_fence_pending_history_at_unlocked(
+                self._conn,
+                task_id=snapshot["task_id"],
+                accepted_order=snapshot["accepted_order"],
+                max_work=min(
+                    _TASK_FENCE_MAX_PENDING_HISTORY_WORK,
+                    remaining_history_work,
+                ),
+            )
+            if (
+                isinstance(reconstructed, _TaskFenceIngressFailure)
+                or reconstructed.input_ids != historical.pending_input_ids
+            ):
+                return False
+            remaining_history_work -= reconstructed.work_units
+            historical_by_order[historical.accepted_order] = historical
+            if historical.task_id is not None:
+                latest_order_by_task[historical.task_id] = (
+                    historical.accepted_order
+                )
+
+        task_rows = self._conn.execute(
+            f"SELECT {_TASK_FENCE_TASK_SELECT_COLUMNS}, created_at, updated_at "
+            "FROM main.task_fence_tasks LIMIT ?",
+            (_TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES + 1,),
+        ).fetchall()
+        if len(task_rows) > _TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES:
+            return False
+        for task in task_rows:
+            if not self._task_fence_task_projection_compatible(
+                task,
+                store_schema_versions=frozenset({2}),
+            ):
+                return False
+            historical = historical_by_order.get(task["last_accepted_order"])
+            if (
+                historical is None
+                or historical.task_id != task["task_id"]
+                or latest_order_by_task.get(task["task_id"])
+                != task["last_accepted_order"]
+            ):
+                return False
+            try:
+                current_projection = TaskFenceTaskControl(
+                    task_id=task["task_id"],
+                    conversation_id=task["conversation_id"],
+                    cohort_key=task["cohort_key"],
+                    store_schema_version=task["store_schema_version"],
+                    control_protocol_version=task[
+                        "control_protocol_version"
+                    ],
+                    intent_epoch=task["intent_epoch"],
+                    control_revision=task["control_revision"],
+                    status=task["status"],
+                    active_authority_event_id=task[
+                        "active_authority_event_id"
+                    ],
+                    active_execution_run_id=task[
+                        "active_execution_run_id"
+                    ],
+                    current_generation_id=task["current_generation_id"],
+                    current_runtime_epoch=task["current_runtime_epoch"],
+                    last_accepted_order=task["last_accepted_order"],
+                    last_transition_event_id=task[
+                        "last_transition_event_id"
+                    ],
+                    created_at=float(task["created_at"]),
+                    updated_at=float(task["updated_at"]),
+                )
+            except (TypeError, ValueError):
+                return False
+            current_pending = (
+                self._task_fence_current_pending_input_ids_unlocked(
+                    self._conn,
+                    task_id=task["task_id"],
+                )
+            )
+            if (
+                historical.task_projection != current_projection
+                or isinstance(current_pending, _TaskFenceIngressFailure)
+                or current_pending != historical.pending_input_ids
+            ):
+                return False
+
+        self._execute_task_fence_schema_sql(
+            cursor,
+            TASK_FENCE_SCHEMA_V3_REDUCTION_SQL,
+        )
+        task_count = len(task_rows)
+        updated_tasks = cursor.execute(
+            "UPDATE main.task_fence_tasks SET store_schema_version = ? "
+            "WHERE store_schema_version = 2",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        if updated_tasks.rowcount != task_count:
+            raise sqlite3.DatabaseError(
+                "Task Fence v2 migration task metadata changed"
+            )
+        updated_control = cursor.execute(
+            "UPDATE main.task_fence_control "
+            "SET store_schema_version = ?, "
+            "updated_at = CAST(strftime('%s', 'now') AS REAL) "
+            "WHERE singleton = 1 AND store_schema_version = 2 "
+            "AND control_protocol_version = ? AND runtime_epoch = 0 "
+            "AND mode_generation = 0 AND ever_enforced = 0 "
+            "AND tested_artifact_commit IS NULL "
+            "AND tested_artifact_checksum IS NULL "
+            "AND dependency_lock_fingerprint IS NULL",
+            (
+                TASK_FENCE_STORE_SCHEMA_VERSION,
+                TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+            ),
+        )
+        if updated_control.rowcount != 1:
+            raise sqlite3.DatabaseError(
+                "Task Fence v2 migration control metadata changed"
+            )
+        if _read_task_fence_schema_objects(
+            self._conn
+        ) != _expected_task_fence_schema_objects():
+            raise sqlite3.DatabaseError("Task Fence v2 migration schema mismatch")
+        if not self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            _expected_task_fence_schema_objects(),
+        ):
+            raise sqlite3.DatabaseError(
+                "Task Fence v2 migration foreign key mismatch"
+            )
+        return True
+
     def _init_task_fence_schema(self) -> None:
-        """Create current Task Fence schema or migrate one pristine exact v1.
+        """Create current Task Fence schema or migrate an exact older shadow.
 
         This runs only after the legacy schema initializer has returned. It
         refuses to start while another transaction is active, so its explicit
         transaction can never commit unrelated work. Partial, foreign, future,
-        and non-pristine v1 namespaces are left byte-for-byte untouched.
+        and unsafe older namespaces are left untouched.
         """
         if self._conn.isolation_level is not None:
             self._task_fence_schema_init_failed = True
@@ -4441,7 +4764,9 @@ class SessionDB:
             observed = _read_task_fence_schema_objects(self._conn)
             if observed == expected:
                 return
-            if observed and observed != _expected_task_fence_v1_schema_objects():
+            expected_v1 = _expected_task_fence_v1_schema_objects()
+            expected_v2 = _expected_task_fence_v2_schema_objects()
+            if observed and observed not in {expected_v1, expected_v2}:
                 return
 
             cursor = self._conn.cursor()
@@ -4465,16 +4790,28 @@ class SessionDB:
                         TASK_FENCE_CONTROL_PROTOCOL_VERSION,
                     ),
                 )
-            elif observed == _expected_task_fence_v1_schema_objects():
-                if not self._migrate_task_fence_v1_to_v2_unlocked(
+            elif observed == expected_v1:
+                if not self._migrate_task_fence_v1_to_current_unlocked(
                     cursor,
                     observed,
                 ):
                     self._conn.rollback()
                     logger.warning(
                         "Task Fence exact v1 shadow state is not pristine; "
-                        "automatic v2 migration was refused and legacy "
+                        "automatic current-schema migration was refused and legacy "
                         "dispatch behavior is unchanged."
+                    )
+                    return
+            elif observed == expected_v2:
+                if not self._migrate_task_fence_v2_to_v3_unlocked(
+                    cursor,
+                    observed,
+                ):
+                    self._conn.rollback()
+                    logger.warning(
+                        "Task Fence exact v2 shadow state is not safely "
+                        "migratable; automatic v3 migration was refused and "
+                        "legacy dispatch behavior is unchanged."
                     )
                     return
             else:
@@ -4802,7 +5139,15 @@ class SessionDB:
             )
 
     @staticmethod
-    def _task_fence_task_projection_compatible(row: sqlite3.Row) -> bool:
+    def _task_fence_task_projection_compatible(
+        row: sqlite3.Row,
+        *,
+        store_schema_versions: Optional[frozenset[int]] = None,
+    ) -> bool:
+        if store_schema_versions is None:
+            store_schema_versions = frozenset(
+                {TASK_FENCE_STORE_SCHEMA_VERSION}
+            )
         return (
             isinstance(row["task_id"], str)
             and bool(row["task_id"])
@@ -4812,7 +5157,7 @@ class SessionDB:
                 row["cohort_key"] is None
                 or (isinstance(row["cohort_key"], str) and bool(row["cohort_key"]))
             )
-            and row["store_schema_version"] == TASK_FENCE_STORE_SCHEMA_VERSION
+            and row["store_schema_version"] in store_schema_versions
             and type(row["store_schema_version"]) is int
             and row["control_protocol_version"]
             == TASK_FENCE_CONTROL_PROTOCOL_VERSION
@@ -4959,29 +5304,31 @@ class SessionDB:
                 created_at,
                 updated_at,
             )
-            pending_input_ids = tuple(
-                row[0]
-                for row in conn.execute(
-                    "SELECT i.event_id FROM main.task_fence_task_inputs AS i "
-                    "JOIN main.task_fence_ingress AS e ON e.event_id = i.event_id "
-                    "WHERE i.task_id = ? AND i.state = 'pending' "
-                    "ORDER BY e.accepted_order",
-                    (resolved_task_id,),
+            reconstructed = (
+                self._task_fence_pending_input_ids_at_unlocked(
+                    conn,
+                    task_id=resolved_task_id,
+                    accepted_order=event["accepted_order"],
                 )
             )
+            current = self._task_fence_current_pending_input_ids_unlocked(
+                conn,
+                task_id=resolved_task_id,
+            )
+            if (
+                isinstance(reconstructed, _TaskFenceIngressFailure)
+                or isinstance(current, _TaskFenceIngressFailure)
+                or reconstructed != current
+            ):
+                raise sqlite3.IntegrityError(
+                    "Task Fence pending history is inconsistent"
+                )
+            pending_input_ids = reconstructed
         elif opened_run_id is not None or closed_run_id is not None:
             raise sqlite3.IntegrityError(
                 "Task Fence taskless acceptance cannot reference runs"
             )
 
-        conn.executemany(
-            "INSERT INTO main.task_fence_acceptance_pending_inputs "
-            "(event_id, ordinal, input_event_id) VALUES (?, ?, ?)",
-            (
-                (event_id, ordinal, input_event_id)
-                for ordinal, input_event_id in enumerate(pending_input_ids)
-            ),
-        )
         fingerprint = self._task_fence_ingress_fingerprint(
             envelope,
             resolved_task_id=resolved_task_id,
@@ -5007,6 +5354,267 @@ class SessionDB:
                 len(pending_input_ids),
             ),
         )
+
+    @staticmethod
+    def _task_fence_action_from_history_row(
+        row: sqlite3.Row,
+    ) -> TaskFenceAction | _TaskFenceIngressFailure:
+        try:
+            action = TaskFenceAction(
+                origin=Origin(row["origin"]),
+                ingress_class=IngressClass(row["ingress_class"]),
+                intent=IntentEffect(row["intent"]),
+                execution=ExecutionEffect(row["execution"]),
+                input_effect=InputEffect(row["input_effect"]),
+                correlation_kind=CorrelationKind(row["correlation_kind"]),
+            )
+            validate_action(action)
+        except (TypeError, ValueError, TaskFenceProtocolRejected):
+            return _TaskFenceIngressFailure(
+                "incompatible_acceptance_projection",
+                unavailable=True,
+            )
+        return action
+
+    @staticmethod
+    def _task_fence_current_pending_input_ids_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+    ) -> Tuple[str, ...] | _TaskFenceIngressFailure:
+        rows = conn.execute(
+            "SELECT ti.event_id, e.accepted_order "
+            "FROM main.task_fence_task_inputs AS ti "
+            "JOIN main.task_fence_ingress AS e ON e.event_id = ti.event_id "
+            "WHERE ti.task_id = ? AND ti.state = 'pending' "
+            "LIMIT ?",
+            (task_id, _TASK_FENCE_MAX_PENDING_HISTORY_WORK + 1),
+        ).fetchall()
+        if len(rows) > _TASK_FENCE_MAX_PENDING_HISTORY_WORK:
+            return _TaskFenceIngressFailure(
+                "pending_history_limit_exceeded",
+                unavailable=True,
+            )
+        for row in rows:
+            if (
+                not _task_fence_v2_identifier_compatible(row["event_id"])
+                or type(row["accepted_order"]) is not int
+            ):
+                return _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
+        rows.sort(key=lambda row: row["accepted_order"])
+        previous_order = 0
+        pending: List[str] = []
+        for row in rows:
+            if row["accepted_order"] <= previous_order:
+                return _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
+            previous_order = row["accepted_order"]
+            pending.append(row["event_id"])
+        return tuple(pending)
+
+    @staticmethod
+    def _task_fence_pending_history_at_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        task_id: Optional[str],
+        accepted_order: int,
+        max_work: int,
+    ) -> _TaskFencePendingHistory | _TaskFenceIngressFailure:
+        if task_id is None:
+            return _TaskFencePendingHistory((), 0)
+        if (
+            not _task_fence_v2_identifier_compatible(task_id)
+            or type(accepted_order) is not int
+            or accepted_order < 1
+            or type(max_work) is not int
+            or max_work < 1
+        ):
+            return _TaskFenceIngressFailure(
+                "incompatible_acceptance_projection",
+                unavailable=True,
+            )
+        action_columns = (
+            "accepted_order, event_id, origin, ingress_class, intent, "
+            "execution, input_effect, correlation_kind"
+        )
+        last_run = conn.execute(
+            f"SELECT {action_columns} FROM main.task_fence_ingress "
+            "WHERE task_id = ? AND accepted_order <= ? "
+            "AND execution = 'run' ORDER BY accepted_order DESC LIMIT 1",
+            (task_id, accepted_order),
+        ).fetchone()
+        if last_run is None:
+            return _TaskFenceIngressFailure(
+                "incompatible_acceptance_projection",
+                unavailable=True,
+            )
+        run_action = SessionDB._task_fence_action_from_history_row(last_run)
+        start_order = last_run["accepted_order"]
+        if (
+            isinstance(run_action, _TaskFenceIngressFailure)
+            or run_action.execution is not ExecutionEffect.RUN
+            or not _task_fence_v2_identifier_compatible(last_run["event_id"])
+            or type(start_order) is not int
+            or start_order < 1
+            or start_order > accepted_order
+        ):
+            return _TaskFenceIngressFailure(
+                "incompatible_acceptance_projection",
+                unavailable=True,
+            )
+
+        history = conn.execute(
+            f"SELECT {action_columns} FROM main.task_fence_ingress "
+            "WHERE task_id = ? AND accepted_order > ? "
+            "AND accepted_order <= ? "
+            "AND input_effect IN ('append', 'discard_selected') "
+            "ORDER BY accepted_order LIMIT ?",
+            (
+                task_id,
+                start_order,
+                accepted_order,
+                max_work + 1,
+            ),
+        ).fetchall()
+        if len(history) > max_work:
+            return _TaskFenceIngressFailure(
+                "pending_history_limit_exceeded",
+                unavailable=True,
+            )
+
+        pending: Dict[str, None] = {}
+        work_units = len(history)
+        previous_order = start_order
+        for row in history:
+            event_id = row["event_id"]
+            order = row["accepted_order"]
+            action = SessionDB._task_fence_action_from_history_row(row)
+            if (
+                not _task_fence_v2_identifier_compatible(event_id)
+                or type(order) is not int
+                or order <= previous_order
+                or isinstance(action, _TaskFenceIngressFailure)
+            ):
+                return _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
+            previous_order = order
+            if action.input_effect is InputEffect.APPEND:
+                if event_id in pending:
+                    return _TaskFenceIngressFailure(
+                        "incompatible_acceptance_projection",
+                        unavailable=True,
+                    )
+                pending[event_id] = None
+                continue
+            if action.input_effect is not InputEffect.DISCARD_SELECTED:
+                return _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
+            remaining = max_work - work_units
+            correlations = conn.execute(
+                "SELECT correlation_id "
+                "FROM main.task_fence_ingress_correlations "
+                "WHERE event_id = ? ORDER BY correlation_id LIMIT ?",
+                (event_id, remaining + 1),
+            ).fetchall()
+            if len(correlations) > remaining:
+                return _TaskFenceIngressFailure(
+                    "pending_history_limit_exceeded",
+                    unavailable=True,
+                )
+            work_units += len(correlations)
+            correlation_ids = tuple(item[0] for item in correlations)
+            if (
+                not correlation_ids
+                or any(
+                    not _task_fence_v2_identifier_compatible(item)
+                    for item in correlation_ids
+                )
+                or not set(correlation_ids).issubset(pending)
+            ):
+                return _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
+            for item in correlation_ids:
+                del pending[item]
+        return _TaskFencePendingHistory(tuple(pending), work_units)
+
+    @staticmethod
+    def _task_fence_pending_input_ids_at_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        task_id: Optional[str],
+        accepted_order: int,
+    ) -> Tuple[str, ...] | _TaskFenceIngressFailure:
+        result = SessionDB._task_fence_pending_history_at_unlocked(
+            conn,
+            task_id=task_id,
+            accepted_order=accepted_order,
+            max_work=_TASK_FENCE_MAX_PENDING_HISTORY_WORK,
+        )
+        if isinstance(result, _TaskFenceIngressFailure):
+            return result
+        return result.input_ids
+
+    @staticmethod
+    def _task_fence_v2_pending_input_ids_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        task_id: Optional[str],
+        accepted_order: int,
+        expected_count: int,
+    ) -> Tuple[str, ...] | _TaskFenceIngressFailure:
+        if expected_count > _TASK_FENCE_MAX_PENDING_HISTORY_WORK:
+            return _TaskFenceIngressFailure(
+                "pending_history_limit_exceeded",
+                unavailable=True,
+            )
+        pending_rows = conn.execute(
+            "SELECT p.ordinal, p.input_event_id, "
+            "ti.task_id AS input_task_id, "
+            "i.task_id AS input_ingress_task_id, "
+            "i.accepted_order AS input_accepted_order "
+            "FROM main.task_fence_acceptance_pending_inputs AS p "
+            "JOIN main.task_fence_task_inputs AS ti "
+            "ON ti.event_id = p.input_event_id "
+            "JOIN main.task_fence_ingress AS i "
+            "ON i.event_id = p.input_event_id "
+            "WHERE p.event_id = ? ORDER BY p.ordinal LIMIT ?",
+            (event_id, _TASK_FENCE_MAX_PENDING_HISTORY_WORK + 1),
+        ).fetchall()
+        previous_input_order = 0
+        valid = len(pending_rows) == expected_count
+        for ordinal, item in enumerate(pending_rows):
+            input_order = item[4]
+            if (
+                type(item[0]) is not int
+                or item[0] != ordinal
+                or not _task_fence_v2_identifier_compatible(item[1])
+                or item[2] != task_id
+                or item[3] != task_id
+                or type(input_order) is not int
+                or input_order <= previous_input_order
+                or input_order > accepted_order
+            ):
+                valid = False
+                break
+            previous_input_order = input_order
+        if not valid:
+            return _TaskFenceIngressFailure(
+                "incompatible_acceptance_projection",
+                unavailable=True,
+            )
+        return tuple(item[1] for item in pending_rows)
 
     @staticmethod
     def _task_fence_collision_failure_unlocked(
@@ -5052,6 +5660,7 @@ class SessionDB:
         event_id: str,
         *,
         replayed: bool,
+        use_v2_pending_rows: bool = False,
     ) -> IngressAcceptance | _TaskFenceIngressFailure:
         row = conn.execute(
             "SELECT i.event_id, i.accepted_order, "
@@ -5096,44 +5705,33 @@ class SessionDB:
                 unavailable=True,
             )
         task_id = row["ingress_task_id"]
-        pending_rows = conn.execute(
-            "SELECT p.ordinal, p.input_event_id, "
-            "ti.task_id AS input_task_id, "
-            "i.task_id AS input_ingress_task_id, "
-            "i.accepted_order AS input_accepted_order "
-            "FROM main.task_fence_acceptance_pending_inputs AS p "
-            "JOIN main.task_fence_task_inputs AS ti "
-            "ON ti.event_id = p.input_event_id "
-            "JOIN main.task_fence_ingress AS i "
-            "ON i.event_id = p.input_event_id "
-            "WHERE p.event_id = ? ORDER BY p.ordinal",
-            (event_id,),
-        ).fetchall()
-        previous_input_order = 0
-        pending_projection_valid = (
-            len(pending_rows) == row["pending_input_count"]
-        )
-        for ordinal, item in enumerate(pending_rows):
-            input_order = item[4]
-            if (
-                type(item[0]) is not int
-                or item[0] != ordinal
-                or not _task_fence_v2_identifier_compatible(item[1])
-                or item[2] != task_id
-                or item[3] != task_id
-                or type(input_order) is not int
-                or input_order <= previous_input_order
-                or input_order > row["accepted_order"]
-            ):
-                pending_projection_valid = False
-                break
-            previous_input_order = input_order
-        if not pending_projection_valid:
-            return _TaskFenceIngressFailure(
-                "incompatible_acceptance_projection",
-                unavailable=True,
+        if use_v2_pending_rows:
+            pending_result = SessionDB._task_fence_v2_pending_input_ids_unlocked(
+                conn,
+                event_id=event_id,
+                task_id=task_id,
+                accepted_order=row["accepted_order"],
+                expected_count=row["pending_input_count"],
             )
-        pending_input_ids = tuple(item[1] for item in pending_rows)
+        else:
+            pending_result = SessionDB._task_fence_pending_input_ids_at_unlocked(
+                conn,
+                task_id=task_id,
+                accepted_order=row["accepted_order"],
+            )
+        if (
+            isinstance(pending_result, _TaskFenceIngressFailure)
+            or len(pending_result) != row["pending_input_count"]
+        ):
+            return (
+                pending_result
+                if isinstance(pending_result, _TaskFenceIngressFailure)
+                else _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
+            )
+        pending_input_ids = pending_result
         task_projection = None
         optional_identifiers = (
             "task_cohort_key",
@@ -5239,7 +5837,7 @@ class SessionDB:
         if task_projection is not None and (
             not task_projection.conversation_id
             or task_projection.store_schema_version
-            != TASK_FENCE_STORE_SCHEMA_VERSION
+            not in _TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS
             or task_projection.control_protocol_version
             != TASK_FENCE_CONTROL_PROTOCOL_VERSION
             or any(
@@ -5547,6 +6145,7 @@ class SessionDB:
                 ).fetchone()
 
         now = time.time()
+        created_task = False
         if authority_affecting and task is None:
             if action != TASK_FENCE_ACTIONS["initial_submit"]:
                 return _TaskFenceIngressFailure("empty_lane_requires_initial_submit")
@@ -5573,6 +6172,7 @@ class SessionDB:
                 "FROM main.task_fence_tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
+            created_task = True
 
         if task is not None:
             if (
@@ -5662,17 +6262,32 @@ class SessionDB:
                     "incident_requires_resolution_or_stop"
                 )
 
-            pending_ids = tuple(
-                row[0]
-                for row in conn.execute(
-                    "SELECT i.event_id FROM main.task_fence_task_inputs AS i "
-                    "JOIN main.task_fence_ingress AS e "
-                    "ON e.event_id = i.event_id "
-                    "WHERE i.task_id = ? AND i.state = 'pending' "
-                    "ORDER BY e.accepted_order",
-                    (resolved_task_id,),
+            current_pending = (
+                self._task_fence_current_pending_input_ids_unlocked(
+                    conn,
+                    task_id=resolved_task_id,
                 )
             )
+            if isinstance(current_pending, _TaskFenceIngressFailure):
+                return current_pending
+            if created_task:
+                historical_pending = ()
+            else:
+                historical_pending = (
+                    self._task_fence_pending_input_ids_at_unlocked(
+                        conn,
+                        task_id=resolved_task_id,
+                        accepted_order=task["last_accepted_order"],
+                    )
+                )
+                if isinstance(historical_pending, _TaskFenceIngressFailure):
+                    return historical_pending
+            if current_pending != historical_pending:
+                return _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
+            pending_ids = historical_pending
             if action.correlation_kind is CorrelationKind.OPEN_QUESTION:
                 open_questions = tuple(
                     row[0]
@@ -5922,17 +6537,30 @@ class SessionDB:
         )
         opened_run_id = None
         if action.execution is ExecutionEffect.RUN:
-            pending_after = tuple(
-                row[0]
-                for row in conn.execute(
-                    "SELECT i.event_id FROM main.task_fence_task_inputs AS i "
-                    "JOIN main.task_fence_ingress AS e "
-                    "ON e.event_id = i.event_id "
-                    "WHERE i.task_id = ? AND i.state = 'pending' "
-                    "ORDER BY e.accepted_order",
-                    (resolved_task_id,),
+            pending_result = (
+                self._task_fence_current_pending_input_ids_unlocked(
+                    conn,
+                    task_id=resolved_task_id,
                 )
             )
+            if isinstance(pending_result, _TaskFenceIngressFailure):
+                raise sqlite3.IntegrityError(
+                    "Task Fence post-mutation pending state is unavailable"
+                )
+            if action.input_effect is InputEffect.APPEND:
+                expected_pending_after = (*pending_ids, event_id)
+            elif action.input_effect is InputEffect.DISCARD_SELECTED:
+                discarded_ids = set(envelope.correlation_ids)
+                expected_pending_after = tuple(
+                    item for item in pending_ids if item not in discarded_ids
+                )
+            else:
+                expected_pending_after = pending_ids
+            if pending_result != expected_pending_after:
+                raise sqlite3.IntegrityError(
+                    "Task Fence post-mutation pending state changed"
+                )
+            pending_after = expected_pending_after
             manifest = json.dumps(
                 pending_after,
                 ensure_ascii=False,
