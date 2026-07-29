@@ -126,7 +126,11 @@ def test_causal_envelope_is_frozen_canonical_and_context_scoped():
         ("intent_epoch", True, "invalid_intent_epoch"),
         ("control_revision", -1, "invalid_control_revision"),
         ("input_manifest_hash", "0" * 63, "invalid_input_manifest_hash"),
-        ("store_schema_version", 4, "invalid_store_schema_version"),
+        (
+            "store_schema_version",
+            TASK_FENCE_STORE_SCHEMA_VERSION + 1,
+            "invalid_store_schema_version",
+        ),
         ("accepted_order", 0, "invalid_accepted_order"),
     ),
 )

@@ -21,7 +21,7 @@ from typing import Iterator, Mapping, Protocol
 
 
 CONTROL_PROTOCOL_VERSION = 1
-TASK_FENCE_STORE_SCHEMA_VERSION = 3
+TASK_FENCE_STORE_SCHEMA_VERSION = 4
 
 _MAX_SOURCE_BYTES = 256
 _MAX_IDENTIFIER_BYTES = 512
@@ -31,6 +31,7 @@ _MAX_EVIDENCE_REFS = 32
 _MAX_CAUSAL_ENVELOPE_BYTES = 16_384
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 
 TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
 
@@ -334,6 +335,7 @@ class DispatchDecision:
     reason: DecisionReason
     permit_id: str | None = None
     attempt_id: str | None = None
+    decision_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.outcome, DecisionOutcome) or not isinstance(
@@ -348,13 +350,18 @@ class DispatchDecision:
         }
         if current != allowed:
             raise TaskFenceProtocolRejected("invalid_dispatch_decision_reason")
-        for field in ("permit_id", "attempt_id"):
+        for field in ("permit_id", "attempt_id", "decision_id"):
             _bounded_text(
                 getattr(self, field),
                 field=field,
                 max_bytes=_MAX_IDENTIFIER_BYTES,
                 optional=True,
             )
+        if (
+            self.decision_id is not None
+            and _DECISION_ID_RE.fullmatch(self.decision_id) is None
+        ):
+            raise TaskFenceProtocolRejected("invalid_decision_id")
         if self.outcome is DecisionOutcome.WOULD_RESERVE:
             valid_shape = self.permit_id is not None and self.attempt_id is None
         elif self.outcome is DecisionOutcome.WOULD_ALLOW:
@@ -833,13 +840,13 @@ def operation_binding_fingerprint(
 class _TaskFencePolicyStore(Protocol):
     def _admit_task_fence_operation(
         self,
-        envelope: CausalEnvelope,
+        envelope: CausalEnvelope | None,
         operation: OperationDescriptor,
     ) -> DispatchDecision: ...
 
     def _authorize_and_start_task_fence_operation(
         self,
-        envelope: CausalEnvelope,
+        envelope: CausalEnvelope | None,
         operation: OperationDescriptor,
         permit_id: str,
     ) -> DispatchDecision: ...
@@ -864,12 +871,7 @@ class TaskFencePolicy:
         operation: OperationDescriptor,
     ) -> DispatchDecision:
         validate_operation_descriptor(operation)
-        if envelope is None:
-            return DispatchDecision(
-                DecisionOutcome.WOULD_BLOCK,
-                DecisionReason.MISSING_PROVENANCE,
-            )
-        if not isinstance(envelope, CausalEnvelope):
+        if envelope is not None and not isinstance(envelope, CausalEnvelope):
             raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
         return self._store._admit_task_fence_operation(envelope, operation)
 
@@ -885,13 +887,7 @@ class TaskFencePolicy:
             field="permit_id",
             max_bytes=_MAX_IDENTIFIER_BYTES,
         )
-        if envelope is None:
-            return DispatchDecision(
-                DecisionOutcome.WOULD_BLOCK,
-                DecisionReason.MISSING_PROVENANCE,
-                permit_id=permit_id,
-            )
-        if not isinstance(envelope, CausalEnvelope):
+        if envelope is not None and not isinstance(envelope, CausalEnvelope):
             raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
         return self._store._authorize_and_start_task_fence_operation(
             envelope,

@@ -79,6 +79,7 @@ def _count(db: SessionDB, table: str) -> int:
         "task_fence_dispatch_permits",
         "task_fence_attempts",
         "task_fence_attempt_transitions",
+        "task_fence_policy_decisions",
     }
     return db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
@@ -230,6 +231,112 @@ def test_admission_reserves_without_consuming_then_authorization_starts(tmp_path
         db.close()
 
 
+def test_policy_journal_is_deterministic_across_reserve_allow_and_consumed_replay(
+    tmp_path,
+):
+    db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    try:
+        admitted = policy.admit_operation(envelope, operation)
+        replayed = policy.admit_operation(envelope, operation)
+
+        assert admitted.decision_id is not None
+        assert replayed == admitted
+        assert _count(db, "task_fence_policy_decisions") == 1
+
+        started = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+        consumed = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+
+        assert started.outcome is DecisionOutcome.WOULD_ALLOW
+        assert consumed.outcome is DecisionOutcome.WOULD_BLOCK
+        assert consumed.reason is DecisionReason.PERMIT_ALREADY_CONSUMED
+        assert all(
+            decision.decision_id is not None
+            for decision in (admitted, started, consumed)
+        )
+        assert len(
+            {
+                admitted.decision_id,
+                started.decision_id,
+                consumed.decision_id,
+            }
+        ) == 3
+        assert tuple(
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_id, decision_point, outcome, reason_code, "
+                "permit_id, attempt_id FROM task_fence_policy_decisions "
+                "ORDER BY decision_order"
+            )
+        ) == (
+            (
+                admitted.decision_id,
+                "admission",
+                "would_reserve",
+                "current_authority",
+                admitted.permit_id,
+                None,
+            ),
+            (
+                started.decision_id,
+                "authorization",
+                "would_allow",
+                "current_authority",
+                admitted.permit_id,
+                started.attempt_id,
+            ),
+            (
+                consumed.decision_id,
+                "authorization",
+                "would_block",
+                "permit_already_consumed",
+                admitted.permit_id,
+                None,
+            ),
+        )
+    finally:
+        db.close()
+
+
+def test_policy_journal_exact_reservation_replays_after_reopen(tmp_path):
+    path = tmp_path / "state.db"
+    db, _acceptance, envelope, operation = _live_lane(path)
+    admitted = TaskFencePolicy(db).admit_operation(envelope, operation)
+    db.close()
+
+    reopened = SessionDB(path)
+    try:
+        replayed = TaskFencePolicy(reopened).admit_operation(envelope, operation)
+
+        assert replayed == admitted
+        assert replayed.decision_id is not None
+        assert _count(reopened, "task_fence_policy_decisions") == 1
+        assert reopened._conn.execute(
+            "SELECT decision_id FROM task_fence_policy_decisions"
+        ).fetchone()[0] == admitted.decision_id
+        inspection = reopened.inspect_task_fence_policy_decision(
+            admitted.decision_id
+        )
+        assert inspection.compatible is True
+        assert inspection.reason == "compatible"
+        assert inspection.decision is not None
+        assert inspection.decision.decision_id == admitted.decision_id
+        assert inspection.decision.outcome is DecisionOutcome.WOULD_RESERVE
+        assert inspection.decision.operation == operation
+        with pytest.raises(FrozenInstanceError):
+            inspection.decision.reason = DecisionReason.STALE_AUTHORITY
+    finally:
+        reopened.close()
+
+
 def test_started_model_generation_with_bound_inputs_can_start(tmp_path):
     db, _acceptance, envelope, operation = _live_lane(
         tmp_path / "state.db",
@@ -309,7 +416,7 @@ def test_operation_kind_must_match_generation_phase(
         ("invocation", DecisionReason.PERMIT_OPERATION_MISMATCH),
     ),
 )
-def test_admission_rejects_missing_stale_or_mismatched_provenance_without_rows(
+def test_admission_rejects_missing_stale_or_mismatched_provenance_without_dispatch_lifecycle_rows(
     tmp_path,
     case,
     reason,
@@ -359,7 +466,90 @@ def test_admission_rejects_missing_stale_or_mismatched_provenance_without_rows(
         db.close()
 
 
-def test_admission_rejects_invocation_rebinding_without_new_rows(tmp_path):
+def test_permitless_missing_and_stale_policy_decisions_are_durable(tmp_path):
+    db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    stale_envelope = replace(envelope, generation_id="tfg_stale")
+    try:
+        missing_admission = policy.admit_operation(None, operation)
+        missing_authorization = policy.authorize_and_start(
+            None,
+            operation,
+            "tfp_missing",
+        )
+        stale = policy.admit_operation(stale_envelope, operation)
+
+        assert missing_admission.reason is DecisionReason.MISSING_PROVENANCE
+        assert missing_authorization.reason is DecisionReason.MISSING_PROVENANCE
+        assert stale.reason is DecisionReason.STALE_AUTHORITY
+        assert all(
+            decision.decision_id is not None
+            for decision in (missing_admission, missing_authorization, stale)
+        )
+        assert _count(db, "task_fence_policy_decisions") == 3
+        assert tuple(
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_id, decision_point, outcome, reason_code, "
+                "candidate_task_id, candidate_generation_id, "
+                "operation_invocation_id, envelope_invocation_id, "
+                "causal_binding_fingerprint, permit_id, attempt_id "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ) == (
+            (
+                missing_admission.decision_id,
+                "admission",
+                "would_block",
+                "missing_provenance",
+                None,
+                None,
+                operation.invocation_id,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                missing_authorization.decision_id,
+                "authorization",
+                "would_block",
+                "missing_provenance",
+                None,
+                None,
+                operation.invocation_id,
+                None,
+                None,
+                "tfp_missing",
+                None,
+            ),
+            (
+                stale.decision_id,
+                "admission",
+                "would_block",
+                "stale_authority",
+                envelope.task_id,
+                stale_envelope.generation_id,
+                operation.invocation_id,
+                envelope.invocation_id,
+                hermes_state.operation_binding_fingerprint(
+                    stale_envelope,
+                    operation,
+                ),
+                None,
+                None,
+            ),
+        )
+        assert _count(db, "task_fence_dispatch_permits") == 0
+        assert _count(db, "task_fence_attempts") == 0
+        assert _count(db, "task_fence_attempt_transitions") == 0
+    finally:
+        db.close()
+
+
+def test_admission_rejects_invocation_rebinding_without_new_dispatch_lifecycle_rows(
+    tmp_path,
+):
     db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
     policy = TaskFencePolicy(db)
     try:
@@ -430,7 +620,9 @@ def test_non_authority_ingress_does_not_stale_current_generation(tmp_path):
         db.close()
 
 
-def test_healthy_ever_enforced_audit_halts_without_dispatch_rows(tmp_path):
+def test_healthy_ever_enforced_audit_halts_without_dispatch_lifecycle_rows(
+    tmp_path,
+):
     db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
     db._conn.execute(
         "UPDATE task_fence_control SET ever_enforced = 1 WHERE singleton = 1"
@@ -461,7 +653,9 @@ def test_read_only_never_enforced_audit_reports_unavailable_without_halt(
 
         assert blocked.outcome is DecisionOutcome.WOULD_BLOCK
         assert blocked.reason is DecisionReason.STORE_UNAVAILABLE
+        assert blocked.decision_id is None
         assert _count(owner, "task_fence_dispatch_permits") == 0
+        assert _count(owner, "task_fence_policy_decisions") == 0
         assert owner._conn.execute(
             "SELECT COUNT(*) FROM task_fence_cohorts WHERE cohort_key = ?",
             (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
@@ -588,8 +782,44 @@ def test_permit_is_single_use_across_independent_writers(tmp_path):
             DecisionReason.CURRENT_AUTHORITY,
             DecisionReason.PERMIT_ALREADY_CONSUMED,
         }
+        assert all(decision.decision_id is not None for decision in decisions)
+        assert len({decision.decision_id for decision in decisions}) == 2
         assert _count(first, "task_fence_attempts") == 1
         assert _count(first, "task_fence_attempt_transitions") == 1
+        assert tuple(
+            tuple(row)
+            for row in first._conn.execute(
+                "SELECT decision_point, outcome, reason_code, permit_id, "
+                "attempt_id FROM task_fence_policy_decisions "
+                "ORDER BY decision_order"
+            )
+        ) == (
+            (
+                "admission",
+                "would_reserve",
+                "current_authority",
+                admitted.permit_id,
+                None,
+            ),
+            (
+                "authorization",
+                "would_allow",
+                "current_authority",
+                admitted.permit_id,
+                next(
+                    decision.attempt_id
+                    for decision in decisions
+                    if decision.outcome is DecisionOutcome.WOULD_ALLOW
+                ),
+            ),
+            (
+                "authorization",
+                "would_block",
+                "permit_already_consumed",
+                admitted.permit_id,
+                None,
+            ),
+        )
     finally:
         second.close()
         first.close()
@@ -805,6 +1035,161 @@ def test_authorization_first_preserves_started_attempt_then_blocks_old_run(
     finally:
         ingress_db.close()
         dispatch_db.close()
+
+
+def test_policy_journal_fault_rolls_back_authorization_and_latches_audit_degraded(
+    tmp_path,
+):
+    db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    admitted = policy.admit_operation(envelope, operation)
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_policy_decision_insert "
+        "BEFORE INSERT ON task_fence_policy_decisions "
+        "WHEN NEW.decision_point = 'authorization' BEGIN "
+        "SELECT RAISE(ABORT, 'secret policy journal fault'); END"
+    )
+    try:
+        degraded = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+
+        assert degraded.outcome is DecisionOutcome.WOULD_BLOCK
+        assert degraded.reason is DecisionReason.AUDIT_DEGRADED
+        assert degraded.decision_id is None
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, consumed_at FROM task_fence_dispatch_permits "
+                "WHERE permit_id = ?",
+                (admitted.permit_id,),
+            ).fetchone()
+        ) == ("reserved", None)
+        assert _count(db, "task_fence_attempts") == 0
+        assert _count(db, "task_fence_attempt_transitions") == 0
+        assert _count(db, "task_fence_policy_decisions") == 1
+        assert db._conn.execute(
+            "SELECT decision_id FROM task_fence_policy_decisions"
+        ).fetchone()[0] == admitted.decision_id
+        assert db._conn.execute(
+            "SELECT audit_degraded FROM task_fence_cohorts WHERE cohort_key = ?",
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        ).fetchone()[0] == 1
+
+        db._conn.execute("DROP TRIGGER fail_policy_decision_insert")
+        started = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+        assert started.outcome is DecisionOutcome.WOULD_ALLOW
+        assert started.decision_id is not None
+        assert _count(db, "task_fence_policy_decisions") == 2
+    finally:
+        db.close()
+
+
+def test_policy_journal_fault_rolls_back_reservation_and_latches_audit_degraded(
+    tmp_path,
+):
+    db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_policy_decision_insert "
+        "BEFORE INSERT ON task_fence_policy_decisions BEGIN "
+        "SELECT RAISE(ABORT, 'secret policy journal fault'); END"
+    )
+    try:
+        degraded = TaskFencePolicy(db).admit_operation(envelope, operation)
+
+        assert degraded.outcome is DecisionOutcome.WOULD_BLOCK
+        assert degraded.reason is DecisionReason.AUDIT_DEGRADED
+        assert degraded.decision_id is None
+        assert _count(db, "task_fence_dispatch_permits") == 0
+        assert _count(db, "task_fence_attempts") == 0
+        assert _count(db, "task_fence_attempt_transitions") == 0
+        assert _count(db, "task_fence_policy_decisions") == 0
+        assert db._conn.execute(
+            "SELECT audit_degraded FROM task_fence_cohorts WHERE cohort_key = ?",
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_missing_provenance_journal_fault_preserves_reason_and_latches_degraded(
+    tmp_path,
+):
+    db, _acceptance, _envelope, operation = _live_lane(tmp_path / "state.db")
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_missing_policy_decision_insert "
+        "BEFORE INSERT ON task_fence_policy_decisions BEGIN "
+        "SELECT RAISE(ABORT, 'secret missing journal fault'); END"
+    )
+    policy = TaskFencePolicy(db)
+    try:
+        admission = policy.admit_operation(None, operation)
+        authorization = policy.authorize_and_start(
+            None,
+            operation,
+            "tfp_missing",
+        )
+
+        assert admission.reason is DecisionReason.MISSING_PROVENANCE
+        assert authorization.reason is DecisionReason.MISSING_PROVENANCE
+        assert admission.decision_id is None
+        assert authorization.decision_id is None
+        assert _count(db, "task_fence_policy_decisions") == 0
+        assert _count(db, "task_fence_dispatch_permits") == 0
+        assert db._conn.execute(
+            "SELECT audit_degraded FROM task_fence_cohorts WHERE cohort_key = ?",
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_missing_provenance_journal_fault_latches_permit_cohort(tmp_path):
+    db, acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    admitted = policy.admit_operation(envelope, operation)
+    db._conn.execute(
+        "INSERT INTO task_fence_cohorts ("
+        "cohort_key, mode, mode_generation, activation_state, "
+        "audit_degraded, created_at, updated_at"
+        ") VALUES ('explicit-review', 'audit', 0, 'inactive', 0, 1.0, 1.0)"
+    )
+    db._conn.execute(
+        "UPDATE task_fence_tasks SET cohort_key = 'explicit-review' WHERE task_id = ?",
+        (acceptance.task_projection.task_id,),
+    )
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_missing_policy_decision_insert "
+        "BEFORE INSERT ON task_fence_policy_decisions BEGIN "
+        "SELECT RAISE(ABORT, 'secret missing journal fault'); END"
+    )
+    try:
+        authorization = policy.authorize_and_start(
+            None,
+            operation,
+            admitted.permit_id,
+        )
+
+        assert authorization.reason is DecisionReason.MISSING_PROVENANCE
+        assert authorization.decision_id is None
+        assert tuple(
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT cohort_key, audit_degraded FROM task_fence_cohorts "
+                "WHERE cohort_key IN ('explicit-review', ?) ORDER BY cohort_key",
+                (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+            )
+        ) == (
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT, 0),
+            ("explicit-review", 1),
+        )
+    finally:
+        db.close()
 
 
 def test_late_authorization_fault_rolls_back_and_latches_audit_degraded(

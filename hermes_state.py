@@ -50,6 +50,7 @@ from task_fence import (
     DecisionReason,
     DispatchDecision,
     OperationDescriptor,
+    OperationKind,
     TASK_FENCE_ACTIONS,
     TASK_FENCE_POLICY_VERSION,
     TASK_FENCE_STORE_SCHEMA_VERSION,
@@ -331,8 +332,10 @@ _TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES = 10_000
 _TASK_FENCE_MAX_V2_MIGRATION_PENDING_ROWS = 1_000_000
 _TASK_FENCE_MAX_V2_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_MAX_V2_MIGRATION_HISTORY_WORK = 1_000_000
-_TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset({2, 3})
+_TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset({2, 3, 4})
+_TASK_FENCE_MAX_V3_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
+_TASK_FENCE_POLICY_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 _TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
 # Fixed audit-only bound; no config until a real consumer sets a latency budget.
 _TASK_FENCE_POLICY_PERMIT_TTL_SECONDS = 24 * 60 * 60
@@ -343,6 +346,16 @@ _TASK_FENCE_TASK_SELECT_COLUMNS = (
     "active_authority_event_id, active_execution_run_id, "
     "current_generation_id, current_runtime_epoch, last_accepted_order, "
     "last_transition_event_id"
+)
+_TASK_FENCE_POLICY_DECISION_SELECT_COLUMNS = (
+    "decision_order, decided_at, decision_id, decision_point, outcome, "
+    "reason_code, policy_version, candidate_task_id, "
+    "candidate_authority_event_id, candidate_run_id, "
+    "candidate_generation_id, candidate_intent_epoch, "
+    "candidate_control_revision, candidate_runtime_epoch, cohort_key, "
+    "mode_generation, operation_invocation_id, envelope_invocation_id, "
+    "operation_kind, adapter, invocation_fingerprint, "
+    "causal_binding_fingerprint, permit_id, attempt_id"
 )
 
 
@@ -375,6 +388,19 @@ def _task_fence_policy_evidence_compatible(
         return len(value.encode("utf-8")) <= _TASK_FENCE_POLICY_EVIDENCE_MAX_BYTES
     except UnicodeEncodeError:
         return False
+
+
+def _task_fence_policy_decision_identifier(semantic: Dict[str, Any]) -> str:
+    """Commit one validated decision semantic to a stable identifier."""
+
+    encoded = json.dumps(
+        semantic,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"tfd_{hashlib.sha256(encoded).hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -418,6 +444,43 @@ class TaskFenceTaskInspection:
     compatible: bool
     reason: str
     task: Optional[TaskFenceTaskControl]
+
+
+@dataclass(frozen=True)
+class TaskFencePolicyDecisionRecord:
+    """One immutable, secret-free durable policy observation."""
+
+    decision_order: int
+    decision_id: str
+    decision_point: str
+    outcome: DecisionOutcome
+    reason: DecisionReason
+    policy_version: str
+    candidate_task_id: Optional[str]
+    candidate_authority_event_id: Optional[str]
+    candidate_run_id: Optional[str]
+    candidate_generation_id: Optional[str]
+    candidate_intent_epoch: Optional[int]
+    candidate_control_revision: Optional[int]
+    candidate_runtime_epoch: Optional[int]
+    cohort_key: Optional[str]
+    mode_generation: int
+    operation: OperationDescriptor
+    envelope_invocation_id: Optional[str]
+    causal_binding_fingerprint: Optional[str]
+    permit_id: Optional[str]
+    attempt_id: Optional[str]
+    decided_at: float
+
+
+@dataclass(frozen=True)
+class TaskFencePolicyDecisionInspection:
+    """Bounded exact lookup paired with Task Fence store compatibility."""
+
+    store: TaskFenceStoreInspection
+    compatible: bool
+    reason: str
+    decision: Optional[TaskFencePolicyDecisionRecord]
 
 
 @dataclass(frozen=True)
@@ -2325,10 +2388,196 @@ CREATE INDEX IF NOT EXISTS main.idx_task_fence_ingress_task_input_history
     WHERE input_effect IN ('append', 'discard_selected');
 DROP TABLE IF EXISTS main.task_fence_acceptance_pending_inputs;
 """
-TASK_FENCE_SCHEMA_POST_V1_SQL = (
-    TASK_FENCE_SCHEMA_V2_EXTENSION_SQL + TASK_FENCE_SCHEMA_V3_REDUCTION_SQL
+TASK_FENCE_SCHEMA_V3_SQL = (
+    TASK_FENCE_SCHEMA_V1_SQL
+    + TASK_FENCE_SCHEMA_V2_EXTENSION_SQL
+    + TASK_FENCE_SCHEMA_V3_REDUCTION_SQL
 )
-TASK_FENCE_SCHEMA_SQL = TASK_FENCE_SCHEMA_V1_SQL + TASK_FENCE_SCHEMA_POST_V1_SQL
+
+
+TASK_FENCE_SCHEMA_V4_EXTENSION_SQL = """
+CREATE TABLE IF NOT EXISTS main.task_fence_policy_decisions (
+    decision_order INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id TEXT NOT NULL UNIQUE CHECK (
+        length(decision_id) = 68
+        AND substr(decision_id, 1, 4) = 'tfd_'
+        AND substr(decision_id, 5) NOT GLOB '*[^0-9a-f]*'
+    ),
+    decision_point TEXT NOT NULL
+        CHECK (decision_point IN ('admission', 'authorization')),
+    outcome TEXT NOT NULL CHECK (
+        outcome IN (
+            'would_reserve', 'would_allow', 'would_block', 'halt_dispatch'
+        )
+    ),
+    reason_code TEXT NOT NULL CHECK (
+        reason_code IN (
+            'current_authority', 'missing_provenance', 'store_unavailable',
+            'store_incompatible', 'audit_degraded', 'cohort_mismatch',
+            'cohort_halted', 'unsupported_mode', 'task_not_found',
+            'task_not_runnable', 'stale_authority', 'newer_input_pending',
+            'invocation_conflict', 'permit_not_found',
+            'permit_already_consumed', 'permit_revoked', 'permit_expired',
+            'permit_operation_mismatch', 'permit_generation_mismatch',
+            'permit_runtime_epoch_mismatch'
+        )
+    ),
+    policy_version TEXT NOT NULL
+        CHECK (policy_version = 'task-fence-policy-v1'),
+    candidate_task_id TEXT,
+    candidate_authority_event_id TEXT,
+    candidate_run_id TEXT,
+    candidate_generation_id TEXT,
+    candidate_intent_epoch INTEGER CHECK (
+        candidate_intent_epoch IS NULL
+        OR (
+            typeof(candidate_intent_epoch) = 'integer'
+            AND candidate_intent_epoch >= 0
+        )
+    ),
+    candidate_control_revision INTEGER CHECK (
+        candidate_control_revision IS NULL
+        OR (
+            typeof(candidate_control_revision) = 'integer'
+            AND candidate_control_revision >= 0
+        )
+    ),
+    candidate_runtime_epoch INTEGER CHECK (
+        candidate_runtime_epoch IS NULL
+        OR (
+            typeof(candidate_runtime_epoch) = 'integer'
+            AND candidate_runtime_epoch >= 0
+        )
+    ),
+    cohort_key TEXT,
+    mode_generation INTEGER NOT NULL CHECK (
+        typeof(mode_generation) = 'integer' AND mode_generation >= 0
+    ),
+    operation_invocation_id TEXT NOT NULL,
+    envelope_invocation_id TEXT,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('model', 'tool')),
+    adapter TEXT NOT NULL,
+    invocation_fingerprint TEXT NOT NULL CHECK (
+        length(invocation_fingerprint) = 64
+        AND invocation_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    causal_binding_fingerprint TEXT CHECK (
+        causal_binding_fingerprint IS NULL
+        OR (
+            length(causal_binding_fingerprint) = 64
+            AND causal_binding_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    permit_id TEXT,
+    attempt_id TEXT,
+    decided_at REAL NOT NULL CHECK (
+        typeof(decided_at) = 'real' AND decided_at >= 0
+    ),
+    CHECK (
+        (
+            candidate_task_id IS NULL
+            AND candidate_authority_event_id IS NULL
+            AND candidate_run_id IS NULL
+            AND candidate_generation_id IS NULL
+            AND candidate_intent_epoch IS NULL
+            AND candidate_control_revision IS NULL
+            AND candidate_runtime_epoch IS NULL
+            AND cohort_key IS NULL
+            AND envelope_invocation_id IS NULL
+            AND causal_binding_fingerprint IS NULL
+        )
+        OR (
+            candidate_task_id IS NOT NULL
+            AND candidate_authority_event_id IS NOT NULL
+            AND candidate_run_id IS NOT NULL
+            AND candidate_generation_id IS NOT NULL
+            AND candidate_intent_epoch IS NOT NULL
+            AND candidate_control_revision IS NOT NULL
+            AND candidate_runtime_epoch IS NOT NULL
+            AND causal_binding_fingerprint IS NOT NULL
+        )
+    ),
+    CHECK (
+        (
+            reason_code = 'current_authority'
+            AND outcome IN ('would_reserve', 'would_allow')
+        )
+        OR (
+            reason_code != 'current_authority'
+            AND outcome IN ('would_block', 'halt_dispatch')
+        )
+    ),
+    CHECK (
+        candidate_task_id IS NOT NULL
+        OR reason_code = 'missing_provenance'
+    ),
+    CHECK (
+        outcome NOT IN ('would_reserve', 'would_allow')
+        OR (
+            candidate_task_id IS NOT NULL
+            AND cohort_key IS NOT NULL
+            AND envelope_invocation_id IS NOT NULL
+            AND envelope_invocation_id = operation_invocation_id
+        )
+    ),
+    CHECK (
+        (
+            outcome = 'would_reserve'
+            AND decision_point = 'admission'
+            AND permit_id IS NOT NULL
+            AND attempt_id IS NULL
+        )
+        OR (
+            outcome = 'would_allow'
+            AND decision_point = 'authorization'
+            AND permit_id IS NOT NULL
+            AND attempt_id IS NOT NULL
+        )
+        OR (
+            outcome IN ('would_block', 'halt_dispatch')
+            AND attempt_id IS NULL
+            AND (
+                decision_point = 'admission'
+                OR permit_id IS NOT NULL
+            )
+        )
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS main.task_fence_policy_decisions_no_replace
+BEFORE INSERT ON task_fence_policy_decisions
+WHEN EXISTS (
+    SELECT 1 FROM task_fence_policy_decisions
+    WHERE decision_order = NEW.decision_order
+        OR decision_id = NEW.decision_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'task_fence_policy_decisions is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS main.task_fence_policy_decisions_no_update
+BEFORE UPDATE ON task_fence_policy_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'task_fence_policy_decisions is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS main.task_fence_policy_decisions_no_delete
+BEFORE DELETE ON task_fence_policy_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'task_fence_policy_decisions is append-only');
+END;
+
+CREATE INDEX IF NOT EXISTS main.idx_task_fence_policy_decisions_invocation
+    ON task_fence_policy_decisions(
+        operation_invocation_id, decision_point, decision_order
+    );
+"""
+
+
+TASK_FENCE_SCHEMA_POST_V1_SQL = (
+    TASK_FENCE_SCHEMA_V2_EXTENSION_SQL
+    + TASK_FENCE_SCHEMA_V3_REDUCTION_SQL
+    + TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
+)
+TASK_FENCE_SCHEMA_SQL = TASK_FENCE_SCHEMA_V3_SQL + TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
 
 _task_fence_expected_schema_objects: Optional[Tuple[Tuple[str, str, str, str], ...]] = (
     None
@@ -2337,6 +2586,9 @@ _task_fence_expected_v1_schema_objects: Optional[
     Tuple[Tuple[str, str, str, str], ...]
 ] = None
 _task_fence_expected_v2_schema_objects: Optional[
+    Tuple[Tuple[str, str, str, str], ...]
+] = None
+_task_fence_expected_v3_schema_objects: Optional[
     Tuple[Tuple[str, str, str, str], ...]
 ] = None
 _task_fence_expected_schema_objects_lock = threading.Lock()
@@ -2413,6 +2665,17 @@ def _expected_task_fence_v2_schema_objects() -> Tuple[
                 _task_fence_schema_objects_for_sql(TASK_FENCE_SCHEMA_V2_SQL)
             )
         return _task_fence_expected_v2_schema_objects
+
+
+def _expected_task_fence_v3_schema_objects() -> Tuple[Tuple[str, str, str, str], ...]:
+    """Lazily build the exact pre-policy-journal migration signature."""
+    global _task_fence_expected_v3_schema_objects
+    with _task_fence_expected_schema_objects_lock:
+        if _task_fence_expected_v3_schema_objects is None:
+            _task_fence_expected_v3_schema_objects = _task_fence_schema_objects_for_sql(
+                TASK_FENCE_SCHEMA_V3_SQL
+            )
+        return _task_fence_expected_v3_schema_objects
 
 
 def _expected_task_fence_schema_objects() -> Tuple[Tuple[str, str, str, str], ...]:
@@ -4729,7 +4992,7 @@ class SessionDB:
         updated_tasks = cursor.execute(
             "UPDATE main.task_fence_tasks SET store_schema_version = ? "
             "WHERE store_schema_version = 2",
-            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+            (3,),
         )
         if updated_tasks.rowcount != task_count:
             raise sqlite3.DatabaseError(
@@ -4746,7 +5009,7 @@ class SessionDB:
             "AND tested_artifact_checksum IS NULL "
             "AND dependency_lock_fingerprint IS NULL",
             (
-                TASK_FENCE_STORE_SCHEMA_VERSION,
+                3,
                 TASK_FENCE_CONTROL_PROTOCOL_VERSION,
             ),
         )
@@ -4756,15 +5019,161 @@ class SessionDB:
             )
         if _read_task_fence_schema_objects(
             self._conn
-        ) != _expected_task_fence_schema_objects():
+        ) != _expected_task_fence_v3_schema_objects():
             raise sqlite3.DatabaseError("Task Fence v2 migration schema mismatch")
         if not self._task_fence_foreign_keys_clean_unlocked(
             self._conn,
-            _expected_task_fence_schema_objects(),
+            _expected_task_fence_v3_schema_objects(),
         ):
             raise sqlite3.DatabaseError(
                 "Task Fence v2 migration foreign key mismatch"
             )
+        return True
+
+    def _task_fence_v3_is_migratable_unlocked(
+        self,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        if schema_objects != _expected_task_fence_v3_schema_objects():
+            return False
+        metadata = self._conn.execute(
+            "SELECT singleton, store_schema_version, control_protocol_version, "
+            "runtime_epoch, mode_generation, ever_enforced, "
+            "tested_artifact_commit, tested_artifact_checksum, "
+            "dependency_lock_fingerprint "
+            "FROM main.task_fence_control ORDER BY singleton LIMIT 2"
+        ).fetchall()
+        if len(metadata) != 1 or tuple(metadata[0]) != (
+            1,
+            3,
+            TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+        ):
+            return False
+
+        remaining_rows = _TASK_FENCE_MAX_V3_MIGRATION_ROWS
+        for object_type, table_name, _table, _sql in schema_objects:
+            if object_type != "table":
+                continue
+            if _TASK_FENCE_TABLE_NAME_RE.fullmatch(table_name) is None:
+                raise sqlite3.DatabaseError("invalid trusted Task Fence table name")
+            safe_table = table_name.replace('"', '""')
+            count = self._conn.execute(
+                f'SELECT COUNT(*) FROM (SELECT 1 FROM main."{safe_table}" LIMIT ?)',
+                (remaining_rows + 1,),
+            ).fetchone()[0]
+            if type(count) is not int or count > remaining_rows:
+                return False
+            remaining_rows -= count
+
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM main.task_fence_cohorts "
+                "WHERE mode != 'audit' OR activation_state != 'inactive' "
+                "OR mode_generation != 0 OR audit_degraded != 0 LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM main.task_fence_tasks "
+                "WHERE store_schema_version != 3 "
+                "OR control_protocol_version != ? LIMIT 1",
+                (TASK_FENCE_CONTROL_PROTOCOL_VERSION,),
+            ).fetchone()
+            is not None
+        ):
+            return False
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM main.task_fence_acceptance_snapshots "
+                "WHERE task_store_schema_version IS NOT NULL "
+                "AND task_store_schema_version NOT IN (2, 3) LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+        for table_name in (
+            "task_fence_dispatch_permits",
+            "task_fence_attempts",
+            "task_fence_attempt_transitions",
+        ):
+            if (
+                self._conn.execute(
+                    f"SELECT 1 FROM main.{table_name} LIMIT 1"
+                ).fetchone()
+                is not None
+            ):
+                return False
+        return self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            schema_objects,
+        )
+
+    def _migrate_task_fence_v3_to_current_unlocked(
+        self,
+        cursor: sqlite3.Cursor,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        if not self._task_fence_v3_is_migratable_unlocked(schema_objects):
+            return False
+
+        task_count = self._conn.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM main.task_fence_tasks LIMIT ?)",
+            (_TASK_FENCE_MAX_V3_MIGRATION_ROWS + 1,),
+        ).fetchone()[0]
+        if (
+            type(task_count) is not int
+            or task_count > _TASK_FENCE_MAX_V3_MIGRATION_ROWS
+        ):
+            return False
+
+        self._execute_task_fence_schema_sql(
+            cursor,
+            TASK_FENCE_SCHEMA_V4_EXTENSION_SQL,
+        )
+        updated_tasks = cursor.execute(
+            "UPDATE main.task_fence_tasks SET store_schema_version = ? "
+            "WHERE store_schema_version = 3",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        if updated_tasks.rowcount != task_count:
+            raise sqlite3.DatabaseError("Task Fence v3 migration task metadata changed")
+        updated_control = cursor.execute(
+            "UPDATE main.task_fence_control "
+            "SET store_schema_version = ?, "
+            "updated_at = CAST(strftime('%s', 'now') AS REAL) "
+            "WHERE singleton = 1 AND store_schema_version = 3 "
+            "AND control_protocol_version = ? AND runtime_epoch = 0 "
+            "AND mode_generation = 0 AND ever_enforced = 0 "
+            "AND tested_artifact_commit IS NULL "
+            "AND tested_artifact_checksum IS NULL "
+            "AND dependency_lock_fingerprint IS NULL",
+            (
+                TASK_FENCE_STORE_SCHEMA_VERSION,
+                TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+            ),
+        )
+        if updated_control.rowcount != 1:
+            raise sqlite3.DatabaseError(
+                "Task Fence v3 migration control metadata changed"
+            )
+        if (
+            _read_task_fence_schema_objects(self._conn)
+            != _expected_task_fence_schema_objects()
+        ):
+            raise sqlite3.DatabaseError("Task Fence v3 migration schema mismatch")
+        if not self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            _expected_task_fence_schema_objects(),
+        ):
+            raise sqlite3.DatabaseError("Task Fence v3 migration foreign key mismatch")
         return True
 
     def _init_task_fence_schema(self) -> None:
@@ -4798,7 +5207,8 @@ class SessionDB:
                 return
             expected_v1 = _expected_task_fence_v1_schema_objects()
             expected_v2 = _expected_task_fence_v2_schema_objects()
-            if observed and observed not in {expected_v1, expected_v2}:
+            expected_v3 = _expected_task_fence_v3_schema_objects()
+            if observed and observed not in {expected_v1, expected_v2, expected_v3}:
                 return
 
             cursor = self._conn.cursor()
@@ -4842,7 +5252,31 @@ class SessionDB:
                     self._conn.rollback()
                     logger.warning(
                         "Task Fence exact v2 shadow state is not safely "
-                        "migratable; automatic v3 migration was refused and "
+                        "migratable; automatic current migration was refused and "
+                        "legacy dispatch behavior is unchanged."
+                    )
+                    return
+                observed = _read_task_fence_schema_objects(self._conn)
+                if not self._migrate_task_fence_v3_to_current_unlocked(
+                    cursor,
+                    observed,
+                ):
+                    self._conn.rollback()
+                    logger.warning(
+                        "Task Fence migrated v2 shadow state is not safely "
+                        "migratable to current; automatic migration was refused "
+                        "and legacy dispatch behavior is unchanged."
+                    )
+                    return
+            elif observed == expected_v3:
+                if not self._migrate_task_fence_v3_to_current_unlocked(
+                    cursor,
+                    observed,
+                ):
+                    self._conn.rollback()
+                    logger.warning(
+                        "Task Fence exact v3 shadow state is not safely "
+                        "migratable; automatic current migration was refused and "
                         "legacy dispatch behavior is unchanged."
                     )
                     return
@@ -5168,6 +5602,250 @@ class SessionDB:
                 compatible=False,
                 reason=reason,
                 task=None,
+            )
+
+    @staticmethod
+    def _task_fence_policy_decision_record(
+        row: sqlite3.Row,
+    ) -> TaskFencePolicyDecisionRecord:
+        """Validate one row before exposing it through the read-only API."""
+
+        decision_order = row["decision_order"]
+        decided_at = row["decided_at"]
+        decision_id = row["decision_id"]
+        decision_point = row["decision_point"]
+        policy_version = row["policy_version"]
+        if (
+            type(decision_order) is not int
+            or decision_order <= 0
+            or type(decided_at) is not float
+            or not math.isfinite(decided_at)
+            or decided_at < 0
+            or not isinstance(decision_id, str)
+            or _TASK_FENCE_POLICY_DECISION_ID_RE.fullmatch(decision_id) is None
+            or decision_point not in {"admission", "authorization"}
+            or policy_version != TASK_FENCE_POLICY_VERSION
+        ):
+            raise ValueError("invalid policy decision scalar")
+
+        candidate_identifiers = (
+            row["candidate_task_id"],
+            row["candidate_authority_event_id"],
+            row["candidate_run_id"],
+            row["candidate_generation_id"],
+        )
+        candidate_counters = (
+            row["candidate_intent_epoch"],
+            row["candidate_control_revision"],
+            row["candidate_runtime_epoch"],
+        )
+        has_candidate = candidate_identifiers[0] is not None
+        if has_candidate:
+            if not all(
+                _task_fence_v2_identifier_compatible(value)
+                for value in candidate_identifiers
+            ) or any(
+                type(value) is not int or value < 0 for value in candidate_counters
+            ):
+                raise ValueError("invalid policy decision candidate")
+        elif any(
+            value is not None for value in (*candidate_identifiers, *candidate_counters)
+        ):
+            raise ValueError("partial policy decision candidate")
+
+        cohort_key = row["cohort_key"]
+        mode_generation = row["mode_generation"]
+        envelope_invocation_id = row["envelope_invocation_id"]
+        causal_binding_fingerprint = row["causal_binding_fingerprint"]
+        if (
+            not _task_fence_v2_identifier_compatible(cohort_key, optional=True)
+            or type(mode_generation) is not int
+            or mode_generation < 0
+            or not _task_fence_v2_identifier_compatible(
+                envelope_invocation_id,
+                optional=True,
+            )
+            or (
+                causal_binding_fingerprint is not None
+                and (
+                    not isinstance(causal_binding_fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", causal_binding_fingerprint) is None
+                )
+            )
+            or (has_candidate != (causal_binding_fingerprint is not None))
+            or (
+                not has_candidate
+                and (cohort_key is not None or envelope_invocation_id is not None)
+            )
+        ):
+            raise ValueError("invalid policy decision context")
+
+        try:
+            outcome = DecisionOutcome(row["outcome"])
+            reason = DecisionReason(row["reason_code"])
+            operation = OperationDescriptor(
+                invocation_id=row["operation_invocation_id"],
+                kind=OperationKind(row["operation_kind"]),
+                adapter=row["adapter"],
+                invocation_fingerprint=row["invocation_fingerprint"],
+            )
+            persisted = DispatchDecision(
+                outcome,
+                reason,
+                permit_id=row["permit_id"],
+                attempt_id=row["attempt_id"],
+                decision_id=decision_id,
+            )
+        except (TaskFenceProtocolRejected, TypeError, ValueError) as exc:
+            raise ValueError("invalid policy decision projection") from exc
+
+        if (
+            (not has_candidate and reason is not DecisionReason.MISSING_PROVENANCE)
+            or (
+                outcome
+                in {
+                    DecisionOutcome.WOULD_RESERVE,
+                    DecisionOutcome.WOULD_ALLOW,
+                }
+                and (
+                    not has_candidate
+                    or cohort_key is None
+                    or envelope_invocation_id != operation.invocation_id
+                )
+            )
+            or (
+                outcome is DecisionOutcome.WOULD_RESERVE
+                and decision_point != "admission"
+            )
+            or (
+                outcome is DecisionOutcome.WOULD_ALLOW
+                and decision_point != "authorization"
+            )
+            or (decision_point == "authorization" and persisted.permit_id is None)
+        ):
+            raise ValueError("invalid policy decision shape")
+
+        semantic = {
+            "policy_version": policy_version,
+            "decision_point": decision_point,
+            "outcome": outcome.value,
+            "reason_code": reason.value,
+            "candidate_task_id": candidate_identifiers[0],
+            "candidate_authority_event_id": candidate_identifiers[1],
+            "candidate_run_id": candidate_identifiers[2],
+            "candidate_generation_id": candidate_identifiers[3],
+            "candidate_intent_epoch": candidate_counters[0],
+            "candidate_control_revision": candidate_counters[1],
+            "candidate_runtime_epoch": candidate_counters[2],
+            "cohort_key": cohort_key,
+            "mode_generation": mode_generation,
+            "operation": operation.to_dict(),
+            "envelope_invocation_id": envelope_invocation_id,
+            "causal_binding_fingerprint": causal_binding_fingerprint,
+            "permit_id": persisted.permit_id,
+            "attempt_id": persisted.attempt_id,
+        }
+        if _task_fence_policy_decision_identifier(semantic) != decision_id:
+            raise ValueError("policy decision identifier mismatch")
+
+        return TaskFencePolicyDecisionRecord(
+            decision_order=decision_order,
+            decision_id=decision_id,
+            decision_point=decision_point,
+            outcome=outcome,
+            reason=reason,
+            policy_version=policy_version,
+            candidate_task_id=candidate_identifiers[0],
+            candidate_authority_event_id=candidate_identifiers[1],
+            candidate_run_id=candidate_identifiers[2],
+            candidate_generation_id=candidate_identifiers[3],
+            candidate_intent_epoch=candidate_counters[0],
+            candidate_control_revision=candidate_counters[1],
+            candidate_runtime_epoch=candidate_counters[2],
+            cohort_key=cohort_key,
+            mode_generation=mode_generation,
+            operation=operation,
+            envelope_invocation_id=envelope_invocation_id,
+            causal_binding_fingerprint=causal_binding_fingerprint,
+            permit_id=persisted.permit_id,
+            attempt_id=persisted.attempt_id,
+            decided_at=decided_at,
+        )
+
+    def _inspect_task_fence_policy_decision(
+        self,
+        decision_id: str,
+    ) -> TaskFencePolicyDecisionInspection:
+        with self._lock:
+            if self._conn is None:
+                raise sqlite3.ProgrammingError("SessionDB is closed")
+            owned_snapshot = self._begin_task_fence_read_snapshot_unlocked()
+            try:
+                store = self._inspect_task_fence_store_unlocked(include_counts=False)
+                if not store.compatible:
+                    return TaskFencePolicyDecisionInspection(
+                        store,
+                        False,
+                        store.reason,
+                        None,
+                    )
+                if (
+                    not isinstance(decision_id, str)
+                    or _TASK_FENCE_POLICY_DECISION_ID_RE.fullmatch(decision_id) is None
+                ):
+                    return TaskFencePolicyDecisionInspection(
+                        store,
+                        False,
+                        "invalid_decision_id",
+                        None,
+                    )
+                row = self._conn.execute(
+                    f"SELECT {_TASK_FENCE_POLICY_DECISION_SELECT_COLUMNS} "
+                    "FROM main.task_fence_policy_decisions "
+                    "WHERE decision_id = ?",
+                    (decision_id,),
+                ).fetchone()
+                if row is None:
+                    return TaskFencePolicyDecisionInspection(
+                        store,
+                        True,
+                        "not_found",
+                        None,
+                    )
+                try:
+                    decision = self._task_fence_policy_decision_record(row)
+                except (KeyError, TypeError, ValueError):
+                    return TaskFencePolicyDecisionInspection(
+                        store,
+                        False,
+                        "malformed_policy_decision",
+                        None,
+                    )
+                return TaskFencePolicyDecisionInspection(
+                    store,
+                    True,
+                    "compatible",
+                    decision,
+                )
+            finally:
+                self._end_task_fence_read_snapshot_unlocked(owned_snapshot)
+
+    def inspect_task_fence_policy_decision(
+        self,
+        decision_id: str,
+    ) -> TaskFencePolicyDecisionInspection:
+        """Return one validated policy row through a bounded SELECT-only path."""
+
+        try:
+            return self._inspect_task_fence_policy_decision(decision_id)
+        except Exception as exc:
+            logger.debug("Task Fence policy decision inspection failed: %s", exc)
+            reason = _task_fence_inspection_failure_reason(exc)
+            return TaskFencePolicyDecisionInspection(
+                store=_failed_task_fence_store_inspection(reason),
+                compatible=False,
+                reason=reason,
+                decision=None,
             )
 
     @staticmethod
@@ -7355,6 +8033,208 @@ class SessionDB:
             permit_id=permit_id,
         )
 
+    def _record_task_fence_policy_decision_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        decision_point: str,
+        envelope: Optional[CausalEnvelope],
+        operation: OperationDescriptor,
+        decision: DispatchDecision,
+        decided_at: float,
+    ) -> DispatchDecision:
+        """Append or replay one exact secret-free policy observation."""
+
+        if decision_point not in {"admission", "authorization"}:
+            raise sqlite3.IntegrityError("Task Fence policy decision point is invalid")
+        validate_operation_descriptor(operation)
+        if envelope is not None and not isinstance(envelope, CausalEnvelope):
+            raise sqlite3.IntegrityError(
+                "Task Fence policy decision envelope is invalid"
+            )
+        if decision.decision_id is not None:
+            raise sqlite3.IntegrityError(
+                "Task Fence policy decision is already persisted"
+            )
+        if (
+            not isinstance(decided_at, float)
+            or not math.isfinite(decided_at)
+            or decided_at < 0
+        ):
+            raise sqlite3.IntegrityError("Task Fence policy decision time is invalid")
+
+        control = conn.execute(
+            "SELECT mode_generation FROM main.task_fence_control WHERE singleton = 1"
+        ).fetchone()
+        if (
+            control is None
+            or type(control["mode_generation"]) is not int
+            or control["mode_generation"] < 0
+        ):
+            raise sqlite3.IntegrityError(
+                "Task Fence policy control projection is incompatible"
+            )
+        mode_generation = control["mode_generation"]
+
+        candidate_task_id = None
+        candidate_authority_event_id = None
+        candidate_run_id = None
+        candidate_generation_id = None
+        candidate_intent_epoch = None
+        candidate_control_revision = None
+        candidate_runtime_epoch = None
+        envelope_invocation_id = None
+        causal_binding_fingerprint = None
+        cohort_key = None
+        if envelope is not None:
+            candidate_task_id = envelope.task_id
+            candidate_authority_event_id = envelope.authority_event_id
+            candidate_run_id = envelope.run_id
+            candidate_generation_id = envelope.generation_id
+            candidate_intent_epoch = envelope.intent_epoch
+            candidate_control_revision = envelope.control_revision
+            candidate_runtime_epoch = envelope.runtime_epoch
+            envelope_invocation_id = envelope.invocation_id
+            causal_binding_fingerprint = operation_binding_fingerprint(
+                envelope,
+                operation,
+            )
+            task = conn.execute(
+                "SELECT cohort_key FROM main.task_fence_tasks WHERE task_id = ?",
+                (candidate_task_id,),
+            ).fetchone()
+            if task is not None:
+                cohort_key = (
+                    task["cohort_key"]
+                    if task["cohort_key"] is not None
+                    else _TASK_FENCE_IMPLICIT_AUDIT_COHORT
+                )
+                if not _task_fence_v2_identifier_compatible(cohort_key):
+                    raise sqlite3.IntegrityError(
+                        "Task Fence policy cohort projection is incompatible"
+                    )
+
+        semantic = {
+            "policy_version": TASK_FENCE_POLICY_VERSION,
+            "decision_point": decision_point,
+            "outcome": decision.outcome.value,
+            "reason_code": decision.reason.value,
+            "candidate_task_id": candidate_task_id,
+            "candidate_authority_event_id": candidate_authority_event_id,
+            "candidate_run_id": candidate_run_id,
+            "candidate_generation_id": candidate_generation_id,
+            "candidate_intent_epoch": candidate_intent_epoch,
+            "candidate_control_revision": candidate_control_revision,
+            "candidate_runtime_epoch": candidate_runtime_epoch,
+            "cohort_key": cohort_key,
+            "mode_generation": mode_generation,
+            "operation": operation.to_dict(),
+            "envelope_invocation_id": envelope_invocation_id,
+            "causal_binding_fingerprint": causal_binding_fingerprint,
+            "permit_id": decision.permit_id,
+            "attempt_id": decision.attempt_id,
+        }
+        decision_id = _task_fence_policy_decision_identifier(semantic)
+        persisted = DispatchDecision(
+            decision.outcome,
+            decision.reason,
+            permit_id=decision.permit_id,
+            attempt_id=decision.attempt_id,
+            decision_id=decision_id,
+        )
+        values = (
+            decision_id,
+            decision_point,
+            decision.outcome.value,
+            decision.reason.value,
+            TASK_FENCE_POLICY_VERSION,
+            candidate_task_id,
+            candidate_authority_event_id,
+            candidate_run_id,
+            candidate_generation_id,
+            candidate_intent_epoch,
+            candidate_control_revision,
+            candidate_runtime_epoch,
+            cohort_key,
+            mode_generation,
+            operation.invocation_id,
+            envelope_invocation_id,
+            operation.kind.value,
+            operation.adapter,
+            operation.invocation_fingerprint,
+            causal_binding_fingerprint,
+            decision.permit_id,
+            decision.attempt_id,
+        )
+        existing = conn.execute(
+            f"SELECT {_TASK_FENCE_POLICY_DECISION_SELECT_COLUMNS} "
+            "FROM main.task_fence_policy_decisions WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                type(existing["decision_order"]) is not int
+                or existing["decision_order"] <= 0
+                or type(existing["decided_at"]) not in {int, float}
+                or not math.isfinite(float(existing["decided_at"]))
+                or existing["decided_at"] < 0
+                or tuple(existing[2:]) != values
+            ):
+                raise sqlite3.IntegrityError(
+                    "Task Fence policy decision replay is incompatible"
+                )
+            return persisted
+
+        conn.execute(
+            "INSERT INTO main.task_fence_policy_decisions ("
+            "decision_id, decision_point, outcome, reason_code, policy_version, "
+            "candidate_task_id, candidate_authority_event_id, candidate_run_id, "
+            "candidate_generation_id, candidate_intent_epoch, "
+            "candidate_control_revision, candidate_runtime_epoch, cohort_key, "
+            "mode_generation, operation_invocation_id, envelope_invocation_id, "
+            "operation_kind, adapter, invocation_fingerprint, "
+            "causal_binding_fingerprint, permit_id, attempt_id, decided_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?)",
+            (*values, decided_at),
+        )
+        return persisted
+
+    def _observe_task_fence_policy_decision(
+        self,
+        *,
+        decision_point: str,
+        envelope: Optional[CausalEnvelope],
+        operation: OperationDescriptor,
+        decision: DispatchDecision,
+    ) -> DispatchDecision:
+        """Best-effort observation for a decision that precedes store authority."""
+
+        if self.read_only or self._conn is None:
+            return decision
+
+        def _observe(conn: sqlite3.Connection) -> DispatchDecision:
+            store = self._inspect_task_fence_store_unlocked(include_counts=False)
+            if not store.compatible:
+                return decision
+            return self._record_task_fence_policy_decision_unlocked(
+                conn,
+                decision_point=decision_point,
+                envelope=envelope,
+                operation=operation,
+                decision=decision,
+                decided_at=time.time(),
+            )
+
+        try:
+            return self._execute_write(_observe)
+        except sqlite3.DatabaseError:
+            self._task_fence_latch_audit_degraded(
+                permit_id=decision.permit_id,
+                unscoped_implicit=envelope is None,
+            )
+            return decision
+
     def _task_fence_policy_cohort_unlocked(
         self,
         conn: sqlite3.Connection,
@@ -7882,6 +8762,7 @@ class SessionDB:
         task_id: Optional[str] = None,
         permit_id: Optional[str] = None,
         attempt_id: Optional[str] = None,
+        unscoped_implicit: bool = False,
     ) -> bool:
         if self.read_only or self._conn is None:
             return False
@@ -7898,17 +8779,21 @@ class SessionDB:
                 attempt_id=attempt_id,
             )
             if resolved_task_id is None:
-                return False
-            task = conn.execute(
-                "SELECT cohort_key FROM main.task_fence_tasks WHERE task_id = ?",
-                (resolved_task_id,),
-            ).fetchone()
-            if task is None:
-                return False
+                if not unscoped_implicit:
+                    return False
+                task_cohort_key = None
+            else:
+                task = conn.execute(
+                    "SELECT cohort_key FROM main.task_fence_tasks WHERE task_id = ?",
+                    (resolved_task_id,),
+                ).fetchone()
+                if task is None:
+                    return False
+                task_cohort_key = task["cohort_key"]
             _reason, cohort_key, audit_fallback = (
                 self._task_fence_policy_cohort_unlocked(
                     conn,
-                    task_cohort_key=task["cohort_key"],
+                    task_cohort_key=task_cohort_key,
                     now=now,
                 )
             )
@@ -8031,25 +8916,26 @@ class SessionDB:
 
     def _admit_task_fence_operation(
         self,
-        envelope: CausalEnvelope,
+        envelope: Optional[CausalEnvelope],
         operation: OperationDescriptor,
     ) -> DispatchDecision:
         """Reserve one exact audit permit without starting an attempt."""
 
         validate_operation_descriptor(operation)
+        if envelope is None:
+            return self._observe_task_fence_policy_decision(
+                decision_point="admission",
+                envelope=None,
+                operation=operation,
+                decision=self._task_fence_policy_block(
+                    DecisionReason.MISSING_PROVENANCE
+                ),
+            )
         if not isinstance(envelope, CausalEnvelope):
             raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
         if self.read_only or self._conn is None:
             return self._task_fence_policy_failure_decision(
                 task_id=envelope.task_id
-            )
-        if envelope.invocation_id is None:
-            return self._task_fence_policy_block(
-                DecisionReason.MISSING_PROVENANCE
-            )
-        if operation.invocation_id != envelope.invocation_id:
-            return self._task_fence_policy_block(
-                DecisionReason.PERMIT_OPERATION_MISMATCH
             )
 
         permit_id = f"tfp_{uuid.uuid4().hex}"
@@ -8060,6 +8946,33 @@ class SessionDB:
 
         def _admit(conn: sqlite3.Connection) -> DispatchDecision:
             now = time.time()
+
+            def observe(decision: DispatchDecision) -> DispatchDecision:
+                return self._record_task_fence_policy_decision_unlocked(
+                    conn,
+                    decision_point="admission",
+                    envelope=envelope,
+                    operation=operation,
+                    decision=decision,
+                    decided_at=now,
+                )
+
+            def block(
+                reason: DecisionReason,
+                *,
+                existing_permit_id: Optional[str] = None,
+            ) -> DispatchDecision:
+                return observe(
+                    self._task_fence_policy_block(
+                        reason,
+                        permit_id=existing_permit_id,
+                    )
+                )
+
+            if envelope.invocation_id is None:
+                return block(DecisionReason.MISSING_PROVENANCE)
+            if operation.invocation_id != envelope.invocation_id:
+                return block(DecisionReason.PERMIT_OPERATION_MISMATCH)
             authority_reason = self._task_fence_policy_authority_reason_unlocked(
                 conn,
                 envelope,
@@ -8071,7 +8984,7 @@ class SessionDB:
                     "Task Fence policy authority projection is incompatible"
                 )
             if authority_reason is not None:
-                return self._task_fence_policy_block(authority_reason)
+                return block(authority_reason)
 
             existing = conn.execute(
                 "SELECT permit_id, task_id, authority_event_id, run_id, "
@@ -8098,16 +9011,16 @@ class SessionDB:
                     binding_fingerprint,
                 )
                 if mismatch is not None:
-                    return self._task_fence_policy_block(
+                    return block(
                         DecisionReason.INVOCATION_CONFLICT,
-                        permit_id=existing["permit_id"],
+                        existing_permit_id=existing["permit_id"],
                     )
                 if existing["state"] != "reserved":
-                    return self._task_fence_policy_block(
+                    return block(
                         self._task_fence_policy_permit_state_reason(
                             existing["state"]
                         ),
-                        permit_id=existing["permit_id"],
+                        existing_permit_id=existing["permit_id"],
                     )
                 if existing["expires_at"] <= now:
                     conn.execute(
@@ -8122,14 +9035,16 @@ class SessionDB:
                             existing["permit_id"],
                         ),
                     )
-                    return self._task_fence_policy_block(
+                    return block(
                         DecisionReason.PERMIT_EXPIRED,
+                        existing_permit_id=existing["permit_id"],
+                    )
+                return observe(
+                    DispatchDecision(
+                        DecisionOutcome.WOULD_RESERVE,
+                        DecisionReason.CURRENT_AUTHORITY,
                         permit_id=existing["permit_id"],
                     )
-                return DispatchDecision(
-                    DecisionOutcome.WOULD_RESERVE,
-                    DecisionReason.CURRENT_AUTHORITY,
-                    permit_id=existing["permit_id"],
                 )
 
             conn.execute(
@@ -8165,10 +9080,12 @@ class SessionDB:
                     now,
                 ),
             )
-            return DispatchDecision(
-                DecisionOutcome.WOULD_RESERVE,
-                DecisionReason.CURRENT_AUTHORITY,
-                permit_id=permit_id,
+            return observe(
+                DispatchDecision(
+                    DecisionOutcome.WOULD_RESERVE,
+                    DecisionReason.CURRENT_AUTHORITY,
+                    permit_id=permit_id,
+                )
             )
 
         try:
@@ -8180,17 +9097,27 @@ class SessionDB:
 
     def _authorize_and_start_task_fence_operation(
         self,
-        envelope: CausalEnvelope,
+        envelope: Optional[CausalEnvelope],
         operation: OperationDescriptor,
         permit_id: str,
     ) -> DispatchDecision:
         """Consume an exact permit and commit STARTED before adapter handoff."""
 
         validate_operation_descriptor(operation)
-        if not isinstance(envelope, CausalEnvelope):
-            raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
         if not isinstance(permit_id, str) or not permit_id:
             raise TaskFenceProtocolRejected("invalid_permit_id")
+        if envelope is None:
+            return self._observe_task_fence_policy_decision(
+                decision_point="authorization",
+                envelope=None,
+                operation=operation,
+                decision=self._task_fence_policy_block(
+                    DecisionReason.MISSING_PROVENANCE,
+                    permit_id=permit_id,
+                ),
+            )
+        if not isinstance(envelope, CausalEnvelope):
+            raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
         if self.read_only or self._conn is None:
             return self._task_fence_policy_failure_decision(
                 task_id=envelope.task_id,
@@ -8202,6 +9129,25 @@ class SessionDB:
 
         def _authorize(conn: sqlite3.Connection) -> DispatchDecision:
             now = time.time()
+
+            def observe(decision: DispatchDecision) -> DispatchDecision:
+                return self._record_task_fence_policy_decision_unlocked(
+                    conn,
+                    decision_point="authorization",
+                    envelope=envelope,
+                    operation=operation,
+                    decision=decision,
+                    decided_at=now,
+                )
+
+            def block(reason: DecisionReason) -> DispatchDecision:
+                return observe(
+                    self._task_fence_policy_block(
+                        reason,
+                        permit_id=permit_id,
+                    )
+                )
+
             permit = conn.execute(
                 "SELECT permit_id, task_id, authority_event_id, run_id, "
                 "generation_id, intent_epoch, control_revision, runtime_epoch, "
@@ -8212,10 +9158,7 @@ class SessionDB:
                 (permit_id,),
             ).fetchone()
             if permit is None:
-                return self._task_fence_policy_block(
-                    DecisionReason.PERMIT_NOT_FOUND,
-                    permit_id=permit_id,
-                )
+                return block(DecisionReason.PERMIT_NOT_FOUND)
             if not self._task_fence_policy_permit_storage_compatible_unlocked(
                 conn,
                 permit,
@@ -8230,10 +9173,7 @@ class SessionDB:
                 binding_fingerprint,
             )
             if mismatch is not None:
-                return self._task_fence_policy_block(
-                    mismatch,
-                    permit_id=permit_id,
-                )
+                return block(mismatch)
             if permit["state"] != "reserved":
                 reason = self._task_fence_policy_permit_state_reason(
                     permit["state"]
@@ -8251,10 +9191,7 @@ class SessionDB:
                             permit_id,
                         ),
                     )
-                return self._task_fence_policy_block(
-                    reason,
-                    permit_id=permit_id,
-                )
+                return block(reason)
             if permit["expires_at"] <= now:
                 conn.execute(
                     "UPDATE main.task_fence_dispatch_permits "
@@ -8268,10 +9205,7 @@ class SessionDB:
                         permit_id,
                     ),
                 )
-                return self._task_fence_policy_block(
-                    DecisionReason.PERMIT_EXPIRED,
-                    permit_id=permit_id,
-                )
+                return block(DecisionReason.PERMIT_EXPIRED)
 
             authority_reason = self._task_fence_policy_authority_reason_unlocked(
                 conn,
@@ -8302,10 +9236,7 @@ class SessionDB:
                             permit_id,
                         ),
                     )
-                return self._task_fence_policy_block(
-                    authority_reason,
-                    permit_id=permit_id,
-                )
+                return block(authority_reason)
 
             consumed = conn.execute(
                 "UPDATE main.task_fence_dispatch_permits "
@@ -8352,11 +9283,13 @@ class SessionDB:
                     now,
                 ),
             )
-            return DispatchDecision(
-                DecisionOutcome.WOULD_ALLOW,
-                DecisionReason.CURRENT_AUTHORITY,
-                permit_id=permit_id,
-                attempt_id=attempt_id,
+            return observe(
+                DispatchDecision(
+                    DecisionOutcome.WOULD_ALLOW,
+                    DecisionReason.CURRENT_AUTHORITY,
+                    permit_id=permit_id,
+                    attempt_id=attempt_id,
+                )
             )
 
         try:

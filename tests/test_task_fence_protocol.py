@@ -14,6 +14,9 @@ import pytest
 from task_fence import (
     TASK_FENCE_ACTIONS as ACTIONS,
     CorrelationKind as Correlation,
+    DecisionOutcome,
+    DecisionReason,
+    DispatchDecision,
     ExecutionEffect,
     IngressClass,
     InputEffect,
@@ -427,6 +430,37 @@ def test_closed_ingress_matrix_accepts_only_documented_shapes() -> None:
     )
     with pytest.raises(ProtocolRejected, match="unsupported_ingress_tuple"):
         validate_action(invalid)
+
+
+def test_dispatch_decision_id_is_closed_bounded_and_optional() -> None:
+    decision_id = f"tfd_{'a' * 64}"
+    persisted = DispatchDecision(
+        DecisionOutcome.WOULD_BLOCK,
+        DecisionReason.STALE_AUTHORITY,
+        decision_id=decision_id,
+    )
+    unavailable = DispatchDecision(
+        DecisionOutcome.HALT_DISPATCH,
+        DecisionReason.STORE_UNAVAILABLE,
+    )
+
+    assert persisted.decision_id == decision_id
+    assert unavailable.decision_id is None
+
+    for invalid in (
+        "",
+        "decision-1",
+        f"tfd_{'g' * 64}",
+        f"tfd_{'a' * 63}",
+        f"tfd_{'a' * 65}",
+        1,
+    ):
+        with pytest.raises(ProtocolRejected, match="decision_id"):
+            DispatchDecision(
+                DecisionOutcome.WOULD_BLOCK,
+                DecisionReason.STALE_AUTHORITY,
+                decision_id=invalid,  # type: ignore[arg-type]
+            )
 
 
 def test_source_event_dedupe_is_idempotent_and_collision_safe() -> None:

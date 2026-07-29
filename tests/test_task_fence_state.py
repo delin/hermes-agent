@@ -31,6 +31,7 @@ EXPECTED_TASK_FENCE_TABLES = {
     "task_fence_ingress_correlations",
     "task_fence_ingress_evidence",
     "task_fence_model_generations",
+    "task_fence_policy_decisions",
     "task_fence_questions",
     "task_fence_resolution_evidence",
     "task_fence_resolutions",
@@ -172,6 +173,14 @@ def test_fresh_store_initializes_exact_current_task_fence_schema(tmp_path):
             if item.table == "task_fence_control"
         ).rows
         == 1
+    )
+    assert (
+        next(
+            item
+            for item in inspection.table_counts
+            if item.table == "task_fence_policy_decisions"
+        ).rows
+        == 0
     )
 
     conn = sqlite3.connect(path)
@@ -1522,6 +1531,16 @@ def test_authority_journals_reject_update_and_delete(tmp_path):
             "'resolution-1', 'incident-1', 'event-1', "
             "'accepted_unknown_no_retry', 1.0)"
         )
+        decision_id = f"tfd_{'a' * 64}"
+        conn.execute(
+            "INSERT INTO task_fence_policy_decisions ("
+            "decision_id, decision_point, outcome, reason_code, policy_version, "
+            "mode_generation, operation_invocation_id, operation_kind, adapter, "
+            "invocation_fingerprint, decided_at"
+            ") VALUES (?, 'admission', 'would_block', 'missing_provenance', "
+            "'task-fence-policy-v1', 0, 'invocation-1', 'tool', 'adapter-1', ?, 1.0)",
+            (decision_id, "b" * 64),
+        )
         conn.commit()
 
         statements = (
@@ -1533,6 +1552,10 @@ def test_authority_journals_reject_update_and_delete(tmp_path):
             "UPDATE task_fence_resolutions SET disposition = 'confirmed_failure' "
             "WHERE resolution_id = 'resolution-1'",
             "DELETE FROM task_fence_resolutions WHERE resolution_id = 'resolution-1'",
+            "UPDATE task_fence_policy_decisions SET reason_code = "
+            f"'stale_authority' WHERE decision_id = '{decision_id}'",
+            "DELETE FROM task_fence_policy_decisions "
+            f"WHERE decision_id = '{decision_id}'",
         )
         for statement in statements:
             with pytest.raises(sqlite3.IntegrityError, match="append-only"):
@@ -1571,6 +1594,17 @@ def test_authority_journals_reject_all_replace_conflicts(tmp_path):
             "'resolution-1', 'incident-1', 'event-1', "
             "'accepted_unknown_no_retry', 1.0)"
         )
+        decision_id = f"tfd_{'a' * 64}"
+        conn.execute(
+            "INSERT INTO task_fence_policy_decisions ("
+            "decision_order, decision_id, decision_point, outcome, reason_code, "
+            "policy_version, mode_generation, operation_invocation_id, "
+            "operation_kind, adapter, "
+            "invocation_fingerprint, decided_at"
+            ") VALUES (13, ?, 'admission', 'would_block', 'missing_provenance', "
+            "'task-fence-policy-v1', 0, 'invocation-1', 'tool', 'adapter-1', ?, 1.0)",
+            (decision_id, "b" * 64),
+        )
         conn.commit()
 
         for verb in ("INSERT OR REPLACE", "REPLACE"):
@@ -1606,6 +1640,24 @@ def test_authority_journals_reject_all_replace_conflicts(tmp_path):
                 "resolution_id, incident_id, resolution_event_id, disposition, resolved_at"
                 ") VALUES ('resolution-incident', 'incident-1', 'event-1', "
                 "'confirmed_failure', 2.0)",
+                f"{verb} INTO task_fence_policy_decisions ("
+                "decision_order, decision_id, decision_point, outcome, reason_code, "
+                "policy_version, mode_generation, operation_invocation_id, "
+                "operation_kind, adapter, "
+                "invocation_fingerprint, decided_at) VALUES ("
+                f"13, 'tfd_{'c' * 64}', 'admission', 'would_block', "
+                "'missing_provenance', 'task-fence-policy-v1', 0, "
+                "'invocation-order', 'tool', 'adapter-1', "
+                f"'{'d' * 64}', 2.0)",
+                f"{verb} INTO task_fence_policy_decisions ("
+                "decision_order, decision_id, decision_point, outcome, reason_code, "
+                "policy_version, mode_generation, operation_invocation_id, "
+                "operation_kind, adapter, "
+                "invocation_fingerprint, decided_at) VALUES ("
+                f"14, '{decision_id}', 'admission', 'would_block', "
+                "'missing_provenance', 'task-fence-policy-v1', 0, "
+                "'invocation-id', 'tool', 'adapter-1', "
+                f"'{'e' * 64}', 2.0)",
             )
             for statement in statements:
                 with pytest.raises(sqlite3.IntegrityError, match="append-only"):
@@ -1622,12 +1674,17 @@ def test_authority_journals_reject_all_replace_conflicts(tmp_path):
         resolutions = conn.execute(
             "SELECT resolution_id, incident_id, disposition FROM task_fence_resolutions"
         ).fetchall()
+        decisions = conn.execute(
+            "SELECT decision_order, decision_id, reason_code "
+            "FROM task_fence_policy_decisions"
+        ).fetchall()
     finally:
         conn.close()
 
     assert ingress == [(7, "event-1", "gateway", "source-1")]
     assert transitions == [(11, "attempt-1", "PREPARED")]
     assert resolutions == [("resolution-1", "incident-1", "accepted_unknown_no_retry")]
+    assert decisions == [(13, decision_id, "missing_provenance")]
 
 
 def test_inspection_counts_are_capped(tmp_path):
@@ -1686,6 +1743,192 @@ def test_count_inspection_never_interpolates_unexpected_identifier(tmp_path):
     )
     assert unexpected.rows is None
     assert unexpected.truncated is False
+
+
+def test_policy_decision_journal_schema_is_closed_and_secret_free(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.close()
+
+    conn = sqlite3.connect(path)
+    try:
+        column_info = {
+            row[1]: row
+            for row in conn.execute(
+                'PRAGMA table_info("task_fence_policy_decisions")'
+            )
+        }
+        columns = set(column_info)
+        foreign_keys = conn.execute(
+            'PRAGMA foreign_key_list("task_fence_policy_decisions")'
+        ).fetchall()
+        indexes = {
+            row[1]
+            for row in conn.execute('PRAGMA index_list("task_fence_policy_decisions")')
+        }
+    finally:
+        conn.close()
+
+    assert columns == {
+        "decision_order",
+        "decision_id",
+        "decision_point",
+        "outcome",
+        "reason_code",
+        "policy_version",
+        "candidate_task_id",
+        "candidate_authority_event_id",
+        "candidate_run_id",
+        "candidate_generation_id",
+        "candidate_intent_epoch",
+        "candidate_control_revision",
+        "candidate_runtime_epoch",
+        "cohort_key",
+        "mode_generation",
+        "operation_invocation_id",
+        "envelope_invocation_id",
+        "operation_kind",
+        "adapter",
+        "invocation_fingerprint",
+        "causal_binding_fingerprint",
+        "permit_id",
+        "attempt_id",
+        "decided_at",
+    }
+    assert foreign_keys == []
+    assert column_info["mode_generation"][3] == 1
+    assert "idx_task_fence_policy_decisions_invocation" in indexes
+    assert all(
+        forbidden not in column.lower()
+        for column in columns
+        for forbidden in (
+            "prompt",
+            "message",
+            "argument",
+            "result",
+            "payload",
+            "secret",
+            "credential",
+            "transcript",
+            "envelope_json",
+        )
+    )
+
+
+def test_policy_decision_exact_inspection_is_bounded_and_rejects_corruption(
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    missing_id = f"tfd_{'f' * 64}"
+    corrupt_id = f"tfd_{'a' * 64}"
+    try:
+        invalid = db.inspect_task_fence_policy_decision("not-a-decision")
+        missing = db.inspect_task_fence_policy_decision(missing_id)
+        db._conn.execute(
+            "INSERT INTO task_fence_policy_decisions ("
+            "decision_id, decision_point, outcome, reason_code, policy_version, "
+            "mode_generation, operation_invocation_id, operation_kind, adapter, "
+            "invocation_fingerprint, decided_at"
+            ") VALUES (?, 'admission', 'would_block', 'missing_provenance', "
+            "'task-fence-policy-v1', 0, 'invocation-corrupt', 'tool', "
+            "'adapter-corrupt', ?, 1.0)",
+            (corrupt_id, "b" * 64),
+        )
+        corrupt = db.inspect_task_fence_policy_decision(corrupt_id)
+
+        assert invalid.compatible is False
+        assert invalid.reason == "invalid_decision_id"
+        assert invalid.decision is None
+        assert missing.compatible is True
+        assert missing.reason == "not_found"
+        assert missing.decision is None
+        assert corrupt.compatible is False
+        assert corrupt.reason == "malformed_policy_decision"
+        assert corrupt.decision is None
+    finally:
+        db.close()
+
+    closed = db.inspect_task_fence_policy_decision(missing_id)
+    assert closed.compatible is False
+    assert closed.reason == "inspection_closed"
+    assert closed.decision is None
+
+
+def test_policy_decision_schema_and_reader_reject_writer_impossible_success(
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    operation = {
+        "invocation_id": "invocation-corrupt",
+        "kind": "tool",
+        "adapter": "adapter-corrupt",
+        "invocation_fingerprint": "b" * 64,
+    }
+    semantic = {
+        "policy_version": hermes_state.TASK_FENCE_POLICY_VERSION,
+        "decision_point": "admission",
+        "outcome": "would_reserve",
+        "reason_code": "current_authority",
+        "candidate_task_id": "task-corrupt",
+        "candidate_authority_event_id": "event-corrupt",
+        "candidate_run_id": "run-corrupt",
+        "candidate_generation_id": "generation-corrupt",
+        "candidate_intent_epoch": 0,
+        "candidate_control_revision": 0,
+        "candidate_runtime_epoch": 0,
+        "cohort_key": None,
+        "mode_generation": 0,
+        "operation": operation,
+        "envelope_invocation_id": operation["invocation_id"],
+        "causal_binding_fingerprint": "c" * 64,
+        "permit_id": "tfp_corrupt",
+        "attempt_id": None,
+    }
+    decision_id = hermes_state._task_fence_policy_decision_identifier(semantic)
+    values = (
+        decision_id,
+        semantic["policy_version"],
+        semantic["candidate_task_id"],
+        semantic["candidate_authority_event_id"],
+        semantic["candidate_run_id"],
+        semantic["candidate_generation_id"],
+        semantic["candidate_intent_epoch"],
+        semantic["candidate_control_revision"],
+        semantic["candidate_runtime_epoch"],
+        semantic["mode_generation"],
+        operation["invocation_id"],
+        semantic["envelope_invocation_id"],
+        operation["adapter"],
+        operation["invocation_fingerprint"],
+        semantic["causal_binding_fingerprint"],
+        semantic["permit_id"],
+    )
+    statement = (
+        "INSERT INTO task_fence_policy_decisions ("
+        "decision_id, decision_point, outcome, reason_code, policy_version, "
+        "candidate_task_id, candidate_authority_event_id, candidate_run_id, "
+        "candidate_generation_id, candidate_intent_epoch, "
+        "candidate_control_revision, candidate_runtime_epoch, cohort_key, "
+        "mode_generation, operation_invocation_id, envelope_invocation_id, "
+        "operation_kind, adapter, invocation_fingerprint, "
+        "causal_binding_fingerprint, permit_id, attempt_id, decided_at"
+        ") VALUES (?, 'admission', 'would_reserve', 'current_authority', ?, "
+        "?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'tool', ?, ?, ?, ?, NULL, 1.0)"
+    )
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            db._conn.execute(statement, values)
+
+        db._conn.execute("PRAGMA ignore_check_constraints=ON")
+        db._conn.execute(statement, values)
+        db._conn.execute("PRAGMA ignore_check_constraints=OFF")
+        corrupt = db.inspect_task_fence_policy_decision(decision_id)
+
+        assert corrupt.compatible is False
+        assert corrupt.reason == "malformed_policy_decision"
+        assert corrupt.decision is None
+    finally:
+        db.close()
 
 
 def test_task_fence_schema_has_no_raw_prompt_or_tool_payload_columns(tmp_path):

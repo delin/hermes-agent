@@ -31,6 +31,9 @@ from task_fence import (
 _TASK_FENCE_V2_DDL_SHA256 = (
     "283bc43a083c97421e712fd29dfc802677558a35c75a890836831e1e3fdac847"
 )
+_TASK_FENCE_V3_DDL_SHA256 = (
+    "f6e4c0a1bd7b586a7793ced62cd2f9eb6f54ac2acebb50d780e509d00fe10d72"
+)
 
 
 def _hash(payload: str) -> str:
@@ -161,6 +164,7 @@ def _downgrade_current_store_to_exact_v2(
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DROP TABLE main.task_fence_policy_decisions")
         conn.execute(
             "DROP INDEX main.idx_task_fence_ingress_task_run_order"
         )
@@ -241,6 +245,60 @@ def _rewrite_exact_v2_row(
         raise
     finally:
         conn.close()
+
+
+def _downgrade_current_store_to_exact_v3(path) -> None:
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA foreign_keys=ON")
+    snapshot_trigger = conn.execute(
+        "SELECT sql FROM main.sqlite_master "
+        "WHERE type = 'trigger' "
+        "AND name = 'task_fence_acceptance_snapshots_no_update'"
+    ).fetchone()
+    assert snapshot_trigger is not None
+    assert isinstance(snapshot_trigger[0], str)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DROP TABLE main.task_fence_policy_decisions")
+        conn.execute(
+            "DROP TRIGGER main.task_fence_acceptance_snapshots_no_update"
+        )
+        conn.execute(
+            "UPDATE main.task_fence_acceptance_snapshots "
+            "SET task_store_schema_version = 3 "
+            "WHERE task_store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE main.task_fence_tasks SET store_schema_version = 3 "
+            "WHERE store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE main.task_fence_control SET store_schema_version = 3 "
+            "WHERE singleton = 1 AND store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(snapshot_trigger[0])
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v3_schema_objects()
+        assert _scalar(
+            check,
+            "SELECT store_schema_version FROM task_fence_control",
+        ) == 3
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        check.close()
 
 
 def _seed_started_generation_and_permit(
@@ -345,6 +403,15 @@ def test_archived_v2_migration_source_is_frozen() -> None:
             hermes_state.TASK_FENCE_SCHEMA_V2_SQL.encode("utf-8")
         ).hexdigest()
         == _TASK_FENCE_V2_DDL_SHA256
+    )
+
+
+def test_archived_v3_migration_source_is_frozen() -> None:
+    assert (
+        hashlib.sha256(
+            hermes_state.TASK_FENCE_SCHEMA_V3_SQL.encode("utf-8")
+        ).hexdigest()
+        == _TASK_FENCE_V3_DDL_SHA256
     )
 
 
@@ -1357,7 +1424,7 @@ def test_oversized_v2_migration_is_bounded_and_untouched(
         check.close()
 
 
-def test_concurrent_populated_v2_migrators_publish_only_complete_v3(
+def test_concurrent_populated_v2_migrators_publish_only_complete_current_schema(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1376,7 +1443,7 @@ def test_concurrent_populated_v2_migrators_publish_only_complete_v3(
     _downgrade_current_store_to_exact_v2(path, (initial, held))
 
     expected_v2 = hermes_state._expected_task_fence_v2_schema_objects()
-    expected_v3 = hermes_state._expected_task_fence_schema_objects()
+    expected_current = hermes_state._expected_task_fence_schema_objects()
     original_read = hermes_state._read_task_fence_schema_objects
     barrier = threading.Barrier(2)
     first_reads: set[int] = set()
@@ -1418,7 +1485,7 @@ def test_concurrent_populated_v2_migrators_publish_only_complete_v3(
     assert len(first_reads) == 2
     check = sqlite3.connect(path)
     try:
-        assert original_read(check) == expected_v3
+        assert original_read(check) == expected_current
     finally:
         check.close()
     verify = SessionDB(path)
@@ -1435,6 +1502,345 @@ def test_concurrent_populated_v2_migrators_publish_only_complete_v3(
         )
     finally:
         verify.close()
+
+
+def test_populated_exact_v3_migrates_to_v4_without_decision_backfill(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    history: list[tuple[IngressEnvelope, IngressAcceptance]] = []
+
+    initial_envelope = _envelope("initial_submit", "v3-initial")
+    initial = db.accept_task_fence_ingress(initial_envelope)
+    assert initial.task_id is not None
+    history.append((initial_envelope, initial))
+
+    held_envelope = _envelope(
+        "comment_hold",
+        "v3-held",
+        task_id=initial.task_id,
+    )
+    held = db.accept_task_fence_ingress(held_envelope)
+    history.append((held_envelope, held))
+
+    resumed_envelope = _envelope(
+        "change_and_run",
+        "v3-resumed",
+        task_id=initial.task_id,
+    )
+    resumed = db.accept_task_fence_ingress(resumed_envelope)
+    history.append((resumed_envelope, resumed))
+    db.close()
+
+    _downgrade_current_store_to_exact_v3(path)
+    migrated = SessionDB(path)
+    try:
+        inspection = migrated.inspect_task_fence_store(include_counts=True)
+        assert inspection.compatible is True
+        assert (
+            inspection.observed_store_schema_version
+            == TASK_FENCE_STORE_SCHEMA_VERSION
+        )
+        assert hermes_state._read_task_fence_schema_objects(
+            _connection(migrated)
+        ) == hermes_state._expected_task_fence_schema_objects()
+        assert _scalar(
+            _connection(migrated),
+            "SELECT COUNT(*) FROM task_fence_policy_decisions",
+        ) == 0
+        assert _scalar(
+            _connection(migrated),
+            "SELECT MIN(store_schema_version) FROM task_fence_tasks",
+        ) == TASK_FENCE_STORE_SCHEMA_VERSION
+        assert _scalar(
+            _connection(migrated),
+            "SELECT MAX(store_schema_version) FROM task_fence_tasks",
+        ) == TASK_FENCE_STORE_SCHEMA_VERSION
+
+        for envelope, acceptance in history:
+            historical_projection = acceptance.task_projection
+            assert historical_projection is not None
+            expected = replace(
+                acceptance,
+                task_projection=replace(
+                    historical_projection,
+                    store_schema_version=3,
+                ),
+                replayed=True,
+            )
+            assert migrated.accept_task_fence_ingress(envelope) == expected
+    finally:
+        migrated.close()
+
+
+def test_exact_v3_with_pre_journal_policy_lifecycle_is_left_untouched(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "v3-policy-lifecycle")
+    )
+    assert initial.task_id is not None
+    assert initial.opened_run_id is not None
+    _seed_started_generation_and_permit(
+        _connection(db),
+        task_id=initial.task_id,
+        run_id=initial.opened_run_id,
+        event_id=initial.event_id,
+    )
+    db.close()
+    _downgrade_current_store_to_exact_v3(path)
+
+    before = sqlite3.connect(path)
+    try:
+        state_before = _task_fence_table_state(before)
+    finally:
+        before.close()
+
+    rejected = SessionDB(path)
+    try:
+        inspection = rejected.inspect_task_fence_store()
+        assert inspection.compatible is False
+        assert inspection.reason == "unsupported_store_schema"
+        assert inspection.observed_store_schema_version == 3
+    finally:
+        rejected.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v3_schema_objects()
+        assert _task_fence_table_state(check) == state_before
+        assert _scalar(
+            check,
+            "SELECT COUNT(*) FROM task_fence_dispatch_permits",
+        ) == 1
+    finally:
+        check.close()
+
+
+def test_exact_v3_with_stale_cohort_generation_is_left_untouched(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db._conn.execute(
+        "INSERT INTO task_fence_cohorts ("
+        "cohort_key, mode, mode_generation, activation_state, "
+        "audit_degraded, created_at, updated_at"
+        ") VALUES ('stale-v3-cohort', 'audit', 1, 'inactive', 0, 1.0, 1.0)"
+    )
+    db.close()
+    _downgrade_current_store_to_exact_v3(path)
+
+    rejected = SessionDB(path)
+    try:
+        inspection = rejected.inspect_task_fence_store()
+        assert inspection.compatible is False
+        assert inspection.reason == "unsupported_store_schema"
+        assert inspection.observed_store_schema_version == 3
+    finally:
+        rejected.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v3_schema_objects()
+        assert _scalar(
+            check,
+            "SELECT store_schema_version FROM task_fence_control",
+        ) == 3
+        assert _scalar(
+            check,
+            "SELECT mode_generation FROM task_fence_cohorts "
+            "WHERE cohort_key = 'stale-v3-cohort'",
+        ) == 1
+    finally:
+        check.close()
+
+
+def test_oversized_v3_migration_is_bounded_and_untouched(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.accept_task_fence_ingress(
+        _envelope("initial_submit", "oversized-v3-initial")
+    )
+    db.close()
+    _downgrade_current_store_to_exact_v3(path)
+    monkeypatch.setattr(hermes_state, "_TASK_FENCE_MAX_V3_MIGRATION_ROWS", 1)
+
+    before = sqlite3.connect(path)
+    try:
+        state_before = _task_fence_table_state(before)
+    finally:
+        before.close()
+
+    rejected = SessionDB(path)
+    try:
+        inspection = rejected.inspect_task_fence_store()
+        assert inspection.compatible is False
+        assert inspection.observed_store_schema_version == 3
+    finally:
+        rejected.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v3_schema_objects()
+        assert _task_fence_table_state(check) == state_before
+    finally:
+        check.close()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("extension", "task_version", "control_version"),
+)
+def test_v3_migration_fault_rolls_back_exact_state(
+    tmp_path,
+    monkeypatch,
+    failure_stage: str,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", f"fault-v3-{failure_stage}")
+    )
+    assert initial.task_id is not None
+    db.close()
+    _downgrade_current_store_to_exact_v3(path)
+    objects_before = hermes_state._expected_task_fence_v3_schema_objects()
+    state_connection = sqlite3.connect(path)
+    try:
+        state_before = _task_fence_table_state(state_connection)
+    finally:
+        state_connection.close()
+
+    if failure_stage == "extension":
+        monkeypatch.setattr(
+            hermes_state,
+            "TASK_FENCE_SCHEMA_V4_EXTENSION_SQL",
+            hermes_state.TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
+            + "CREATE TABLE task_fence_v4_partial (value INTEGER);"
+            + "INVALID TASK FENCE V4;",
+        )
+        failed = SessionDB(path)
+        try:
+            assert failed._task_fence_schema_init_failed is True
+        finally:
+            failed.close()
+    else:
+        target = {
+            "task_version": "task_fence_tasks",
+            "control_version": "task_fence_control",
+        }[failure_stage]
+        probe = SessionDB.__new__(SessionDB)
+        probe._conn = sqlite3.connect(path, isolation_level=None)
+        probe._conn.row_factory = sqlite3.Row
+        probe._conn.execute("PRAGMA foreign_keys=ON")
+        probe._task_fence_schema_init_failed = False
+        probe._conn.execute(
+            "CREATE TEMP TRIGGER fail_task_fence_v3_migration "
+            f"BEFORE UPDATE ON main.{target} BEGIN "
+            "SELECT RAISE(ABORT, 'injected v3 migration failure'); END"
+        )
+        try:
+            probe._init_task_fence_schema()
+            assert probe._task_fence_schema_init_failed is True
+        finally:
+            probe._conn.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(check) == objects_before
+        assert _task_fence_table_state(check) == state_before
+        assert _scalar(
+            check,
+            "SELECT store_schema_version FROM task_fence_control",
+        ) == 3
+        assert check.execute(
+            "SELECT DISTINCT store_schema_version FROM task_fence_tasks"
+        ).fetchall() == [(3,)]
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        check.close()
+
+
+def test_concurrent_populated_v3_migrators_publish_only_complete_v4(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _envelope("initial_submit", "race-v3-initial")
+    )
+    assert initial.task_id is not None
+    db.accept_task_fence_ingress(
+        _envelope("comment_hold", "race-v3-held", task_id=initial.task_id)
+    )
+    db.close()
+    _downgrade_current_store_to_exact_v3(path)
+
+    expected_v3 = hermes_state._expected_task_fence_v3_schema_objects()
+    expected_v4 = hermes_state._expected_task_fence_schema_objects()
+    original_read = hermes_state._read_task_fence_schema_objects
+    barrier = threading.Barrier(2)
+    first_reads: set[int] = set()
+    reads_lock = threading.Lock()
+
+    def synchronized_read(conn):
+        observed = original_read(conn)
+        connection_id = id(conn)
+        should_wait = False
+        with reads_lock:
+            if (
+                observed == expected_v3
+                and not conn.in_transaction
+                and connection_id not in first_reads
+            ):
+                first_reads.add(connection_id)
+                should_wait = True
+        if should_wait:
+            barrier.wait(timeout=5)
+        return observed
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_read_task_fence_schema_objects",
+        synchronized_read,
+    )
+
+    def migrate() -> bool:
+        candidate = SessionDB(path)
+        try:
+            return candidate.inspect_task_fence_store().compatible
+        finally:
+            candidate.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(lambda _index: migrate(), range(2)))
+
+    assert results == (True, True)
+    assert len(first_reads) == 2
+    check = sqlite3.connect(path)
+    try:
+        assert original_read(check) == expected_v4
+        assert _scalar(
+            check,
+            "SELECT COUNT(*) FROM task_fence_policy_decisions",
+        ) == 0
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        check.close()
 
 
 def test_task_bound_and_taskless_advisory_snapshots_are_historical(
