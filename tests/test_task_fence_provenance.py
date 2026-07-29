@@ -832,6 +832,37 @@ def _prepare_real_conversation(
     agent.client.chat.completions.create.side_effect = _create
 
 
+def _prepare_bedrock_conversation(agent, *, streaming: bool) -> None:
+    endpoint = "https://bedrock-runtime.eu-west-1.amazonaws.com"
+    _prepare_real_conversation(agent, [])
+    agent.api_mode = "bedrock_converse"
+    agent.provider = "bedrock"
+    agent.model = "amazon.nova-test-v1:0"
+    agent.base_url = endpoint
+    agent._base_url_lower = endpoint.lower()
+    agent._base_url_hostname = "bedrock-runtime.eu-west-1.amazonaws.com"
+    agent._bedrock_region = "eu-west-1"
+    agent._bedrock_guardrail_config = None
+    agent._disable_streaming = not streaming
+    agent.stream_delta_callback = (
+        (lambda _delta: None) if streaming else None
+    )
+    agent.tools = []
+
+
+def _raw_bedrock_response(content: str) -> dict:
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": content}],
+            }
+        },
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+    }
+
+
 def test_real_conversation_records_generation_and_binds_emitted_tool(
     provenance_agent,
     registered_probe_tools,
@@ -1845,6 +1876,425 @@ def test_real_codex_midstream_retry_starts_before_each_responses_create(
             ]
         )
         assert request_secret not in audit_dump
+    finally:
+        db.close()
+
+
+def test_real_bedrock_nonstream_starts_before_converse(
+    provenance_agent,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    factories = []
+    calls = []
+    request_secret = "raw-bedrock-nonstream-real-path-secret"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-bedrock-nonstream")
+        )
+        provenance_agent._session_db = db
+        _prepare_bedrock_conversation(provenance_agent, streaming=False)
+
+        def converse(**kwargs):
+            envelope = current_causal_envelope()
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            calls.append(
+                (
+                    dict(kwargs),
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return _raw_bedrock_response("bedrock nonstream succeeded")
+
+        client = SimpleNamespace(converse=converse)
+
+        def get_client(region):
+            factories.append(
+                (
+                    region,
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return client
+
+        with (
+            patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                side_effect=get_client,
+            ),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                request_secret,
+                conversation_history=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": (
+                                        "data:image/png;base64,"
+                                        "YmluYXJ5LWltYWdl"
+                                    )
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "image context acknowledged",
+                    },
+                ],
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "bedrock nonstream succeeded"
+        assert len(factories) == 1
+        assert factories[0][0] == "eu-west-1"
+        assert factories[0][1].invocation_id is None
+        assert factories[0][2] is None
+        assert factories[0][3] is False
+        assert len(calls) == 1
+        request, envelope, state, ambient_policy, carries_authority = calls[0]
+        assert "__bedrock_converse__" not in request
+        assert "__bedrock_region__" not in request
+        assert any(
+            block.get("image", {}).get("source", {}).get("bytes")
+            == b"binary-image"
+            for message in request["messages"]
+            for block in message["content"]
+        )
+        assert envelope.invocation_id is not None
+        assert envelope.generation_id == factories[0][1].generation_id
+        assert state == "STARTED"
+        assert ambient_policy is None
+        assert carries_authority is False
+
+        route = {
+            "api_mode": "bedrock_converse",
+            "provider": "bedrock",
+            "model": provenance_agent.model,
+            "endpoint": provenance_agent.base_url,
+            "region": "eu-west-1",
+        }
+        expected = model_wire_fingerprint(
+            adapter="provider:bedrock.converse",
+            request=request,
+            route=route,
+        )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            ("admission", "provider:bedrock.converse", expected),
+            ("authorization", "provider:bedrock.converse", expected),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert request_secret not in audit_dump
+    finally:
+        db.close()
+
+
+def test_real_bedrock_stream_retry_starts_each_physical_handoff(
+    provenance_agent,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    calls = []
+    lifecycle = []
+    request_secret = "raw-bedrock-stream-real-path-secret"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-bedrock-stream")
+        )
+        provenance_agent._session_db = db
+        provenance_agent._api_max_retries = 2
+        _prepare_bedrock_conversation(provenance_agent, streaming=True)
+
+        class EventStream:
+            def __init__(self, *, fail):
+                self.fail = fail
+
+            def __iter__(self):
+                lifecycle.append(
+                    (
+                        self.fail,
+                        current_causal_envelope(),
+                        current_task_fence_policy(),
+                        _context_carries_task_fence_authority(),
+                    )
+                )
+                if self.fail:
+                    raise httpx.RemoteProtocolError(
+                        "Bedrock EventStream transport dropped"
+                    )
+                return iter(
+                    [
+                        {
+                            "contentBlockDelta": {
+                                "delta": {"text": "bedrock stream succeeded"}
+                            }
+                        },
+                        {"contentBlockStop": {}},
+                        {"messageStop": {"stopReason": "end_turn"}},
+                        {
+                            "metadata": {
+                                "usage": {
+                                    "inputTokens": 1,
+                                    "outputTokens": 1,
+                                }
+                            }
+                        },
+                    ]
+                )
+
+        def converse_stream(**kwargs):
+            envelope = current_causal_envelope()
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            calls.append(
+                (
+                    dict(kwargs),
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return {"stream": EventStream(fail=len(calls) == 1)}
+
+        client = SimpleNamespace(converse_stream=converse_stream)
+        with (
+            patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                return_value=client,
+            ),
+            patch("agent.conversation_loop.jittered_backoff", return_value=0),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "bedrock stream succeeded"
+        assert len(calls) == 2
+        assert all(entry[2] == "STARTED" for entry in calls)
+        assert all(entry[3] is None for entry in calls)
+        assert not any(entry[4] for entry in calls)
+        assert calls[0][0] == calls[1][0]
+        envelopes = [entry[1] for entry in calls]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert len({envelope.generation_id for envelope in envelopes}) == 2
+        assert [entry[0] for entry in lifecycle] == [True, False]
+        assert all(entry[1].invocation_id is None for entry in lifecycle)
+        assert all(entry[2] is None for entry in lifecycle)
+        assert not any(entry[3] for entry in lifecycle)
+        assert [
+            entry[1].generation_id for entry in lifecycle
+        ] == [
+            envelope.generation_id for envelope in envelopes
+        ]
+
+        expected = model_wire_fingerprint(
+            adapter="provider:bedrock.converse_stream",
+            request=calls[0][0],
+            route={
+                "api_mode": "bedrock_converse",
+                "provider": "bedrock",
+                "model": provenance_agent.model,
+                "endpoint": provenance_agent.base_url,
+                "region": "eu-west-1",
+            },
+        )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            ("admission", "provider:bedrock.converse_stream", expected),
+            ("authorization", "provider:bedrock.converse_stream", expected),
+            ("admission", "provider:bedrock.converse_stream", expected),
+            ("authorization", "provider:bedrock.converse_stream", expected),
+        ]
+        generations = db._conn.execute(
+            "SELECT generation_id, state, closed_at "
+            "FROM task_fence_model_generations ORDER BY opened_at"
+        ).fetchall()
+        assert [row["generation_id"] for row in generations] == [
+            envelope.generation_id for envelope in envelopes
+        ]
+        assert generations[0]["state"] == "failed"
+        assert generations[0]["closed_at"] is not None
+        assert generations[1]["state"] == "committed"
+        assert generations[1]["closed_at"] is None
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        assert request_secret not in "\n".join(db._conn.iterdump())
+    finally:
+        db.close()
+
+
+def test_real_bedrock_iam_fallback_starts_each_physical_handoff(
+    provenance_agent,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    calls = []
+    request_secret = "raw-bedrock-iam-fallback-secret"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-bedrock-iam-fallback")
+        )
+        provenance_agent._session_db = db
+        _prepare_bedrock_conversation(provenance_agent, streaming=True)
+
+        def record_handoff(adapter, kwargs):
+            envelope = current_causal_envelope()
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            calls.append(
+                (
+                    adapter,
+                    dict(kwargs),
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+
+        def converse_stream(**kwargs):
+            record_handoff("provider:bedrock.converse_stream", kwargs)
+            raise RuntimeError(
+                "not authorized to perform "
+                "bedrock:InvokeModelWithResponseStream"
+            )
+
+        def converse(**kwargs):
+            record_handoff("provider:bedrock.converse", kwargs)
+            return _raw_bedrock_response("bedrock IAM fallback succeeded")
+
+        client = SimpleNamespace(
+            converse_stream=converse_stream,
+            converse=converse,
+        )
+        with (
+            patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                return_value=client,
+            ),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "bedrock IAM fallback succeeded"
+        assert provenance_agent._disable_streaming is True
+        assert [entry[0] for entry in calls] == [
+            "provider:bedrock.converse_stream",
+            "provider:bedrock.converse",
+        ]
+        assert all(entry[3] == "STARTED" for entry in calls)
+        assert all(entry[4] is None for entry in calls)
+        assert not any(entry[5] for entry in calls)
+        envelopes = [entry[2] for entry in calls]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert len({envelope.generation_id for envelope in envelopes}) == 1
+        assert calls[0][1] == calls[1][1]
+
+        route = {
+            "api_mode": "bedrock_converse",
+            "provider": "bedrock",
+            "model": provenance_agent.model,
+            "endpoint": provenance_agent.base_url,
+            "region": "eu-west-1",
+        }
+        expected_rows = []
+        for adapter, request, *_rest in calls:
+            fingerprint = model_wire_fingerprint(
+                adapter=adapter,
+                request=request,
+                route=route,
+            )
+            expected_rows.extend(
+                [
+                    ("admission", adapter, fingerprint),
+                    ("authorization", adapter, fingerprint),
+                ]
+            )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == expected_rows
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        assert request_secret not in "\n".join(db._conn.iterdump())
     finally:
         db.close()
 

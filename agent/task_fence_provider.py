@@ -18,6 +18,46 @@ _LOCAL_ONLY_REQUEST_FIELDS = frozenset({
 })
 
 
+def _normalize_model_wire_value(
+    value: Any,
+    *,
+    path: tuple[tuple[str, Any], ...],
+    binary_frames: list[dict[str, Any]],
+) -> Any:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        payload = bytes(value)
+        binary = {
+            "__task_fence_binary__": {
+                "length": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        }
+        binary_frames.append({
+            "path": [list(segment) for segment in path],
+            **binary["__task_fence_binary__"],
+        })
+        return binary
+    if isinstance(value, Mapping):
+        return {
+            key: _normalize_model_wire_value(
+                value[key],
+                path=(*path, ("key", key)),
+                binary_frames=binary_frames,
+            )
+            for key in sorted(value)
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_model_wire_value(
+                item,
+                path=(*path, ("index", index)),
+                binary_frames=binary_frames,
+            )
+            for index, item in enumerate(value)
+        ]
+    return value
+
+
 @contextmanager
 def _without_task_fence_model_authority() -> Iterator[None]:
     from task_fence import bind_task_fence_policy
@@ -41,6 +81,16 @@ def model_wire_fingerprint(
         for key, value in request.items()
         if key not in _LOCAL_ONLY_REQUEST_FIELDS
     }
+    binary_frames: list[dict[str, Any]] = []
+    canonical_value = _normalize_model_wire_value(
+        {
+            "adapter": adapter,
+            "request": provider_request,
+            "route": dict(route),
+        },
+        path=(),
+        binary_frames=binary_frames,
+    )
     encoder = json.JSONEncoder(
         ensure_ascii=False,
         separators=(",", ":"),
@@ -49,12 +99,16 @@ def model_wire_fingerprint(
     )
     digest = hashlib.sha256()
     digest.update(b"task-fence-model-wire-v1\0")
-    for chunk in encoder.iterencode({
-        "adapter": adapter,
-        "request": provider_request,
-        "route": dict(route),
-    }):
+    for chunk in encoder.iterencode(canonical_value):
         digest.update(chunk.encode("utf-8", errors="surrogatepass"))
+    if binary_frames:
+        # The sidecar binds each binary value to its typed structural path.
+        # A user-supplied JSON object that resembles the display marker
+        # therefore cannot collide with actual provider bytes.
+        digest.update(b"\0task-fence-model-wire-binary-v1\0")
+        for frame in binary_frames:
+            for chunk in encoder.iterencode(frame):
+                digest.update(chunk.encode("utf-8", errors="surrogatepass"))
     return digest.hexdigest()
 
 

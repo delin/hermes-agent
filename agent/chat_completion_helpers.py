@@ -115,7 +115,20 @@ def _is_task_fence_supported_model_wire(agent) -> bool:
     return api_mode in {
         "chat_completions",
         "anthropic_messages",
+        "bedrock_converse",
         "codex_responses",
+    }
+
+
+def _task_fence_bedrock_route(agent, request: dict, region: str) -> dict:
+    return {
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+        "provider": str(getattr(agent, "provider", "") or ""),
+        "model": str(
+            request.get("modelId") or getattr(agent, "model", "") or ""
+        ),
+        "endpoint": str(getattr(agent, "base_url", "") or ""),
+        "region": str(region or ""),
     }
 
 
@@ -545,11 +558,19 @@ def _dispatch_nonstreaming_api_request(
             is_stale_connection_error,
             normalize_converse_response,
         )
+        from agent.task_fence_provider import task_fence_model_handoff
+
         region = api_kwargs.pop("__bedrock_region__", "us-east-1")
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
-            raw_response = client.converse(**api_kwargs)
+            with task_fence_model_handoff(
+                adapter="provider:bedrock.converse",
+                request=api_kwargs,
+                route=_task_fence_bedrock_route(agent, api_kwargs, region),
+                policy=task_fence_model_policy,
+            ):
+                raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
@@ -2556,11 +2577,23 @@ def interruptible_streaming_api_call(
                     normalize_converse_response,
                     stream_converse_with_callbacks,
                 )
+                from agent.task_fence_provider import task_fence_model_handoff
+
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
                 client = _get_bedrock_runtime_client(region)
                 try:
-                    raw_response = client.converse_stream(**api_kwargs)
+                    with task_fence_model_handoff(
+                        adapter="provider:bedrock.converse_stream",
+                        request=api_kwargs,
+                        route=_task_fence_bedrock_route(
+                            agent,
+                            api_kwargs,
+                            region,
+                        ),
+                        policy=task_fence_model_policy,
+                    ):
+                        raw_response = client.converse_stream(**api_kwargs)
                 except Exception as _bedrock_exc:
                     # IAM policies scoped to bedrock:InvokeModel only (no
                     # InvokeModelWithResponseStream) reject converse_stream()
@@ -2581,8 +2614,19 @@ def interruptible_streaming_api_call(
                             "using non-streaming converse() for this session.",
                             type(_bedrock_exc).__name__,
                         )
+                        with task_fence_model_handoff(
+                            adapter="provider:bedrock.converse",
+                            request=api_kwargs,
+                            route=_task_fence_bedrock_route(
+                                agent,
+                                api_kwargs,
+                                region,
+                            ),
+                            policy=task_fence_model_policy,
+                        ):
+                            fallback_response = client.converse(**api_kwargs)
                         result["response"] = normalize_converse_response(
-                            client.converse(**api_kwargs)
+                            fallback_response
                         )
                         return
                     # Evict the cached client on stale-connection failures

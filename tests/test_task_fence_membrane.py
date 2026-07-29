@@ -778,7 +778,14 @@ def test_openai_model_wire_ignores_public_tool_policy_without_explicit_capabilit
             True,
         ),
         ("codex_app_server", "openai-codex", "", False, False),
-        ("bedrock_converse", "bedrock", "", False, False),
+        ("bedrock_converse", "bedrock", "", False, True),
+        (
+            "bedrock_converse",
+            "",
+            "https://bedrock-runtime.eu-west-1.amazonaws.com",
+            False,
+            True,
+        ),
         ("chat_completions", "moa", "https://virtual.invalid/v1", False, False),
         ("chat_completions", "copilot-acp", "acp://copilot", False, False),
         (
@@ -790,7 +797,7 @@ def test_openai_model_wire_ignores_public_tool_policy_without_explicit_capabilit
         ),
     ],
 )
-def test_openai_model_wire_ownership_excludes_non_sdk_facades(
+def test_model_wire_ownership_excludes_non_sdk_facades(
     api_mode,
     provider,
     base_url,
@@ -810,6 +817,203 @@ def test_openai_model_wire_ownership_excludes_non_sdk_facades(
 
     assert _is_task_fence_openai_chat_wire(agent) is openai_owned
     assert _is_task_fence_supported_model_wire(agent) is supported
+
+
+def test_model_wire_fingerprint_commits_binary_payloads():
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    route = {
+        "api_mode": "bedrock_converse",
+        "provider": "bedrock",
+        "model": "amazon.nova-test-v1:0",
+        "endpoint": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "region": "us-east-1",
+    }
+
+    def fingerprint(payload):
+        return model_wire_fingerprint(
+            adapter="provider:bedrock.converse",
+            request={
+                "modelId": route["model"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "image": {
+                                    "format": "png",
+                                    "source": {"bytes": payload},
+                                }
+                            }
+                        ],
+                    }
+                ],
+            },
+            route=route,
+        )
+
+    payload = b"binary-image-a"
+    assert fingerprint(payload) == fingerprint(bytearray(payload))
+    assert fingerprint(payload) != fingerprint(b"binary-image-b")
+    assert fingerprint(payload) != fingerprint(
+        {
+            "__task_fence_binary__": {
+                "length": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        }
+    )
+
+
+def test_bedrock_converse_requires_explicit_model_capability(tmp_path):
+    from agent.chat_completion_helpers import (
+        _dispatch_nonstreaming_api_request,
+    )
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    observed = []
+    raw_response = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": "legacy bedrock response"}],
+            }
+        },
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+    }
+
+    def converse(**kwargs):
+        observed.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+            )
+        )
+        return raw_response
+
+    client = SimpleNamespace(converse=converse)
+    agent = SimpleNamespace(
+        api_mode="bedrock_converse",
+        provider="bedrock",
+        model="amazon.nova-test-v1:0",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    request = {
+        "modelId": agent.model,
+        "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+        "__bedrock_converse__": True,
+        "__bedrock_region__": "us-east-1",
+    }
+    try:
+        with (
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            bind_causal_envelope(generation),
+            patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                return_value=client,
+            ),
+        ):
+            response = _dispatch_nonstreaming_api_request(
+                agent,
+                request,
+                make_client=lambda *_args, **_kwargs: pytest.fail(
+                    "Bedrock must not build an OpenAI client"
+                ),
+            )
+
+        assert response.choices[0].message.content == "legacy bedrock response"
+        assert observed == [
+            (
+                {
+                    "modelId": agent.model,
+                    "messages": [
+                        {"role": "user", "content": [{"text": "hello"}]}
+                    ],
+                },
+                generation,
+                None,
+            )
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_bedrock_nonstream_stale_error_preserves_legacy_failure(tmp_path):
+    from agent.chat_completion_helpers import (
+        _dispatch_nonstreaming_api_request,
+    )
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    stale_error = RuntimeError("sentinel stale Bedrock connection")
+    observed = []
+
+    def converse(**kwargs):
+        observed.append(dict(kwargs))
+        raise stale_error
+
+    client = SimpleNamespace(converse=converse)
+    agent = SimpleNamespace(
+        api_mode="bedrock_converse",
+        provider="bedrock",
+        model="amazon.nova-test-v1:0",
+        base_url="https://bedrock-runtime.ap-south-1.amazonaws.com",
+    )
+    request = {
+        "modelId": agent.model,
+        "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+        "__bedrock_converse__": True,
+        "__bedrock_region__": "ap-south-1",
+    }
+    try:
+        with (
+            bind_causal_envelope(generation),
+            patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                return_value=client,
+            ),
+            patch(
+                "agent.bedrock_adapter.is_stale_connection_error",
+                return_value=True,
+            ) as classify,
+            patch(
+                "agent.bedrock_adapter.invalidate_runtime_client",
+            ) as invalidate,
+        ):
+            with pytest.raises(RuntimeError) as raised:
+                _dispatch_nonstreaming_api_request(
+                    agent,
+                    request,
+                    make_client=lambda *_args, **_kwargs: pytest.fail(
+                        "Bedrock must not build an OpenAI client"
+                    ),
+                    task_fence_model_policy=policy,
+                )
+
+        assert raised.value is stale_error
+        assert observed == [
+            {
+                "modelId": agent.model,
+                "messages": [
+                    {"role": "user", "content": [{"text": "hello"}]}
+                ],
+            }
+        ]
+        classify.assert_called_once_with(stale_error)
+        invalidate.assert_called_once_with("ap-south-1")
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
 
 
 def test_gemini_native_nonstream_starts_before_http_handoff(tmp_path):
