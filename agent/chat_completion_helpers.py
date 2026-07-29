@@ -69,17 +69,82 @@ def _ra():
 
 
 def _bind_task_fence_worker(target: Callable[[], Any]) -> Callable[[], Any]:
-    """Copy only the immutable Task Fence envelope into a provider thread."""
+    """Copy only immutable provenance into a provider thread."""
 
-    from task_fence import bind_causal_envelope, current_causal_envelope
+    from task_fence import (
+        bind_causal_envelope,
+        bind_task_fence_policy,
+        current_causal_envelope,
+    )
 
     envelope = current_causal_envelope()
 
     def _bound() -> Any:
-        with bind_causal_envelope(envelope):
+        with (
+            bind_causal_envelope(envelope),
+            bind_task_fence_policy(None),
+        ):
             return target()
 
     return _bound
+
+
+def _is_task_fence_openai_chat_wire(agent) -> bool:
+    """Return whether ``chat.completions.create`` is the real in-process wire."""
+
+    if getattr(agent, "api_mode", None) != "chat_completions":
+        return False
+    if getattr(agent, "provider", None) in {"moa", "copilot-acp"}:
+        return False
+    base_url = str(getattr(agent, "base_url", "") or "")
+    if base_url.lower().startswith(("acp://", "acp+tcp://")):
+        return False
+    return not is_native_gemini_base_url(base_url)
+
+
+def _is_task_fence_wp63a_model_wire(agent) -> bool:
+    if getattr(agent, "api_mode", None) != "chat_completions":
+        return False
+    if getattr(agent, "provider", None) in {"moa", "copilot-acp"}:
+        return False
+    base_url = str(getattr(agent, "base_url", "") or "")
+    return not base_url.lower().startswith(("acp://", "acp+tcp://"))
+
+
+def _create_openai_chat_completion(
+    agent,
+    request_client,
+    api_kwargs: dict,
+    *,
+    task_fence_model_policy=None,
+):
+    """Call one exact OpenAI-compatible SDK handoff in shadow audit scope."""
+
+    if is_native_gemini_base_url(getattr(agent, "base_url", None)):
+        if task_fence_model_policy is None:
+            return request_client.chat.completions.create(**api_kwargs)
+        native_kwargs = dict(api_kwargs)
+        native_kwargs["_task_fence_model_policy"] = task_fence_model_policy
+        return request_client.chat.completions.create(**native_kwargs)
+    if not _is_task_fence_openai_chat_wire(agent):
+        return request_client.chat.completions.create(**api_kwargs)
+
+    from agent.task_fence_provider import task_fence_model_handoff
+
+    adapter = "provider:openai.chat.completions.create"
+    route = {
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+        "provider": str(getattr(agent, "provider", "") or ""),
+        "model": str(api_kwargs.get("model") or getattr(agent, "model", "") or ""),
+        "endpoint": str(getattr(agent, "base_url", "") or ""),
+    }
+    with task_fence_model_handoff(
+        adapter=adapter,
+        request=api_kwargs,
+        route=route,
+        policy=task_fence_model_policy,
+    ):
+        return request_client.chat.completions.create(**api_kwargs)
 
 
 def estimate_request_context_tokens(api_payload: Any) -> int:
@@ -408,7 +473,13 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+def _dispatch_nonstreaming_api_request(
+    agent,
+    api_kwargs: dict,
+    *,
+    make_client,
+    task_fence_model_policy=None,
+):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by the interrupt-worker path (``interruptible_api_call``) and the
@@ -468,7 +539,12 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    return _create_openai_chat_completion(
+        agent,
+        request_client,
+        api_kwargs,
+        task_fence_model_policy=task_fence_model_policy,
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -515,7 +591,7 @@ def should_use_direct_api_call(agent) -> bool:
     return getattr(agent, "platform", None) == "subagent"
 
 
-def direct_api_call(agent, api_kwargs: dict):
+def direct_api_call(agent, api_kwargs: dict, *, task_fence_model_policy=None):
     """Run a non-streaming LLM call inline on the conversation thread.
 
     Used when ``should_use_direct_api_call`` is True (cron turns and
@@ -551,7 +627,10 @@ def direct_api_call(agent, api_kwargs: dict):
 
     try:
         response = _dispatch_nonstreaming_api_request(
-            agent, api_kwargs, make_client=_make_client
+            agent,
+            api_kwargs,
+            make_client=_make_client,
+            task_fence_model_policy=task_fence_model_policy,
         )
     except Exception:
         if getattr(agent, "_interrupt_requested", False):
@@ -572,7 +651,12 @@ def direct_api_call(agent, api_kwargs: dict):
             agent._close_request_openai_client(request_client, reason="request_complete")
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    task_fence_model_policy=None,
+):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -590,7 +674,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        return direct_api_call(
+            agent,
+            api_kwargs,
+            task_fence_model_policy=task_fence_model_policy,
+        )
 
     result = {"response": None, "error": None}
 
@@ -682,6 +770,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     ),
                     kind=kind,
                 ),
+                task_fence_model_policy=task_fence_model_policy,
             )
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
@@ -2345,7 +2434,13 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+    task_fence_model_policy=None,
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2371,7 +2466,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # branch below — routing through the _interruptible_api_call method keeps the
     # outer loop's per-request retry/refresh seam intact.
     if should_use_direct_api_call(agent):
-        return agent._interruptible_api_call(api_kwargs)
+        if task_fence_model_policy is None:
+            return agent._interruptible_api_call(api_kwargs)
+        return agent._interruptible_api_call(
+            api_kwargs,
+            _task_fence_model_policy=task_fence_model_policy,
+        )
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
@@ -2380,7 +2480,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # temporarily so _run_codex_stream can pick it up.
         agent._codex_on_first_delta = on_first_delta
         try:
-            return agent._interruptible_api_call(api_kwargs)
+            if task_fence_model_policy is None:
+                return agent._interruptible_api_call(api_kwargs)
+            return agent._interruptible_api_call(
+                api_kwargs,
+                _task_fence_model_policy=task_fence_model_policy,
+            )
         finally:
             agent._codex_on_first_delta = None
 
@@ -2844,7 +2949,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
+        stream = _create_openai_chat_completion(
+            agent,
+            request_client,
+            stream_kwargs,
+            task_fence_model_policy=task_fence_model_policy,
+        )
         if agent.provider == "moa":
             # The MoA facade is a shared singleton — abort/close of the
             # registered client is a no-op, so register the stream handle

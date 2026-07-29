@@ -5282,10 +5282,19 @@ class AIAgent:
                 drop_context_1m_beta=_drop_1m,
             )
 
-    def _interruptible_api_call(self, api_kwargs: dict):
+    def _interruptible_api_call(
+        self,
+        api_kwargs: dict,
+        *,
+        _task_fence_model_policy=None,
+    ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
         from agent.chat_completion_helpers import interruptible_api_call
-        return interruptible_api_call(self, api_kwargs)
+        return interruptible_api_call(
+            self,
+            api_kwargs,
+            task_fence_model_policy=_task_fence_model_policy,
+        )
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -5693,11 +5702,20 @@ class AIAgent:
         )
 
     def _interruptible_streaming_api_call(
-        self, api_kwargs: dict, *, on_first_delta: callable = None
+        self,
+        api_kwargs: dict,
+        *,
+        on_first_delta: callable = None,
+        _task_fence_model_policy=None,
     ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
         from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
+        return interruptible_streaming_api_call(
+            self,
+            api_kwargs,
+            on_first_delta=on_first_delta,
+            task_fence_model_policy=_task_fence_model_policy,
+        )
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""

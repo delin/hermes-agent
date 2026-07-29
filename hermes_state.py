@@ -7496,6 +7496,7 @@ class SessionDB:
         run_id: str,
         expected_hash: str,
         allowed_states: frozenset[str],
+        require_uniform_state: bool = False,
     ) -> Tuple[str, ...] | _TaskFenceIngressFailure:
         inputs = self._task_fence_run_inputs_unlocked(
             conn,
@@ -7505,8 +7506,10 @@ class SessionDB:
         if isinstance(inputs, _TaskFenceIngressFailure):
             return inputs
         input_ids = tuple(input_id for input_id, _state in inputs)
+        input_states = frozenset(state for _input_id, state in inputs)
         if (
             any(state not in allowed_states for _input_id, state in inputs)
+            or (require_uniform_state and len(input_states) > 1)
             or self._task_fence_input_manifest_hash(input_ids) != expected_hash
         ):
             return _TaskFenceIngressFailure(
@@ -8435,14 +8438,19 @@ class SessionDB:
             (envelope.task_id,),
         ).fetchone() is not None:
             return DecisionReason.NEWER_INPUT_PENDING
+        is_model_operation = operation.kind.value == "model"
+        allowed_input_states = (
+            frozenset({"bound", "presented"})
+            if is_model_operation
+            else frozenset({"presented"})
+        )
         exact_run_inputs = self._task_fence_exact_run_input_ids_unlocked(
             conn,
             task_id=envelope.task_id,
             run_id=envelope.run_id,
             expected_hash=envelope.input_manifest_hash,
-            allowed_states=frozenset(
-                {"bound" if operation.kind.value == "model" else "presented"}
-            ),
+            allowed_states=allowed_input_states,
+            require_uniform_state=is_model_operation,
         )
         if isinstance(exact_run_inputs, _TaskFenceIngressFailure):
             raise sqlite3.IntegrityError(exact_run_inputs.reason)

@@ -1,3 +1,4 @@
+from contextvars import copy_context
 from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
@@ -8,6 +9,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from hermes_state import SessionDB
@@ -32,6 +34,13 @@ from task_fence import (
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _context_carries_task_fence_authority() -> bool:
+    return any(
+        isinstance(value, (SessionDB, TaskFencePolicy))
+        for _variable, value in copy_context().items()
+    )
 
 
 def _ingress(
@@ -107,6 +116,26 @@ def _model_response(
     )
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _stream_chunk(
+    *,
+    content: str | None,
+    finish_reason: str | None,
+    model: str = "test/model",
+) -> SimpleNamespace:
+    delta = SimpleNamespace(
+        content=content,
+        tool_calls=None,
+        reasoning_content=None,
+        reasoning=None,
+    )
+    choice = SimpleNamespace(
+        index=0,
+        delta=delta,
+        finish_reason=finish_reason,
+    )
+    return SimpleNamespace(choices=[choice], model=model, usage=None)
 
 
 def test_causal_envelope_is_frozen_canonical_and_context_scoped():
@@ -780,6 +809,7 @@ def _prepare_real_conversation(
     *,
     provider_observed=None,
     provider_inspect=None,
+    provider_requests=None,
 ) -> None:
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
@@ -793,6 +823,8 @@ def _prepare_real_conversation(
         envelope = current_causal_envelope()
         if provider_observed is not None:
             provider_observed.append(envelope)
+        if provider_requests is not None:
+            provider_requests.append(dict(_kwargs))
         if callable(provider_inspect):
             provider_inspect(envelope)
         return next(response_iter)
@@ -808,6 +840,8 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
     names, _, observed, probe = registered_probe_tools
     provider_observed = []
     provider_states = []
+    provider_requests = []
+    request_secret = "raw-provider-prompt-must-not-be-durable"
     db = SessionDB(tmp_path / "state.db")
     try:
         acceptance = db.accept_task_fence_ingress(
@@ -835,6 +869,11 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
             assert row is not None
             return (*tuple(row), None if attempt is None else attempt["state"])
 
+        def inspect_provider_generation(envelope):
+            assert current_task_fence_policy() is None
+            assert _context_carries_task_fence_authority() is False
+            return inspect_generation(envelope)
+
         probe["inspect"] = inspect_generation
         _prepare_real_conversation(
             provenance_agent,
@@ -851,8 +890,9 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
                 ),
             ],
             provider_observed=provider_observed,
+            provider_requests=provider_requests,
             provider_inspect=lambda envelope: provider_states.append(
-                inspect_generation(envelope)
+                inspect_provider_generation(envelope)
             ),
         )
 
@@ -862,7 +902,7 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
             patch.object(provenance_agent, "_cleanup_task_resources"),
         ):
             result = provenance_agent.run_conversation(
-                "do the recorded task",
+                request_secret,
                 task_fence_acceptance=acceptance,
             )
 
@@ -902,18 +942,22 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
         }
         assert len(provider_observed) == 2
         assert all(item is not None for item in provider_observed)
-        assert all(item.invocation_id is None for item in provider_observed)
+        assert all(item.invocation_id is not None for item in provider_observed)
+        assert len({item.invocation_id for item in provider_observed}) == 2
+        assert all(
+            item.parent_invocation_id is None for item in provider_observed
+        )
         assert provider_states[0] == (
             "started",
             None,
             provider_observed[0].generation_id,
-            None,
+            "STARTED",
         )
         assert provider_states[1] == (
             "started",
             None,
             provider_observed[1].generation_id,
-            None,
+            "STARTED",
         )
         assert provider_observed[0].generation_id == invocation.generation_id
         assert provider_observed[1].generation_id != invocation.generation_id
@@ -928,6 +972,20 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
                 "admission",
                 DecisionOutcome.WOULD_RESERVE.value,
                 "current_authority",
+                "model",
+                "provider:openai.chat.completions.create",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                "current_authority",
+                "model",
+                "provider:openai.chat.completions.create",
+            ),
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                "current_authority",
                 "tool",
                 f"registry:{names[0]}",
             ),
@@ -938,7 +996,63 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
                 "tool",
                 f"registry:{names[0]}",
             ),
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                "current_authority",
+                "model",
+                "provider:openai.chat.completions.create",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                "current_authority",
+                "model",
+                "provider:openai.chat.completions.create",
+            ),
         ]
+
+        from agent.task_fence_provider import model_wire_fingerprint
+
+        route = {
+            "api_mode": str(provenance_agent.api_mode or ""),
+            "provider": str(provenance_agent.provider or ""),
+            "model": str(provenance_agent.model or ""),
+            "endpoint": str(provenance_agent.base_url or ""),
+        }
+        model_decisions = db._conn.execute(
+            "SELECT invocation_fingerprint FROM task_fence_policy_decisions "
+            "WHERE operation_kind = 'model' ORDER BY decision_order"
+        ).fetchall()
+        assert [row["invocation_fingerprint"] for row in model_decisions] == [
+            expected
+            for request in provider_requests
+            for expected in (
+                model_wire_fingerprint(
+                    adapter="provider:openai.chat.completions.create",
+                    request=request,
+                    route={
+                        **route,
+                        "model": str(
+                            request.get("model") or provenance_agent.model or ""
+                        ),
+                    },
+                ),
+            )
+            for _ in range(2)
+        ]
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert request_secret not in audit_dump
 
         held = db.accept_task_fence_ingress(
             _ingress("comment_hold", "event-after-real", task_id=acceptance.task_id)
@@ -950,6 +1064,510 @@ def test_real_conversation_records_generation_and_binds_emitted_tool(
             "WHERE closed_at IS NULL"
         ).fetchone()[0] == 0
         assert current_causal_envelope() is None
+    finally:
+        db.close()
+
+
+def test_real_stream_retry_records_one_model_attempt_per_sdk_handoff(
+    provenance_agent,
+    monkeypatch,
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    entries = []
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-stream-wire-retry")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(provenance_agent, [])
+        provenance_agent._disable_streaming = False
+        provenance_agent.stream_delta_callback = lambda _delta: None
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        outcomes = iter(
+            [
+                httpx.RemoteProtocolError("stream transport dropped"),
+                _model_response(
+                    content="stream retry succeeded",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+
+        def create(**kwargs):
+            envelope = current_causal_envelope()
+            assert current_task_fence_policy() is None
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            entries.append((envelope, attempt["state"], dict(kwargs)))
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        provenance_agent.client.chat.completions.create.side_effect = create
+
+        with (
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                "retry the same physical stream",
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "stream retry succeeded"
+        assert len(entries) == 2
+        envelopes = [entry[0] for entry in entries]
+        assert {entry[1] for entry in entries} == {"STARTED"}
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert len({envelope.generation_id for envelope in envelopes}) == 1
+        assert {envelope.parent_invocation_id for envelope in envelopes} == {None}
+        assert entries[0][2]["stream"] is True
+        assert entries[1][2]["stream"] is True
+
+        model_decisions = db._conn.execute(
+            "SELECT decision_point, outcome, invocation_fingerprint "
+            "FROM task_fence_policy_decisions "
+            "WHERE operation_kind = 'model' ORDER BY decision_order"
+        ).fetchall()
+        assert [
+            (row["decision_point"], row["outcome"])
+            for row in model_decisions
+        ] == [
+            ("admission", DecisionOutcome.WOULD_RESERVE.value),
+            ("authorization", DecisionOutcome.WOULD_ALLOW.value),
+            ("admission", DecisionOutcome.WOULD_RESERVE.value),
+            ("authorization", DecisionOutcome.WOULD_ALLOW.value),
+        ]
+        assert len(
+            {row["invocation_fingerprint"] for row in model_decisions}
+        ) == 1
+        attempts = db._conn.execute(
+            "SELECT p.invocation_envelope_id, a.state "
+            "FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id ORDER BY a.started_at"
+        ).fetchall()
+        assert {row["invocation_envelope_id"] for row in attempts} == {
+            envelope.invocation_id for envelope in envelopes
+        }
+        assert {row["state"] for row in attempts} == {"STARTED"}
+    finally:
+        db.close()
+
+
+def test_real_openai_stream_worker_keeps_policy_out_of_sdk_lifecycle(
+    provenance_agent,
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    observed = {
+        "factory": [],
+        "create": [],
+        "iterate": [],
+        "close": [],
+    }
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-stream-policy-isolation")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(provenance_agent, [])
+        provenance_agent._disable_streaming = False
+        provenance_agent.stream_delta_callback = lambda _delta: None
+
+        class Stream:
+            def __init__(self):
+                self._chunks = iter(
+                    [
+                        _stream_chunk(
+                            content="isolated stream",
+                            finish_reason="stop",
+                        )
+                    ]
+                )
+
+            def __iter__(self):
+                observed["iterate"].append(
+                    (
+                        "iter",
+                        current_task_fence_policy(),
+                        _context_carries_task_fence_authority(),
+                    )
+                )
+                return self
+
+            def __next__(self):
+                observed["iterate"].append(
+                    (
+                        "next",
+                        current_task_fence_policy(),
+                        _context_carries_task_fence_authority(),
+                    )
+                )
+                return next(self._chunks)
+
+        def create(**_kwargs):
+            envelope = current_causal_envelope()
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+            observed["create"].append(
+                (
+                    current_task_fence_policy(),
+                    envelope,
+                    attempt["state"],
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return Stream()
+
+        def make_client(*, reason, api_kwargs=None):
+            observed["factory"].append(
+                (
+                    reason,
+                    api_kwargs,
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return provenance_agent.client
+
+        def close_client(_client, *, reason):
+            observed["close"].append(
+                (
+                    reason,
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+
+        provenance_agent.client.chat.completions.create.side_effect = create
+
+        with (
+            patch.object(
+                provenance_agent,
+                "_create_request_openai_client",
+                side_effect=make_client,
+            ),
+            patch.object(
+                provenance_agent,
+                "_close_request_openai_client",
+                side_effect=close_client,
+            ),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                "stream without lending audit authority",
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "isolated stream"
+        assert len(observed["factory"]) == 1
+        assert observed["factory"][0][2] is None
+        assert observed["factory"][0][3] is False
+        assert len(observed["create"]) == 1
+        assert observed["create"][0][0] is None
+        assert observed["create"][0][1].invocation_id is not None
+        assert observed["create"][0][2] == "STARTED"
+        assert observed["create"][0][3] is False
+        assert observed["iterate"] == [
+            ("iter", None, False),
+            ("next", None, False),
+            ("next", None, False),
+        ]
+        assert observed["close"] == [
+            ("stream_request_complete", None, False)
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_real_native_gemini_stream_uses_worker_carrier_at_http_open(
+    provenance_agent,
+    tmp_path,
+):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    db = SessionDB(tmp_path / "state.db")
+    observed = []
+
+    class StreamResponse:
+        status_code = 200
+
+        @staticmethod
+        def iter_text():
+            payload = {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "gemini worker"}]},
+                        "finishReason": "STOP",
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    class StreamContext:
+        def __enter__(self):
+            envelope = current_causal_envelope()
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+            observed.append(
+                (
+                    "open",
+                    current_task_fence_policy(),
+                    envelope,
+                    attempt["state"],
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return StreamResponse()
+
+        def __exit__(self, *_args):
+            observed.append(
+                (
+                    "close",
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return False
+
+    class HTTP:
+        def stream(self, method, url, *, json, headers, timeout):
+            assert method == "POST"
+            assert url.endswith(":streamGenerateContent?alt=sse")
+            assert json["contents"][0]["parts"][0]["text"]
+            return StreamContext()
+
+        def close(self):
+            return None
+
+    native_client = GeminiNativeClient(
+        api_key="test-key",
+        http_client=HTTP(),
+    )
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-gemini-worker")
+        )
+        provenance_agent._session_db = db
+        provenance_agent.provider = "gemini"
+        provenance_agent.base_url = native_client.base_url
+        provenance_agent.model = "gemini-2.5-flash"
+        _prepare_real_conversation(provenance_agent, [])
+        provenance_agent.client = native_client
+        provenance_agent._disable_streaming = False
+        provenance_agent.stream_delta_callback = lambda _delta: None
+
+        with (
+            patch.object(
+                provenance_agent,
+                "_create_request_openai_client",
+                return_value=native_client,
+            ),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                "stream through native Gemini",
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "gemini worker"
+        assert [entry[0] for entry in observed] == ["open", "close"]
+        assert observed[0][1] is None
+        assert observed[0][2].invocation_id is not None
+        assert observed[0][3] == "STARTED"
+        assert observed[0][4] is False
+        assert observed[1] == ("close", None, False)
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, adapter "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            ("admission", "provider:gemini.streamGenerateContent"),
+            ("authorization", "provider:gemini.streamGenerateContent"),
+        ]
+    finally:
+        native_client.close()
+        db.close()
+
+
+def test_real_provider_fallback_rebuilds_model_handoff_provenance(
+    provenance_agent,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    entries = []
+    fallback_client = MagicMock()
+    fallback_client.base_url = "https://fallback.example/v1"
+    fallback_client.api_key = "fallback-key"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-provider-fallback")
+        )
+        provenance_agent._session_db = db
+        provenance_agent.model = "primary/model"
+        provenance_agent._api_max_retries = 2
+        provenance_agent._fallback_chain = [
+            {
+                "provider": "custom",
+                "model": "fallback/model",
+                "base_url": fallback_client.base_url,
+                "api_key": fallback_client.api_key,
+            }
+        ]
+        provenance_agent._fallback_index = 0
+        _prepare_real_conversation(provenance_agent, [])
+
+        invalid = SimpleNamespace(
+            choices=[],
+            model=provenance_agent.model,
+            usage=None,
+        )
+
+        def record_entry(response):
+            def create(**kwargs):
+                envelope = current_causal_envelope()
+                assert current_task_fence_policy() is None
+                with db._lock:
+                    attempt = db._conn.execute(
+                        "SELECT a.state FROM task_fence_attempts AS a "
+                        "JOIN task_fence_dispatch_permits AS p "
+                        "ON p.permit_id = a.permit_id "
+                        "WHERE p.invocation_envelope_id = ?",
+                        (envelope.invocation_id,),
+                    ).fetchone()
+                entries.append(
+                    (
+                        envelope,
+                        attempt["state"],
+                        dict(kwargs),
+                        {
+                            "api_mode": str(provenance_agent.api_mode or ""),
+                            "provider": str(provenance_agent.provider or ""),
+                            "model": str(kwargs.get("model") or ""),
+                            "endpoint": str(provenance_agent.base_url or ""),
+                        },
+                    )
+                )
+                return response
+
+            return create
+
+        provenance_agent.client.chat.completions.create.side_effect = record_entry(
+            invalid
+        )
+        fallback_client.chat.completions.create.side_effect = record_entry(
+            _model_response(
+                content="fallback succeeded",
+                tool_calls=None,
+                finish_reason="stop",
+            )
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "fallback/model"),
+            ),
+            patch("agent.credential_pool.load_pool", return_value=None),
+            patch("agent.model_metadata.get_model_context_length", return_value=131072),
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                "fall back without losing provenance",
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "fallback succeeded"
+        assert len(entries) == 2
+        assert [entry[1] for entry in entries] == ["STARTED", "STARTED"]
+        assert entries[0][3]["provider"] != entries[1][3]["provider"]
+        assert entries[0][3]["model"] == "primary/model"
+        assert entries[1][3] == {
+            "api_mode": "chat_completions",
+            "provider": "custom",
+            "model": "fallback/model",
+            "endpoint": fallback_client.base_url,
+        }
+        assert entries[0][0].generation_id != entries[1][0].generation_id
+        assert entries[0][0].invocation_id != entries[1][0].invocation_id
+
+        decisions = db._conn.execute(
+            "SELECT decision_point, invocation_fingerprint "
+            "FROM task_fence_policy_decisions "
+            "WHERE operation_kind = 'model' ORDER BY decision_order"
+        ).fetchall()
+        assert [row["decision_point"] for row in decisions] == [
+            "admission",
+            "authorization",
+            "admission",
+            "authorization",
+        ]
+        expected_fingerprints = [
+            model_wire_fingerprint(
+                adapter="provider:openai.chat.completions.create",
+                request=request,
+                route=route,
+            )
+            for _, _, request, route in entries
+            for _ in range(2)
+        ]
+        assert [row["invocation_fingerprint"] for row in decisions] == (
+            expected_fingerprints
+        )
+        assert len(set(expected_fingerprints)) == 2
+
+        generations = db._conn.execute(
+            "SELECT generation_id, state, closed_at "
+            "FROM task_fence_model_generations ORDER BY opened_at"
+        ).fetchall()
+        assert [row["generation_id"] for row in generations] == [
+            entries[0][0].generation_id,
+            entries[1][0].generation_id,
+        ]
+        assert generations[0]["state"] == "failed"
+        assert generations[0]["closed_at"] is not None
+        assert generations[1]["state"] == "committed"
+        assert generations[1]["closed_at"] is None
     finally:
         db.close()
 
@@ -1178,6 +1796,7 @@ def test_stale_acceptance_fails_open_without_rebasing_generation(
     tmp_path,
 ):
     db = SessionDB(tmp_path / "state.db")
+    provider_observed = []
     try:
         stale = db.accept_task_fence_ingress(
             _ingress("initial_submit", "event-stale")
@@ -1195,6 +1814,7 @@ def test_stale_acceptance_fails_open_without_rebasing_generation(
                     finish_reason="stop",
                 )
             ],
+            provider_observed=provider_observed,
         )
 
         with (
@@ -1209,8 +1829,26 @@ def test_stale_acceptance_fails_open_without_rebasing_generation(
 
         assert result["completed"] is True
         assert result["final_response"] == "legacy result"
+        assert provider_observed == [None]
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_model_generations"
+        ).fetchone()[0] == 0
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, outcome, reason_code, operation_kind "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_BLOCK.value,
+                "missing_provenance",
+                "model",
+            )
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 0
     finally:
         db.close()

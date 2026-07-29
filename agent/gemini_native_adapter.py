@@ -22,6 +22,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -987,6 +988,7 @@ class GeminiNativeClient:
         stop: Any = None,
         extra_body: Optional[Dict[str, Any]] = None,
         timeout: Any = None,
+        _task_fence_model_policy: Any = None,
         **_: Any,
     ) -> Any:
         thinking_config = None
@@ -1006,10 +1008,33 @@ class GeminiNativeClient:
 
         model = bare_gemini_model_id(model)
         if stream:
-            return self._stream_completion(model=model, request=request, timeout=timeout)
+            return self._stream_completion(
+                model=model,
+                request=request,
+                timeout=timeout,
+                task_fence_model_policy=_task_fence_model_policy,
+            )
 
         url = f"{self.base_url}/models/{model}:generateContent"
-        response = self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
+        from agent.task_fence_provider import task_fence_model_handoff
+
+        with task_fence_model_handoff(
+            adapter="provider:gemini.generateContent",
+            request={"model": model, "request": request},
+            route={
+                "api_mode": "chat_completions",
+                "provider": "gemini",
+                "model": model,
+                "endpoint": self.base_url,
+            },
+            policy=_task_fence_model_policy,
+        ):
+            response = self._http.post(
+                url,
+                json=request,
+                headers=self._headers(),
+                timeout=timeout,
+            )
         if response.status_code != 200:
             raise gemini_http_error(response)
         try:
@@ -1023,26 +1048,76 @@ class GeminiNativeClient:
             ) from exc
         return translate_gemini_response(payload, model=model)
 
-    def _stream_completion(self, *, model: str, request: Dict[str, Any], timeout: Any = None) -> Iterator[_GeminiStreamChunk]:
+    def _stream_completion(
+        self,
+        *,
+        model: str,
+        request: Dict[str, Any],
+        timeout: Any = None,
+        task_fence_model_policy: Any = None,
+    ) -> Iterator[_GeminiStreamChunk]:
         url = f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse"
         stream_headers = dict(self._headers())
         stream_headers["Accept"] = "text/event-stream"
 
         def _generator() -> Iterator[_GeminiStreamChunk]:
+            stream_stack = ExitStack()
             try:
-                with self._http.stream("POST", url, json=request, headers=stream_headers, timeout=timeout) as response:
-                    if response.status_code != 200:
+                from agent.task_fence_provider import (
+                    _without_task_fence_model_authority,
+                    task_fence_model_handoff,
+                )
+
+                with task_fence_model_handoff(
+                    adapter="provider:gemini.streamGenerateContent",
+                    request={"model": model, "request": request},
+                    route={
+                        "api_mode": "chat_completions",
+                        "provider": "gemini",
+                        "model": model,
+                        "endpoint": self.base_url,
+                    },
+                    policy=task_fence_model_policy,
+                ):
+                    response = stream_stack.enter_context(
+                        self._http.stream(
+                            "POST",
+                            url,
+                            json=request,
+                            headers=stream_headers,
+                            timeout=timeout,
+                        )
+                )
+                if response.status_code != 200:
+                    with _without_task_fence_model_authority():
                         body_text = read_streaming_error_body(response)
-                        raise gemini_http_error(response, body_text=body_text)
-                    tool_call_indices: Dict[str, Dict[str, Any]] = {}
-                    for event in _iter_sse_events(response):
-                        for chunk in translate_stream_event(event, model, tool_call_indices):
-                            yield chunk
+                    raise gemini_http_error(response, body_text=body_text)
+                tool_call_indices: Dict[str, Dict[str, Any]] = {}
+                events = iter(_iter_sse_events(response))
+                while True:
+                    try:
+                        with _without_task_fence_model_authority():
+                            event = next(events)
+                    except StopIteration:
+                        break
+                    for chunk in translate_stream_event(
+                        event,
+                        model,
+                        tool_call_indices,
+                    ):
+                        yield chunk
             except httpx.HTTPError as exc:
                 raise GeminiAPIError(
                     f"Gemini streaming request failed: {exc}",
                     code="gemini_stream_error",
                 ) from exc
+            finally:
+                from agent.task_fence_provider import (
+                    _without_task_fence_model_authority,
+                )
+
+                with _without_task_fence_model_authority():
+                    stream_stack.close()
 
         return _generator()
 

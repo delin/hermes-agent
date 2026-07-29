@@ -2278,24 +2278,48 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    from task_fence import bind_causal_envelope
-
+                    from task_fence import (
+                        TaskFencePolicy,
+                        bind_causal_envelope,
+                        bind_task_fence_policy,
+                    )
+                    from agent.chat_completion_helpers import (
+                        _is_task_fence_wp63a_model_wire,
+                    )
                     generation = _reserve_task_fence_shadow_generation(
                         agent,
                         _task_fence_acceptance,
                     )
                     _task_fence_generation_envelope = generation
+                    provider_policy = None
+                    if (
+                        _task_fence_acceptance is not None
+                        and _is_task_fence_wp63a_model_wire(agent)
+                    ):
+                        provider_store = getattr(agent, "_session_db", None)
+                        if provider_store is not None:
+                            provider_policy = TaskFencePolicy(provider_store)
+                    provider_call_kwargs = {}
+                    if provider_policy is not None:
+                        provider_call_kwargs["_task_fence_model_policy"] = (
+                            provider_policy
+                        )
 
                     try:
-                        with bind_causal_envelope(generation):
+                        with (
+                            bind_causal_envelope(generation),
+                            bind_task_fence_policy(None),
+                        ):
                             if _use_streaming:
                                 response = agent._interruptible_streaming_api_call(
                                     next_api_kwargs,
                                     on_first_delta=_stop_spinner,
+                                    **provider_call_kwargs,
                                 )
                             else:
                                 response = agent._interruptible_api_call(
-                                    next_api_kwargs
+                                    next_api_kwargs,
+                                    **provider_call_kwargs,
                                 )
                     except BaseException:
                         _finish_task_fence_shadow_generation(

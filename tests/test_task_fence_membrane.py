@@ -17,6 +17,7 @@ from task_fence import (
     bind_causal_envelope,
     bind_task_fence_policy,
     current_causal_envelope,
+    current_task_fence_policy,
 )
 from tools.registry import _task_fence_tool_fingerprint, registry
 
@@ -48,6 +49,15 @@ def _live_lane(path):
     )
     generation = db.reserve_task_fence_generation(acceptance)
     assert db.finish_task_fence_generation(generation, state="committed")
+    return db, acceptance, generation
+
+
+def _live_model_lane(path):
+    db = SessionDB(path)
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "membrane-model-initial")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
     return db, acceptance, generation
 
 
@@ -446,6 +456,640 @@ def test_registry_audit_failure_is_secret_free_and_fail_open(
         assert secret not in caplog.text
         assert "RuntimeError" in caplog.text
     finally:
+        db.close()
+
+
+def test_openai_model_wire_race_is_shadow_only(tmp_path):
+    from agent.chat_completion_helpers import _create_openai_chat_completion
+
+    db, acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    original_admit = TaskFencePolicy.admit_operation
+    calls = []
+    advanced = False
+    response = object()
+
+    def admit_then_advance(self, envelope, operation):
+        nonlocal advanced
+        decision = original_admit(self, envelope, operation)
+        if self is policy and not advanced:
+            advanced = True
+            db.accept_task_fence_ingress(
+                _ingress(
+                    "comment_hold",
+                    "membrane-model-newer-input",
+                    task_id=acceptance.task_id,
+                )
+            )
+        return decision
+
+    def create(**kwargs):
+        calls.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+            )
+        )
+        return response
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        )
+    )
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="openrouter",
+        model="test/model",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    request = {
+        "model": "test/model",
+        "messages": [{"role": "user", "content": "shadow race"}],
+    }
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+            patch.object(
+                TaskFencePolicy,
+                "admit_operation",
+                new=admit_then_advance,
+            ),
+        ):
+            result = _create_openai_chat_completion(
+                agent,
+                client,
+                request,
+                task_fence_model_policy=policy,
+            )
+
+        assert result is response
+        assert len(calls) == 1
+        assert calls[0][0] == request
+        assert calls[0][1].generation_id == generation.generation_id
+        assert calls[0][1].invocation_id is not None
+        assert calls[0][2] is None
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, outcome, reason_code "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_BLOCK.value,
+                DecisionReason.PERMIT_REVOKED.value,
+            ),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_openai_model_wire_audit_fault_is_secret_free_and_fail_open(
+    tmp_path,
+    caplog,
+):
+    from agent.chat_completion_helpers import _create_openai_chat_completion
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    secret = "provider-audit-error-secret"
+    calls = []
+    response = object()
+
+    def create(**kwargs):
+        calls.append((dict(kwargs), current_task_fence_policy()))
+        return response
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        )
+    )
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="openrouter",
+        model="test/model",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    request = {"model": "test/model", "messages": []}
+    policy = TaskFencePolicy(db)
+    try:
+        caplog.set_level(logging.WARNING, logger="agent.task_fence_provider")
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+            patch.object(
+                TaskFencePolicy,
+                "admit_operation",
+                side_effect=RuntimeError(secret),
+            ),
+        ):
+            result = _create_openai_chat_completion(
+                agent,
+                client,
+                request,
+                task_fence_model_policy=policy,
+            )
+
+        assert result is response
+        assert calls == [(request, None)]
+        assert secret not in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_openai_model_wire_context_fault_does_not_lend_policy_to_sdk(
+    tmp_path,
+    caplog,
+):
+    from agent.chat_completion_helpers import _create_openai_chat_completion
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    secret = "provider-context-error-secret"
+    calls = []
+    response = object()
+
+    def create(**kwargs):
+        calls.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+            )
+        )
+        return response
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        )
+    )
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="openrouter",
+        model="test/model",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    request = {"model": "test/model", "messages": []}
+    policy = TaskFencePolicy(db)
+    try:
+        caplog.set_level(logging.WARNING, logger="agent.task_fence_provider")
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+            patch(
+                "task_fence.CausalEnvelope.for_invocation",
+                side_effect=RuntimeError(secret),
+            ),
+        ):
+            result = _create_openai_chat_completion(
+                agent,
+                client,
+                request,
+                task_fence_model_policy=policy,
+            )
+
+        assert result is response
+        assert calls == [(request, generation, None)]
+        assert secret not in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_openai_model_wire_ignores_public_tool_policy_without_explicit_capability(
+    tmp_path,
+):
+    from agent.chat_completion_helpers import _create_openai_chat_completion
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    calls = []
+    response = object()
+
+    def create(**kwargs):
+        calls.append((dict(kwargs), current_task_fence_policy()))
+        return response
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        )
+    )
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="openrouter",
+        model="test/model",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    request = {"model": "test/model", "messages": []}
+    try:
+        with (
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            bind_causal_envelope(generation),
+        ):
+            result = _create_openai_chat_completion(agent, client, request)
+
+        assert result is response
+        assert calls == [(request, None)]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "openai_owned", "wp63a_supported"),
+    [
+        ("openrouter", "https://openrouter.ai/api/v1", True, True),
+        (
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            False,
+            True,
+        ),
+        ("moa", "https://virtual.invalid/v1", False, False),
+        ("copilot-acp", "acp://copilot", False, False),
+        ("custom", "acp+tcp://127.0.0.1:7777", False, False),
+    ],
+)
+def test_openai_model_wire_ownership_excludes_non_sdk_facades(
+    provider,
+    base_url,
+    openai_owned,
+    wp63a_supported,
+):
+    from agent.chat_completion_helpers import (
+        _is_task_fence_openai_chat_wire,
+        _is_task_fence_wp63a_model_wire,
+    )
+
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider=provider,
+        base_url=base_url,
+    )
+
+    assert _is_task_fence_openai_chat_wire(agent) is openai_owned
+    assert _is_task_fence_wp63a_model_wire(agent) is wp63a_supported
+
+
+def test_gemini_native_nonstream_starts_before_http_handoff(tmp_path):
+    from agent.gemini_native_adapter import GeminiNativeClient
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    prompt_secret = "raw-gemini-prompt-secret"
+    api_secret = "raw-gemini-api-key-secret"
+    observed = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "gemini done"}]},
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 2,
+                },
+            }
+
+    class HTTP:
+        def post(self, url, *, json, headers, timeout):
+            envelope = current_causal_envelope()
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+            observed.update(
+                url=url,
+                request=json,
+                headers=headers,
+                envelope=envelope,
+                policy=current_task_fence_policy(),
+                attempt=attempt["state"],
+            )
+            return Response()
+
+        def close(self):
+            return None
+
+    endpoint = "https://generativelanguage.googleapis.com/v1beta"
+    client = GeminiNativeClient(
+        api_key=api_secret,
+        base_url=endpoint,
+        http_client=HTTP(),
+    )
+    policy = TaskFencePolicy(db)
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+        ):
+            response = client.chat.completions.create(
+                model="gemini-2.5-flash",
+                messages=[{"role": "user", "content": prompt_secret}],
+                _task_fence_model_policy=policy,
+            )
+
+        assert response.choices[0].message.content == "gemini done"
+        assert observed["attempt"] == "STARTED"
+        assert observed["envelope"].generation_id == generation.generation_id
+        assert observed["envelope"].invocation_id is not None
+        assert observed["policy"] is None
+        assert observed["headers"]["x-goog-api-key"] == api_secret
+        expected = model_wire_fingerprint(
+            adapter="provider:gemini.generateContent",
+            request={
+                "model": "gemini-2.5-flash",
+                "request": observed["request"],
+            },
+            route={
+                "api_mode": "chat_completions",
+                "provider": "gemini",
+                "model": "gemini-2.5-flash",
+                "endpoint": endpoint,
+            },
+        )
+        decisions = db._conn.execute(
+            "SELECT adapter, invocation_fingerprint "
+            "FROM task_fence_policy_decisions ORDER BY decision_order"
+        ).fetchall()
+        assert [tuple(row) for row in decisions] == [
+            ("provider:gemini.generateContent", expected),
+            ("provider:gemini.generateContent", expected),
+        ]
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert prompt_secret not in audit_dump
+        assert api_secret not in audit_dump
+    finally:
+        client.close()
+        db.close()
+
+
+def test_gemini_native_stream_starts_at_lazy_http_handoff(tmp_path):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    observed = []
+
+    class StreamResponse:
+        status_code = 200
+
+        @staticmethod
+        def iter_text():
+            payload = {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "streamed"}]},
+                        "finishReason": "STOP",
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    class StreamContext:
+        def __init__(self, method, url, request):
+            self.method = method
+            self.url = url
+            self.request = request
+
+        def __enter__(self):
+            envelope = current_causal_envelope()
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+            observed.append(
+                (
+                    self.method,
+                    self.url,
+                    self.request,
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                )
+            )
+            return StreamResponse()
+
+        def __exit__(self, *_args):
+            return False
+
+    class HTTP:
+        def stream(self, method, url, *, json, headers, timeout):
+            return StreamContext(method, url, dict(json))
+
+        def close(self):
+            return None
+
+    client = GeminiNativeClient(
+        api_key="test-key",
+        http_client=HTTP(),
+    )
+    policy = TaskFencePolicy(db)
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+        ):
+            stream = client.chat.completions.create(
+                model="gemini-2.5-flash",
+                messages=[{"role": "user", "content": "stream please"}],
+                stream=True,
+                _task_fence_model_policy=policy,
+            )
+            assert observed == []
+            chunks = list(stream)
+
+        assert len(observed) == 1
+        assert observed[0][0] == "POST"
+        assert observed[0][4] == "STARTED"
+        assert observed[0][3].generation_id == generation.generation_id
+        assert observed[0][3].invocation_id is not None
+        assert observed[0][5] is None
+        assert chunks[0].choices[0].delta.content == "streamed"
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+        assert [
+            row[0]
+            for row in db._conn.execute(
+                "SELECT adapter FROM task_fence_policy_decisions "
+                "ORDER BY decision_order"
+            )
+        ] == [
+            "provider:gemini.streamGenerateContent",
+            "provider:gemini.streamGenerateContent",
+        ]
+    finally:
+        client.close()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_async_gemini_stream_does_not_carry_policy_across_threaded_yields(
+    tmp_path,
+):
+    from agent.gemini_native_adapter import (
+        AsyncGeminiNativeClient,
+        GeminiNativeClient,
+    )
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    observed = []
+
+    class StreamResponse:
+        status_code = 200
+
+        @staticmethod
+        def iter_text():
+            for text in ("first", "second"):
+                payload = {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": text}]},
+                            "finishReason": "STOP",
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    class StreamContext:
+        def __enter__(self):
+            envelope = current_causal_envelope()
+            attempt = db._conn.execute(
+                "SELECT a.state FROM task_fence_attempts AS a "
+                "JOIN task_fence_dispatch_permits AS p "
+                "ON p.permit_id = a.permit_id "
+                "WHERE p.invocation_envelope_id = ?",
+                (envelope.invocation_id,),
+            ).fetchone()
+            observed.append(
+                ("enter", current_task_fence_policy(), envelope, attempt["state"])
+            )
+            return StreamResponse()
+
+        def __exit__(self, *_args):
+            observed.append(
+                (
+                    "exit",
+                    current_task_fence_policy(),
+                    current_causal_envelope(),
+                    None,
+                )
+            )
+            return False
+
+    class HTTP:
+        def stream(self, method, url, *, json, headers, timeout):
+            observed.append(
+                (
+                    "stream",
+                    current_task_fence_policy(),
+                    current_causal_envelope(),
+                    method,
+                )
+            )
+            return StreamContext()
+
+        def close(self):
+            return None
+
+    sync_client = GeminiNativeClient(
+        api_key="test-key",
+        http_client=HTTP(),
+    )
+    client = AsyncGeminiNativeClient(sync_client)
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+        ):
+            stream = await client.chat.completions.create(
+                model="gemini-2.5-flash",
+                messages=[{"role": "user", "content": "stream twice"}],
+                stream=True,
+                _task_fence_model_policy=policy,
+            )
+            chunks = [chunk async for chunk in stream]
+            assert current_task_fence_policy() is policy
+
+        assert [
+            chunk.choices[0].delta.content
+            for chunk in chunks
+            if chunk.choices[0].delta.content is not None
+        ] == [
+            "first",
+            "second",
+        ]
+        assert [entry[0] for entry in observed] == [
+            "stream",
+            "enter",
+            "exit",
+        ]
+        assert all(entry[1] is None for entry in observed)
+        assert observed[0][2].invocation_id is not None
+        assert observed[0][2] == observed[1][2]
+        assert observed[1][3] == "STARTED"
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+    finally:
+        await client.close()
         db.close()
 
 

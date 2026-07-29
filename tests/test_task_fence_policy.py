@@ -74,6 +74,37 @@ def _live_lane(
     return db, acceptance, envelope, operation
 
 
+def _multi_input_model_lane(path, *, invocation_id: str):
+    db = SessionDB(path)
+    initial = db.accept_task_fence_ingress(
+        _ingress("initial_submit", f"{invocation_id}-initial")
+    )
+    db.accept_task_fence_ingress(
+        _ingress(
+            "comment_hold",
+            f"{invocation_id}-held",
+            task_id=initial.task_id,
+        )
+    )
+    resumed = db.accept_task_fence_ingress(
+        _ingress(
+            "change_and_run",
+            f"{invocation_id}-resumed",
+            task_id=initial.task_id,
+        )
+    )
+    envelope = db.reserve_task_fence_generation(resumed).for_invocation(
+        invocation_id
+    )
+    operation = OperationDescriptor(
+        invocation_id=invocation_id,
+        kind=OperationKind.MODEL,
+        adapter="provider:test-multi-input-model",
+        invocation_fingerprint=_hash(invocation_id),
+    )
+    return db, envelope, operation
+
+
 def _count(db: SessionDB, table: str) -> int:
     assert table in {
         "task_fence_dispatch_permits",
@@ -373,6 +404,135 @@ def test_started_model_generation_with_bound_inputs_can_start(tmp_path):
             "SELECT state FROM task_fence_attempts WHERE attempt_id = ?",
             (started.attempt_id,),
         ).fetchone()[0] == "STARTED"
+    finally:
+        db.close()
+
+
+def test_post_commit_model_continuation_with_presented_inputs_can_start(
+    tmp_path,
+    monkeypatch,
+):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "policy-model-continuation")
+        )
+        first_generation = db.reserve_task_fence_generation(acceptance)
+        assert db.finish_task_fence_generation(
+            first_generation,
+            state="committed",
+        )
+        continuation = db.reserve_task_fence_generation(acceptance).for_invocation(
+            "tfiv_policy_model_continuation"
+        )
+        operation = OperationDescriptor(
+            invocation_id=continuation.invocation_id,
+            kind=OperationKind.MODEL,
+            adapter="provider:test-model-continuation",
+            invocation_fingerprint=_hash("post-commit-model-continuation"),
+        )
+
+        assert tuple(
+            db._conn.execute(
+                "SELECT state FROM task_fence_task_inputs "
+                "WHERE task_id = ? ORDER BY event_id",
+                (continuation.task_id,),
+            ).fetchone()
+        ) == ("presented",)
+
+        policy = TaskFencePolicy(db)
+
+        def committed_generation_scan_is_not_on_the_policy_hot_path(
+            *_args,
+            **_kwargs,
+        ):
+            raise AssertionError("unexpected global generation scan")
+
+        monkeypatch.setattr(
+            SessionDB,
+            "_task_fence_run_has_committed_generation_unlocked",
+            staticmethod(committed_generation_scan_is_not_on_the_policy_hot_path),
+        )
+        admitted = policy.admit_operation(continuation, operation)
+        started = policy.authorize_and_start(
+            continuation,
+            operation,
+            admitted.permit_id,
+        )
+
+        assert admitted.outcome is DecisionOutcome.WOULD_RESERVE
+        assert started.outcome is DecisionOutcome.WOULD_ALLOW
+        assert db._conn.execute(
+            "SELECT state FROM task_fence_attempts WHERE attempt_id = ?",
+            (started.attempt_id,),
+        ).fetchone()[0] == "STARTED"
+    finally:
+        db.close()
+
+
+def test_model_admission_rejects_mixed_bound_and_presented_inputs(tmp_path):
+    db, envelope, operation = _multi_input_model_lane(
+        tmp_path / "state.db",
+        invocation_id="tfiv_policy_mixed_admission",
+    )
+    try:
+        input_rows = db._conn.execute(
+            "SELECT event_id, state FROM task_fence_task_inputs "
+            "WHERE task_id = ? AND bound_run_id = ? ORDER BY event_id",
+            (envelope.task_id, envelope.run_id),
+        ).fetchall()
+        assert len(input_rows) >= 2
+        assert {row["state"] for row in input_rows} == {"bound"}
+        db._conn.execute(
+            "UPDATE task_fence_task_inputs SET state = 'presented' "
+            "WHERE event_id = ?",
+            (input_rows[0]["event_id"],),
+        )
+
+        admitted = TaskFencePolicy(db).admit_operation(envelope, operation)
+
+        assert admitted.outcome is DecisionOutcome.WOULD_BLOCK
+        assert admitted.permit_id is None
+        assert _count(db, "task_fence_dispatch_permits") == 0
+        assert _count(db, "task_fence_attempts") == 0
+    finally:
+        db.close()
+
+
+def test_model_authorization_revalidates_uniform_input_state(tmp_path):
+    db, envelope, operation = _multi_input_model_lane(
+        tmp_path / "state.db",
+        invocation_id="tfiv_policy_mixed_authorization",
+    )
+    policy = TaskFencePolicy(db)
+    try:
+        admitted = policy.admit_operation(envelope, operation)
+        assert admitted.outcome is DecisionOutcome.WOULD_RESERVE
+        input_rows = db._conn.execute(
+            "SELECT event_id, state FROM task_fence_task_inputs "
+            "WHERE task_id = ? AND bound_run_id = ? ORDER BY event_id",
+            (envelope.task_id, envelope.run_id),
+        ).fetchall()
+        assert len(input_rows) >= 2
+        assert {row["state"] for row in input_rows} == {"bound"}
+        db._conn.execute(
+            "UPDATE task_fence_task_inputs SET state = 'presented' "
+            "WHERE event_id = ?",
+            (input_rows[0]["event_id"],),
+        )
+
+        started = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+
+        assert started.outcome is DecisionOutcome.WOULD_BLOCK
+        assert _count(db, "task_fence_attempts") == 0
+        assert db._conn.execute(
+            "SELECT state FROM task_fence_dispatch_permits WHERE permit_id = ?",
+            (admitted.permit_id,),
+        ).fetchone()[0] != "consumed"
     finally:
         db.close()
 
