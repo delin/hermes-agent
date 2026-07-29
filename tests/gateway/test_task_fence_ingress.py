@@ -1,5 +1,10 @@
 import asyncio
+from collections import OrderedDict
 from dataclasses import replace
+import sys
+import threading
+import types
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -155,6 +160,94 @@ def _count(db: SessionDB, table: str) -> int:
 
 
 @pytest.mark.asyncio
+async def test_gateway_passes_exact_acceptance_per_turn_without_cached_leak(
+    task_fence_db,
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(AsyncSessionDB(task_fence_db))
+    adapter = _ShadowSlackAdapter(task_fence_db)
+    runner.adapters = {Platform.SLACK: adapter}
+    runner._voice_mode = {}
+    runner._prefill_messages = []
+    runner._ephemeral_system_prompt = ""
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    runner._refresh_fallback_model = lambda: None
+    runner._apply_fallback_chain_to_agent = lambda *_args: None
+    runner._init_cached_agent_for_turn = lambda *_args: None
+    runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+
+    event = _event("start", "1700000000.000000")
+    await runner._accept_task_fence_gateway_ingress(event, _session_key())
+    acceptance = event.task_fence_acceptance
+    assert acceptance is not None
+
+    observed = []
+    created = []
+
+    class FakeAgent:
+        tools = []
+
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            created.append(self)
+
+        def run_conversation(
+            self,
+            message,
+            conversation_history=None,
+            task_id=None,
+            **kwargs,
+        ):
+            observed.append(kwargs.get("task_fence_acceptance"))
+            return {
+                "final_response": "done",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"default": "test/model"}},
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake"},
+    )
+
+    kwargs = {
+        "context_prompt": "",
+        "history": [],
+        "source": _source(),
+        "session_id": "task-fence-session",
+        "session_key": _session_key(),
+    }
+    first = await runner._run_agent(
+        message="first",
+        task_fence_acceptance=acceptance,
+        **kwargs,
+    )
+    second = await runner._run_agent(message="second", **kwargs)
+
+    assert first["final_response"] == "done"
+    assert second["final_response"] == "done"
+    assert len(created) == 1
+    assert observed == [acceptance, None]
+
+
+@pytest.mark.asyncio
 async def test_cold_acceptance_commits_before_typing_hook_and_handler(
     task_fence_db,
 ):
@@ -229,8 +322,77 @@ async def test_busy_plain_text_commits_hold_before_legacy_queue(
     await adapter.handle_message(follow_up)
 
     assert follow_up.task_fence_acceptance is not None
-    assert adapter.observations[-1] == ("busy_handler", 2, "paused", 1)
+    assert adapter.observations[-1] == ("busy_handler", 2, "paused", 2)
     assert adapter._pending_messages[_session_key()] is follow_up
+
+    release_first.set()
+    await first_task
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.parametrize("busy_text_mode", ("", "queue"))
+@pytest.mark.asyncio
+async def test_busy_text_coalescing_carries_latest_exact_acceptance(
+    task_fence_db,
+    busy_text_mode,
+):
+    runner = _runner(AsyncSessionDB(task_fence_db))
+    adapter = _ShadowSlackAdapter(task_fence_db)
+    adapter._busy_text_mode = busy_text_mode
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    adapter.set_task_fence_ingress_handler(
+        runner._accept_task_fence_gateway_ingress
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "first":
+            first_started.set()
+            await release_first.wait()
+        return None
+
+    async def busy_handler(_event, _session_key):
+        return False
+
+    adapter.set_message_handler(handler)
+    adapter.set_busy_session_handler(busy_handler)
+    first = _event("first", "1700000000.000012")
+    earlier = _event("earlier", "1700000000.000013")
+    latest = _event("latest", "1700000000.000014")
+
+    await adapter.handle_message(first)
+    first_task = adapter._session_tasks[_session_key()]
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    await adapter.handle_message(earlier)
+    await adapter.handle_message(latest)
+
+    if busy_text_mode == "queue":
+        merged = adapter._text_debounce[_session_key()].event
+        assert _session_key() not in adapter._pending_messages
+    else:
+        merged = adapter._pending_messages[_session_key()]
+
+    assert earlier.task_fence_acceptance is not None
+    assert latest.task_fence_acceptance is not None
+    assert latest.task_fence_acceptance.accepted_order == 3
+    assert merged is earlier
+    assert merged.text == "earlier\nlatest"
+    assert merged.task_fence_ingress is latest.task_fence_ingress
+    assert merged.task_fence_acceptance is latest.task_fence_acceptance
+    assert merged.task_fence_acceptance_attempted is True
+
+    failed = _event("failed", "1700000000.000015")
+    failed.task_fence_acceptance_attempted = True
+    await adapter.handle_message(failed)
+
+    assert failed.task_fence_acceptance is None
+    assert merged.text == "earlier\nlatest\nfailed"
+    assert merged.task_fence_ingress is failed.task_fence_ingress
+    assert merged.task_fence_acceptance is None
+    assert merged.task_fence_acceptance_attempted is True
+    assert _count(task_fence_db, "task_fence_ingress") == 3
 
     release_first.set()
     await first_task

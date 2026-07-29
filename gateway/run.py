@@ -14326,6 +14326,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                task_fence_acceptance=getattr(
+                    event,
+                    "task_fence_acceptance",
+                    None,
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -20389,6 +20394,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        task_fence_acceptance: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -20407,6 +20413,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                task_fence_acceptance=task_fence_acceptance,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -20418,6 +20425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                task_fence_acceptance=task_fence_acceptance,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -20539,6 +20547,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        task_fence_acceptance: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -22641,6 +22650,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                if task_fence_acceptance is not None:
+                    _conversation_kwargs["task_fence_acceptance"] = (
+                        task_fence_acceptance
+                    )
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
@@ -23712,6 +23725,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    task_fence_acceptance=(
+                        getattr(pending_event, "task_fence_acceptance", None)
+                        if pending_event is not None
+                        else None
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

@@ -45,6 +45,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from task_fence import IngressAcceptance
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +317,8 @@ class TurnContext:
     turn_id: str
     # Index of the current user turn within ``messages``.
     current_turn_user_idx: int
+    # Exact process-local Task Fence acceptance for the configured shadow lane.
+    task_fence_acceptance: Optional[IngressAcceptance] = None
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
@@ -344,6 +347,7 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    task_fence_acceptance: Optional[IngressAcceptance] = None,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -351,6 +355,13 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    if (
+        task_fence_acceptance is not None
+        and not isinstance(task_fence_acceptance, IngressAcceptance)
+    ):
+        logger.warning("Ignoring malformed Task Fence acceptance at turn entry")
+        task_fence_acceptance = None
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1233,6 +1244,7 @@ def build_turn_context(
         active_system_prompt=active_system_prompt,
         effective_task_id=effective_task_id,
         turn_id=turn_id,
+        task_fence_acceptance=task_fence_acceptance,
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,

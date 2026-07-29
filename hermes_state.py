@@ -43,8 +43,10 @@ from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
 from task_fence import (
+    CausalEnvelope,
     CONTROL_PROTOCOL_VERSION,
     TASK_FENCE_ACTIONS,
+    TASK_FENCE_STORE_SCHEMA_VERSION,
     CorrelationKind,
     ExecutionEffect,
     IngressAcceptance,
@@ -58,6 +60,8 @@ from task_fence import (
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
     TaskFenceProtocolRejected,
+    TaskFenceProvenanceRejected,
+    TaskFenceProvenanceUnavailable,
     TaskFenceTaskControl,
     validate_action,
     validate_ingress_envelope,
@@ -309,7 +313,6 @@ SCHEMA_VERSION = 23
 # Task Fence is independently versioned from the general session schema.  The
 # control protocol must be able to reject an unknown control-store layout
 # without conflating it with unrelated session/FTS migrations.
-TASK_FENCE_STORE_SCHEMA_VERSION = 3
 TASK_FENCE_CONTROL_PROTOCOL_VERSION = CONTROL_PROTOCOL_VERSION
 TASK_FENCE_TABLE_PREFIX = "task_fence_"
 _TASK_FENCE_V2_IDENTIFIER_MAX_BYTES = 512
@@ -5418,6 +5421,58 @@ class SessionDB:
         return tuple(pending)
 
     @staticmethod
+    def _task_fence_input_manifest_hash(input_ids: Tuple[str, ...]) -> str:
+        manifest = json.dumps(
+            input_ids,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(manifest).hexdigest()
+
+    @staticmethod
+    def _task_fence_run_inputs_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        run_id: str,
+    ) -> Tuple[Tuple[str, str], ...] | _TaskFenceIngressFailure:
+        """Return one run's actual input membership in accepted FIFO order."""
+
+        rows = conn.execute(
+            "SELECT ti.event_id, ti.task_id AS input_task_id, ti.state, "
+            "i.task_id AS ingress_task_id, "
+            "i.accepted_order FROM main.task_fence_task_inputs AS ti "
+            "JOIN main.task_fence_ingress AS i ON i.event_id = ti.event_id "
+            "WHERE ti.bound_run_id = ? "
+            "ORDER BY i.accepted_order LIMIT ?",
+            (run_id, _TASK_FENCE_MAX_PENDING_HISTORY_WORK + 1),
+        ).fetchall()
+        if len(rows) > _TASK_FENCE_MAX_PENDING_HISTORY_WORK:
+            return _TaskFenceIngressFailure(
+                "pending_history_limit_exceeded",
+                unavailable=True,
+            )
+        previous_order = 0
+        inputs: List[Tuple[str, str]] = []
+        for row in rows:
+            if (
+                not _task_fence_v2_identifier_compatible(row["event_id"])
+                or row["input_task_id"] != task_id
+                or row["ingress_task_id"] != task_id
+                or row["state"]
+                not in {"pending", "bound", "presented", "discarded"}
+                or type(row["accepted_order"]) is not int
+                or row["accepted_order"] <= previous_order
+            ):
+                return _TaskFenceIngressFailure(
+                    "incompatible_generation_input_manifest",
+                    unavailable=True,
+                )
+            previous_order = row["accepted_order"]
+            inputs.append((row["event_id"], row["state"]))
+        return tuple(inputs)
+
+    @staticmethod
     def _task_fence_pending_history_at_unlocked(
         conn: sqlite3.Connection,
         *,
@@ -5443,30 +5498,34 @@ class SessionDB:
             "execution, input_effect, correlation_kind"
         )
         last_run = conn.execute(
-            f"SELECT {action_columns} FROM main.task_fence_ingress "
-            "WHERE task_id = ? AND accepted_order <= ? "
-            "AND execution = 'run' ORDER BY accepted_order DESC LIMIT 1",
-            (task_id, accepted_order),
+            f"SELECT {action_columns} FROM main.task_fence_ingress AS e "
+            "JOIN main.task_fence_execution_runs AS r "
+            "ON r.open_event_id = e.event_id AND r.task_id = e.task_id "
+            "WHERE e.task_id = ? AND e.accepted_order <= ? "
+            "AND e.execution = 'run' AND NOT ("
+            "r.close_reason = 'accepted_ingress_unpresented' AND EXISTS ("
+            "SELECT 1 FROM main.task_fence_ingress AS close_event "
+            "WHERE close_event.event_id = r.close_event_id "
+            "AND close_event.accepted_order <= ?"
+            ")) ORDER BY e.accepted_order DESC LIMIT 1",
+            (task_id, accepted_order, accepted_order),
         ).fetchone()
-        if last_run is None:
-            return _TaskFenceIngressFailure(
-                "incompatible_acceptance_projection",
-                unavailable=True,
-            )
-        run_action = SessionDB._task_fence_action_from_history_row(last_run)
-        start_order = last_run["accepted_order"]
-        if (
-            isinstance(run_action, _TaskFenceIngressFailure)
-            or run_action.execution is not ExecutionEffect.RUN
-            or not _task_fence_v2_identifier_compatible(last_run["event_id"])
-            or type(start_order) is not int
-            or start_order < 1
-            or start_order > accepted_order
-        ):
-            return _TaskFenceIngressFailure(
-                "incompatible_acceptance_projection",
-                unavailable=True,
-            )
+        start_order = 0
+        if last_run is not None:
+            run_action = SessionDB._task_fence_action_from_history_row(last_run)
+            start_order = last_run["accepted_order"]
+            if (
+                isinstance(run_action, _TaskFenceIngressFailure)
+                or run_action.execution is not ExecutionEffect.RUN
+                or not _task_fence_v2_identifier_compatible(last_run["event_id"])
+                or type(start_order) is not int
+                or start_order < 1
+                or start_order > accepted_order
+            ):
+                return _TaskFenceIngressFailure(
+                    "incompatible_acceptance_projection",
+                    unavailable=True,
+                )
 
         history = conn.execute(
             f"SELECT {action_columns} FROM main.task_fence_ingress "
@@ -6218,29 +6277,34 @@ class SessionDB:
                     unavailable=True,
                 )
 
-            active_generations = conn.execute(
+            open_generations = conn.execute(
                 "SELECT generation_id, run_id, intent_epoch, control_revision, "
-                "runtime_epoch FROM main.task_fence_model_generations "
-                "WHERE task_id = ? AND state IN ('reserved', 'started') "
+                "runtime_epoch, state, closed_at "
+                "FROM main.task_fence_model_generations "
+                "WHERE task_id = ? "
+                "AND (state IN ('reserved', 'started') OR closed_at IS NULL) "
                 "ORDER BY generation_id LIMIT 2",
                 (task_id,),
             ).fetchall()
             current_generation_id = task["current_generation_id"]
             if current_generation_id is None:
-                generation_is_compatible = not active_generations
+                generation_is_compatible = not open_generations
             else:
                 generation_is_compatible = (
                     task["status"] == "running"
-                    and len(active_generations) == 1
-                    and active_generations[0]["generation_id"]
+                    and len(open_generations) == 1
+                    and open_generations[0]["generation_id"]
                     == current_generation_id
-                    and active_generations[0]["run_id"] == active_run_id
-                    and active_generations[0]["intent_epoch"]
+                    and open_generations[0]["run_id"] == active_run_id
+                    and open_generations[0]["intent_epoch"]
                     == task["intent_epoch"]
-                    and active_generations[0]["control_revision"]
+                    and open_generations[0]["control_revision"]
                     == task["control_revision"]
-                    and active_generations[0]["runtime_epoch"]
+                    and open_generations[0]["runtime_epoch"]
                     == task["current_runtime_epoch"]
+                    and open_generations[0]["state"]
+                    in {"reserved", "started", "committed"}
+                    and open_generations[0]["closed_at"] is None
                 )
             if not generation_is_compatible:
                 return _TaskFenceIngressFailure(
@@ -6435,14 +6499,56 @@ class SessionDB:
 
         old_run_id = task["active_execution_run_id"]
         old_generation_id = task["current_generation_id"]
+        carried_input_ids: Tuple[str, ...] = ()
         if old_generation_id is not None:
-            conn.execute(
-                "UPDATE main.task_fence_model_generations "
-                "SET state = 'cancelled', closed_at = ? "
-                "WHERE generation_id = ? AND state IN ('reserved', 'started')",
-                (now, old_generation_id),
-            )
+            if not self._close_task_fence_generation_unlocked(
+                conn,
+                generation_id=old_generation_id,
+                now=now,
+            ):
+                raise sqlite3.IntegrityError(
+                    "Task Fence current generation changed"
+                )
         if old_run_id is not None:
+            old_run = conn.execute(
+                "SELECT bound_input_hash FROM main.task_fence_execution_runs "
+                "WHERE run_id = ? AND task_id = ? AND state = 'open'",
+                (old_run_id, resolved_task_id),
+            ).fetchone()
+            if old_run is None:
+                raise sqlite3.IntegrityError("Task Fence open run changed")
+            committed = self._task_fence_run_has_committed_generation_unlocked(
+                conn,
+                run_id=old_run_id,
+            )
+            allowed_input_states = (
+                frozenset({"presented"})
+                if committed
+                else frozenset({"bound"})
+            )
+            exact_run_inputs = self._task_fence_exact_run_input_ids_unlocked(
+                conn,
+                task_id=resolved_task_id,
+                run_id=old_run_id,
+                expected_hash=old_run["bound_input_hash"],
+                allowed_states=allowed_input_states,
+            )
+            if isinstance(exact_run_inputs, _TaskFenceIngressFailure):
+                raise sqlite3.IntegrityError(exact_run_inputs.reason)
+            if not committed:
+                carried_input_ids = exact_run_inputs
+                requeued = conn.execute(
+                    "UPDATE main.task_fence_task_inputs "
+                    "SET state = 'pending', bound_run_id = NULL, "
+                    "state_changed_at = ? "
+                    "WHERE task_id = ? AND bound_run_id = ? "
+                    "AND state = 'bound'",
+                    (now, resolved_task_id, old_run_id),
+                )
+                if requeued.rowcount != len(carried_input_ids):
+                    raise sqlite3.IntegrityError(
+                        "Task Fence failed-run inputs changed"
+                    )
             conn.execute(
                 "UPDATE main.task_fence_dispatch_permits SET state = 'revoked' "
                 "WHERE run_id = ? AND state = 'reserved'",
@@ -6451,12 +6557,28 @@ class SessionDB:
             updated = conn.execute(
                 "UPDATE main.task_fence_execution_runs "
                 "SET state = 'closed', close_event_id = ?, "
-                "close_reason = 'accepted_ingress', closed_at = ? "
+                "close_reason = ?, closed_at = ? "
                 "WHERE run_id = ? AND state = 'open'",
-                (event_id, now, old_run_id),
+                (
+                    event_id,
+                    (
+                        "accepted_ingress"
+                        if committed
+                        else "accepted_ingress_unpresented"
+                    ),
+                    now,
+                    old_run_id,
+                ),
             )
             if updated.rowcount != 1:
                 raise sqlite3.IntegrityError("Task Fence open run changed")
+
+        if carried_input_ids:
+            if set(carried_input_ids).intersection(pending_ids):
+                raise sqlite3.IntegrityError(
+                    "Task Fence failed-run input is already pending"
+                )
+            pending_ids = (*carried_input_ids, *pending_ids)
 
         if action.correlation_kind is CorrelationKind.OPEN_QUESTION:
             conn.execute(
@@ -6561,12 +6683,9 @@ class SessionDB:
                     "Task Fence post-mutation pending state changed"
                 )
             pending_after = expected_pending_after
-            manifest = json.dumps(
-                pending_after,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            bound_input_hash = hashlib.sha256(manifest).hexdigest()
+            bound_input_hash = self._task_fence_input_manifest_hash(
+                pending_after
+            )
             opened_run_id = f"tfr_{uuid.uuid4().hex}"
             conn.execute(
                 "INSERT INTO main.task_fence_execution_runs ("
@@ -6641,6 +6760,541 @@ class SessionDB:
                 "Task Fence acceptance snapshot is unreadable"
             )
         return acceptance
+
+    @staticmethod
+    def _close_task_fence_generation_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        generation_id: str,
+        now: float,
+    ) -> bool:
+        """Close current authority while preserving a committed outcome."""
+
+        updated = conn.execute(
+            "UPDATE main.task_fence_model_generations SET "
+            "state = CASE "
+            "WHEN state IN ('reserved', 'started') THEN 'cancelled' "
+            "ELSE state END, closed_at = ? "
+            "WHERE generation_id = ? AND closed_at IS NULL "
+            "AND state IN ('reserved', 'started', 'committed')",
+            (now, generation_id),
+        )
+        return updated.rowcount == 1
+
+    def _task_fence_exact_run_input_ids_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        run_id: str,
+        expected_hash: str,
+        allowed_states: frozenset[str],
+    ) -> Tuple[str, ...] | _TaskFenceIngressFailure:
+        inputs = self._task_fence_run_inputs_unlocked(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+        )
+        if isinstance(inputs, _TaskFenceIngressFailure):
+            return inputs
+        input_ids = tuple(input_id for input_id, _state in inputs)
+        if (
+            any(state not in allowed_states for _input_id, state in inputs)
+            or self._task_fence_input_manifest_hash(input_ids) != expected_hash
+        ):
+            return _TaskFenceIngressFailure(
+                "incompatible_generation_input_manifest",
+                unavailable=True,
+            )
+        return input_ids
+
+    @staticmethod
+    def _task_fence_run_has_committed_generation_unlocked(
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+    ) -> bool:
+        row = conn.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM main.task_fence_model_generations "
+            "WHERE run_id = ? AND state = 'committed'"
+            ")",
+            (run_id,),
+        ).fetchone()
+        return bool(row[0])
+
+    def _reserve_task_fence_generation_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        acceptance: IngressAcceptance,
+        *,
+        generation_id: str,
+        now: float,
+    ) -> CausalEnvelope:
+        store = self._inspect_task_fence_store_unlocked(include_counts=False)
+        if not store.compatible:
+            raise TaskFenceProvenanceUnavailable(store.reason)
+
+        projection = acceptance.task_projection
+        if (
+            acceptance.task_id is None
+            or projection is None
+            or acceptance.task_id != projection.task_id
+        ):
+            raise TaskFenceProvenanceRejected("missing_task_authority")
+        if (
+            projection.status != "running"
+            or projection.active_authority_event_id is None
+            or projection.active_execution_run_id is None
+        ):
+            raise TaskFenceProvenanceRejected("missing_open_run")
+
+        historical = self._task_fence_acceptance_unlocked(
+            conn,
+            acceptance.event_id,
+            replayed=acceptance.replayed,
+        )
+        if isinstance(historical, _TaskFenceIngressFailure):
+            raise TaskFenceProvenanceUnavailable(historical.reason)
+        if historical != acceptance:
+            raise TaskFenceProvenanceRejected("acceptance_projection_mismatch")
+
+        task = conn.execute(
+            "SELECT task_id, conversation_id, cohort_key, "
+            "store_schema_version, control_protocol_version, intent_epoch, "
+            "control_revision, status, active_authority_event_id, "
+            "active_execution_run_id, current_generation_id, "
+            "current_runtime_epoch, last_accepted_order, "
+            "last_transition_event_id "
+            "FROM main.task_fence_tasks WHERE task_id = ?",
+            (projection.task_id,),
+        ).fetchone()
+        if task is None or not self._task_fence_task_projection_compatible(task):
+            raise TaskFenceProvenanceUnavailable("incompatible_task_projection")
+
+        expected_task = (
+            projection.task_id,
+            projection.conversation_id,
+            projection.cohort_key,
+            projection.store_schema_version,
+            projection.control_protocol_version,
+            projection.intent_epoch,
+            projection.control_revision,
+            projection.status,
+            projection.active_authority_event_id,
+            projection.active_execution_run_id,
+            projection.current_runtime_epoch,
+            projection.last_accepted_order,
+            projection.last_transition_event_id,
+        )
+        current_task = (
+            task["task_id"],
+            task["conversation_id"],
+            task["cohort_key"],
+            task["store_schema_version"],
+            task["control_protocol_version"],
+            task["intent_epoch"],
+            task["control_revision"],
+            task["status"],
+            task["active_authority_event_id"],
+            task["active_execution_run_id"],
+            task["current_runtime_epoch"],
+            task["last_accepted_order"],
+            task["last_transition_event_id"],
+        )
+        if current_task != expected_task:
+            raise TaskFenceProvenanceRejected("stale_acceptance")
+
+        run = conn.execute(
+            "SELECT task_id, authority_event_id, intent_epoch, "
+            "control_revision, runtime_epoch, bound_input_hash, state "
+            "FROM main.task_fence_execution_runs WHERE run_id = ?",
+            (projection.active_execution_run_id,),
+        ).fetchone()
+        if (
+            run is None
+            or run["state"] != "open"
+            or run["task_id"] != projection.task_id
+            or run["authority_event_id"] != projection.active_authority_event_id
+            or run["intent_epoch"] != projection.intent_epoch
+            or run["control_revision"] != projection.control_revision
+            or run["runtime_epoch"] != projection.current_runtime_epoch
+            or not isinstance(run["bound_input_hash"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", run["bound_input_hash"]) is None
+        ):
+            raise TaskFenceProvenanceRejected("stale_execution_run")
+
+        previous_generation_id = task["current_generation_id"]
+        open_generations = conn.execute(
+            "SELECT generation_id FROM main.task_fence_model_generations "
+            "WHERE task_id = ? "
+            "AND (state IN ('reserved', 'started') OR closed_at IS NULL) "
+            "ORDER BY generation_id LIMIT 2",
+            (projection.task_id,),
+        ).fetchall()
+        if previous_generation_id is None and open_generations:
+            raise TaskFenceProvenanceUnavailable(
+                "incompatible_current_generation"
+            )
+        if previous_generation_id is not None:
+            previous = conn.execute(
+                "SELECT task_id, run_id, intent_epoch, control_revision, "
+                "runtime_epoch, state, closed_at "
+                "FROM main.task_fence_model_generations "
+                "WHERE generation_id = ?",
+                (previous_generation_id,),
+            ).fetchone()
+            if (
+                previous is None
+                or previous["task_id"] != projection.task_id
+                or previous["run_id"] != projection.active_execution_run_id
+                or previous["intent_epoch"] != projection.intent_epoch
+                or previous["control_revision"] != projection.control_revision
+                or previous["runtime_epoch"] != projection.current_runtime_epoch
+                or previous["state"]
+                not in {"reserved", "started", "committed"}
+                or previous["closed_at"] is not None
+                or len(open_generations) != 1
+                or open_generations[0]["generation_id"]
+                != previous_generation_id
+            ):
+                raise TaskFenceProvenanceUnavailable(
+                    "incompatible_current_generation"
+                )
+            if not self._close_task_fence_generation_unlocked(
+                conn,
+                generation_id=previous_generation_id,
+                now=now,
+            ):
+                raise TaskFenceProvenanceUnavailable(
+                    "incompatible_current_generation"
+                )
+
+        exact_run_inputs = self._task_fence_exact_run_input_ids_unlocked(
+            conn,
+            task_id=projection.task_id,
+            run_id=projection.active_execution_run_id,
+            expected_hash=run["bound_input_hash"],
+            allowed_states=frozenset({"bound", "presented"}),
+        )
+        if isinstance(exact_run_inputs, _TaskFenceIngressFailure):
+            raise TaskFenceProvenanceUnavailable(exact_run_inputs.reason)
+
+        conn.execute(
+            "INSERT INTO main.task_fence_model_generations ("
+            "generation_id, task_id, run_id, intent_epoch, control_revision, "
+            "runtime_epoch, input_manifest_hash, snapshot_event_id, state, "
+            "opened_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)",
+            (
+                generation_id,
+                projection.task_id,
+                projection.active_execution_run_id,
+                projection.intent_epoch,
+                projection.control_revision,
+                projection.current_runtime_epoch,
+                run["bound_input_hash"],
+                acceptance.event_id,
+                now,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE main.task_fence_tasks "
+            "SET current_generation_id = ?, updated_at = ? "
+            "WHERE task_id = ? AND intent_epoch = ? "
+            "AND control_revision = ? AND current_runtime_epoch = ? "
+            "AND active_execution_run_id = ? AND last_accepted_order = ? "
+            "AND current_generation_id IS ?",
+            (
+                generation_id,
+                now,
+                projection.task_id,
+                projection.intent_epoch,
+                projection.control_revision,
+                projection.current_runtime_epoch,
+                projection.active_execution_run_id,
+                projection.last_accepted_order,
+                previous_generation_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise sqlite3.IntegrityError(
+                "Task Fence generation authority changed"
+            )
+
+        return CausalEnvelope(
+            task_id=projection.task_id,
+            authority_event_id=projection.active_authority_event_id,
+            run_id=projection.active_execution_run_id,
+            generation_id=generation_id,
+            snapshot_event_id=acceptance.event_id,
+            input_manifest_hash=run["bound_input_hash"],
+            store_schema_version=projection.store_schema_version,
+            control_protocol_version=projection.control_protocol_version,
+            intent_epoch=projection.intent_epoch,
+            control_revision=projection.control_revision,
+            runtime_epoch=projection.current_runtime_epoch,
+            accepted_order=projection.last_accepted_order,
+        )
+
+    def reserve_task_fence_generation(
+        self,
+        acceptance: IngressAcceptance,
+    ) -> CausalEnvelope:
+        """Record one model-generation attempt against exact accepted authority."""
+
+        if not isinstance(acceptance, IngressAcceptance):
+            raise TaskFenceProvenanceRejected("invalid_acceptance_type")
+        if self.read_only:
+            raise TaskFenceProvenanceUnavailable("read_only_store")
+        if self._conn is None:
+            raise TaskFenceProvenanceUnavailable("closed_store")
+        generation_id = f"tfg_{uuid.uuid4().hex}"
+        try:
+            return self._execute_write(
+                lambda conn: self._reserve_task_fence_generation_unlocked(
+                    conn,
+                    acceptance,
+                    generation_id=generation_id,
+                    now=time.time(),
+                )
+            )
+        except (TaskFenceProvenanceRejected, TaskFenceProvenanceUnavailable):
+            raise
+        except sqlite3.OperationalError as exc:
+            raise TaskFenceProvenanceUnavailable(
+                "generation_unavailable"
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            raise TaskFenceProvenanceUnavailable(
+                "generation_database_error"
+            ) from exc
+
+    def finish_task_fence_generation(
+        self,
+        envelope: CausalEnvelope,
+        *,
+        state: str,
+    ) -> bool:
+        """Finish the exact generation without refreshing stale authority."""
+
+        if not isinstance(envelope, CausalEnvelope):
+            raise TaskFenceProvenanceRejected("invalid_causal_envelope_type")
+        if envelope.invocation_id is not None:
+            raise TaskFenceProvenanceRejected("generation_envelope_required")
+        if state not in {"committed", "failed", "cancelled"}:
+            raise TaskFenceProvenanceRejected("invalid_generation_state")
+        if self.read_only:
+            raise TaskFenceProvenanceUnavailable("read_only_store")
+        if self._conn is None:
+            raise TaskFenceProvenanceUnavailable("closed_store")
+
+        def _finish(conn: sqlite3.Connection) -> bool:
+            store = self._inspect_task_fence_store_unlocked(
+                include_counts=False
+            )
+            if not store.compatible:
+                raise TaskFenceProvenanceUnavailable(store.reason)
+
+            row = conn.execute(
+                "SELECT g.generation_id, g.task_id, g.run_id, "
+                "g.intent_epoch, g.control_revision, g.runtime_epoch, "
+                "g.input_manifest_hash, g.snapshot_event_id, g.state, "
+                "g.closed_at, r.authority_event_id, "
+                "r.bound_input_hash AS run_input_manifest_hash, "
+                "r.state AS run_state, "
+                "s.task_id AS snapshot_task_id, "
+                "s.task_store_schema_version AS snapshot_store_schema_version, "
+                "s.task_control_protocol_version "
+                "AS snapshot_control_protocol_version, "
+                "s.task_intent_epoch AS snapshot_intent_epoch, "
+                "s.task_control_revision AS snapshot_control_revision, "
+                "s.task_active_authority_event_id "
+                "AS snapshot_authority_event_id, "
+                "s.task_active_execution_run_id AS snapshot_run_id, "
+                "s.task_current_runtime_epoch AS snapshot_runtime_epoch, "
+                "s.task_last_accepted_order AS snapshot_accepted_order, "
+                "i.accepted_order, t.store_schema_version, "
+                "t.control_protocol_version, t.intent_epoch AS task_intent_epoch, "
+                "t.control_revision AS task_control_revision, t.status, "
+                "t.active_authority_event_id, t.active_execution_run_id, "
+                "t.current_generation_id, "
+                "t.current_runtime_epoch AS task_runtime_epoch "
+                "FROM main.task_fence_model_generations AS g "
+                "JOIN main.task_fence_execution_runs AS r "
+                "ON r.run_id = g.run_id "
+                "JOIN main.task_fence_acceptance_snapshots AS s "
+                "ON s.event_id = g.snapshot_event_id "
+                "JOIN main.task_fence_ingress AS i "
+                "ON i.event_id = g.snapshot_event_id "
+                "JOIN main.task_fence_tasks AS t ON t.task_id = g.task_id "
+                "WHERE g.generation_id = ?",
+                (envelope.generation_id,),
+            ).fetchone()
+            expected = (
+                envelope.generation_id,
+                envelope.task_id,
+                envelope.run_id,
+                envelope.intent_epoch,
+                envelope.control_revision,
+                envelope.runtime_epoch,
+                envelope.input_manifest_hash,
+                envelope.snapshot_event_id,
+                envelope.authority_event_id,
+                envelope.input_manifest_hash,
+                envelope.task_id,
+                envelope.store_schema_version,
+                envelope.control_protocol_version,
+                envelope.intent_epoch,
+                envelope.control_revision,
+                envelope.authority_event_id,
+                envelope.run_id,
+                envelope.runtime_epoch,
+                envelope.accepted_order,
+                envelope.accepted_order,
+            )
+            if row is None or (
+                row["generation_id"],
+                row["task_id"],
+                row["run_id"],
+                row["intent_epoch"],
+                row["control_revision"],
+                row["runtime_epoch"],
+                row["input_manifest_hash"],
+                row["snapshot_event_id"],
+                row["authority_event_id"],
+                row["run_input_manifest_hash"],
+                row["snapshot_task_id"],
+                row["snapshot_store_schema_version"],
+                row["snapshot_control_protocol_version"],
+                row["snapshot_intent_epoch"],
+                row["snapshot_control_revision"],
+                row["snapshot_authority_event_id"],
+                row["snapshot_run_id"],
+                row["snapshot_runtime_epoch"],
+                row["snapshot_accepted_order"],
+                row["accepted_order"],
+            ) != expected:
+                raise TaskFenceProvenanceUnavailable(
+                    "generation_projection_mismatch"
+                )
+            if row["state"] == state:
+                return (
+                    state == "committed"
+                    or row["closed_at"] is not None
+                )
+            if row["state"] not in {"reserved", "started"}:
+                return False
+
+            current_authority = (
+                row["store_schema_version"] == envelope.store_schema_version
+                and row["control_protocol_version"]
+                == envelope.control_protocol_version
+                and row["task_intent_epoch"] == envelope.intent_epoch
+                and row["task_control_revision"] == envelope.control_revision
+                and row["status"] == "running"
+                and row["active_authority_event_id"]
+                == envelope.authority_event_id
+                and row["active_execution_run_id"] == envelope.run_id
+                and row["current_generation_id"] == envelope.generation_id
+                and row["task_runtime_epoch"] == envelope.runtime_epoch
+                and row["run_state"] == "open"
+                and row["closed_at"] is None
+            )
+            if not current_authority:
+                return False
+
+            exact_run_inputs = self._task_fence_exact_run_input_ids_unlocked(
+                conn,
+                task_id=envelope.task_id,
+                run_id=envelope.run_id,
+                expected_hash=envelope.input_manifest_hash,
+                allowed_states=frozenset({"bound", "presented"}),
+            )
+            if isinstance(exact_run_inputs, _TaskFenceIngressFailure):
+                raise TaskFenceProvenanceUnavailable(exact_run_inputs.reason)
+
+            now = time.time()
+            if state == "committed":
+                updated = conn.execute(
+                    "UPDATE main.task_fence_model_generations "
+                    "SET state = 'committed' "
+                    "WHERE generation_id = ? AND closed_at IS NULL "
+                    "AND state IN ('reserved', 'started')",
+                    (envelope.generation_id,),
+                )
+                if updated.rowcount != 1:
+                    return False
+                conn.execute(
+                    "UPDATE main.task_fence_task_inputs "
+                    "SET state = 'presented', state_changed_at = ? "
+                    "WHERE task_id = ? AND bound_run_id = ? "
+                    "AND state = 'bound'",
+                    (now, envelope.task_id, envelope.run_id),
+                )
+                presented_inputs = (
+                    self._task_fence_exact_run_input_ids_unlocked(
+                        conn,
+                        task_id=envelope.task_id,
+                        run_id=envelope.run_id,
+                        expected_hash=envelope.input_manifest_hash,
+                        allowed_states=frozenset({"presented"}),
+                    )
+                )
+                if isinstance(presented_inputs, _TaskFenceIngressFailure):
+                    raise sqlite3.IntegrityError(presented_inputs.reason)
+                return True
+
+            updated = conn.execute(
+                "UPDATE main.task_fence_model_generations "
+                "SET state = ?, closed_at = ? "
+                "WHERE generation_id = ? AND closed_at IS NULL "
+                "AND state IN ('reserved', 'started')",
+                (state, now, envelope.generation_id),
+            )
+            if updated.rowcount != 1:
+                return False
+            cleared = conn.execute(
+                "UPDATE main.task_fence_tasks "
+                "SET current_generation_id = NULL, updated_at = ? "
+                "WHERE task_id = ? AND store_schema_version = ? "
+                "AND control_protocol_version = ? AND intent_epoch = ? "
+                "AND control_revision = ? AND status = 'running' "
+                "AND active_authority_event_id = ? "
+                "AND active_execution_run_id = ? "
+                "AND current_generation_id = ? "
+                "AND current_runtime_epoch = ?",
+                (
+                    now,
+                    envelope.task_id,
+                    envelope.store_schema_version,
+                    envelope.control_protocol_version,
+                    envelope.intent_epoch,
+                    envelope.control_revision,
+                    envelope.authority_event_id,
+                    envelope.run_id,
+                    envelope.generation_id,
+                    envelope.runtime_epoch,
+                ),
+            )
+            if cleared.rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    "Task Fence generation authority changed"
+                )
+            return True
+
+        try:
+            return self._execute_write(_finish)
+        except (TaskFenceProvenanceRejected, TaskFenceProvenanceUnavailable):
+            raise
+        except sqlite3.OperationalError as exc:
+            raise TaskFenceProvenanceUnavailable(
+                "generation_finish_unavailable"
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            raise TaskFenceProvenanceUnavailable(
+                "generation_finish_database_error"
+            ) from exc
 
     def accept_task_fence_ingress(
         self,

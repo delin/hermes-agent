@@ -1,26 +1,32 @@
-"""Typed ingress contracts for the Task Fence control protocol.
+"""Typed ingress and causal contracts for the Task Fence control protocol.
 
-This module defines data that may cross the trusted ingress boundary. It does
-not authorize dispatch and deliberately contains no prompt, transcript, tool,
-or result payload fields.
+This module defines bounded, secret-free data that may cross trusted runtime
+boundaries. It does not authorize dispatch and deliberately contains no
+prompt, transcript, tool argument, or result payload fields.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterator, Mapping
 
 
 CONTROL_PROTOCOL_VERSION = 1
+TASK_FENCE_STORE_SCHEMA_VERSION = 3
 
 _MAX_SOURCE_BYTES = 256
 _MAX_IDENTIFIER_BYTES = 512
 _MAX_OPAQUE_REFERENCE_BYTES = 2_048
 _MAX_CORRELATION_IDS = 64
 _MAX_EVIDENCE_REFS = 32
+_MAX_CAUSAL_ENVELOPE_BYTES = 16_384
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -207,7 +213,7 @@ _ALLOWED_ACTION_SHAPES = frozenset(
 
 
 class TaskFenceProtocolRejected(ValueError):
-    """A typed ingress value does not satisfy the closed protocol."""
+    """A typed Task Fence value does not satisfy the closed protocol."""
 
     def __init__(self, reason: str):
         self.reason = reason
@@ -224,6 +230,18 @@ class TaskFenceIngressRejected(TaskFenceProtocolRejected):
 
 class TaskFenceIngressUnavailable(RuntimeError):
     """Shadow acceptance could not use a compatible writable control store."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class TaskFenceProvenanceRejected(TaskFenceProtocolRejected):
+    """A causal operation does not match its recorded task authority."""
+
+
+class TaskFenceProvenanceUnavailable(RuntimeError):
+    """Shadow provenance could not use a compatible writable control store."""
 
     def __init__(self, reason: str):
         self.reason = reason
@@ -437,6 +455,249 @@ class IngressAcceptance:
     opened_run_id: str | None
     closed_run_id: str | None
     accepted_at: float
+
+
+_CAUSAL_ENVELOPE_FIELDS = frozenset(
+    {
+        "task_id",
+        "authority_event_id",
+        "run_id",
+        "generation_id",
+        "snapshot_event_id",
+        "input_manifest_hash",
+        "store_schema_version",
+        "control_protocol_version",
+        "intent_epoch",
+        "control_revision",
+        "runtime_epoch",
+        "accepted_order",
+        "invocation_id",
+        "parent_invocation_id",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CausalEnvelope:
+    """Immutable authority copied from one recorded model generation.
+
+    `invocation_id` is absent on the generation envelope. Independently
+    dispatchable descendants derive a new envelope and may reference only the
+    immediately preceding invocation ID; every authority field is copied.
+    """
+
+    task_id: str
+    authority_event_id: str
+    run_id: str
+    generation_id: str
+    snapshot_event_id: str
+    input_manifest_hash: str
+    store_schema_version: int
+    control_protocol_version: int
+    intent_epoch: int
+    control_revision: int
+    runtime_epoch: int
+    accepted_order: int
+    invocation_id: str | None = None
+    parent_invocation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for field in (
+            "task_id",
+            "authority_event_id",
+            "run_id",
+            "generation_id",
+            "snapshot_event_id",
+        ):
+            _bounded_text(
+                getattr(self, field),
+                field=field,
+                max_bytes=_MAX_IDENTIFIER_BYTES,
+            )
+        for field in ("invocation_id", "parent_invocation_id"):
+            _bounded_text(
+                getattr(self, field),
+                field=field,
+                max_bytes=_MAX_IDENTIFIER_BYTES,
+                optional=True,
+            )
+        if not (
+            isinstance(self.input_manifest_hash, str)
+            and _SHA256_RE.fullmatch(self.input_manifest_hash)
+        ):
+            raise TaskFenceProtocolRejected("invalid_input_manifest_hash")
+        for field in (
+            "store_schema_version",
+            "control_protocol_version",
+            "intent_epoch",
+            "control_revision",
+            "runtime_epoch",
+            "accepted_order",
+        ):
+            value = getattr(self, field)
+            if type(value) is not int or not 0 <= value <= _MAX_SQLITE_INTEGER:
+                raise TaskFenceProtocolRejected(f"invalid_{field}")
+        if self.store_schema_version != TASK_FENCE_STORE_SCHEMA_VERSION:
+            raise TaskFenceProtocolRejected("invalid_store_schema_version")
+        if self.accepted_order < 1:
+            raise TaskFenceProtocolRejected("invalid_accepted_order")
+        if self.control_protocol_version != CONTROL_PROTOCOL_VERSION:
+            raise TaskFenceProtocolRejected("unsupported_protocol_version")
+        if self.invocation_id is None and self.parent_invocation_id is not None:
+            raise TaskFenceProtocolRejected("orphan_parent_invocation_id")
+        if (
+            self.invocation_id is not None
+            and self.invocation_id == self.parent_invocation_id
+        ):
+            raise TaskFenceProtocolRejected("cyclic_invocation_id")
+
+    def for_invocation(self, invocation_id: str | None = None) -> "CausalEnvelope":
+        """Copy authority into one new server-owned invocation identity."""
+
+        return CausalEnvelope(
+            task_id=self.task_id,
+            authority_event_id=self.authority_event_id,
+            run_id=self.run_id,
+            generation_id=self.generation_id,
+            snapshot_event_id=self.snapshot_event_id,
+            input_manifest_hash=self.input_manifest_hash,
+            store_schema_version=self.store_schema_version,
+            control_protocol_version=self.control_protocol_version,
+            intent_epoch=self.intent_epoch,
+            control_revision=self.control_revision,
+            runtime_epoch=self.runtime_epoch,
+            accepted_order=self.accepted_order,
+            invocation_id=(
+                f"tfiv_{uuid.uuid4().hex}"
+                if invocation_id is None
+                else invocation_id
+            ),
+            parent_invocation_id=self.invocation_id,
+        )
+
+    def _authority_tuple(self) -> tuple[object, ...]:
+        return (
+            self.task_id,
+            self.authority_event_id,
+            self.run_id,
+            self.generation_id,
+            self.snapshot_event_id,
+            self.input_manifest_hash,
+            self.store_schema_version,
+            self.control_protocol_version,
+            self.intent_epoch,
+            self.control_revision,
+            self.runtime_epoch,
+            self.accepted_order,
+        )
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        """Return the exact closed serialization shape."""
+
+        return {
+            "task_id": self.task_id,
+            "authority_event_id": self.authority_event_id,
+            "run_id": self.run_id,
+            "generation_id": self.generation_id,
+            "snapshot_event_id": self.snapshot_event_id,
+            "input_manifest_hash": self.input_manifest_hash,
+            "store_schema_version": self.store_schema_version,
+            "control_protocol_version": self.control_protocol_version,
+            "intent_epoch": self.intent_epoch,
+            "control_revision": self.control_revision,
+            "runtime_epoch": self.runtime_epoch,
+            "accepted_order": self.accepted_order,
+            "invocation_id": self.invocation_id,
+            "parent_invocation_id": self.parent_invocation_id,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(
+            self.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "CausalEnvelope":
+        if not isinstance(payload, dict) or set(payload) != _CAUSAL_ENVELOPE_FIELDS:
+            raise TaskFenceProtocolRejected("invalid_causal_envelope_fields")
+        try:
+            return cls(**payload)
+        except TypeError as exc:
+            raise TaskFenceProtocolRejected(
+                "invalid_causal_envelope_fields"
+            ) from exc
+
+    @classmethod
+    def from_json(cls, payload: object) -> "CausalEnvelope":
+        if not isinstance(payload, str):
+            raise TaskFenceProtocolRejected("invalid_causal_envelope_json")
+        try:
+            if len(payload.encode("utf-8")) > _MAX_CAUSAL_ENVELOPE_BYTES:
+                raise TaskFenceProtocolRejected(
+                    "causal_envelope_json_too_large"
+                )
+            decoded = json.loads(payload)
+        except TaskFenceProtocolRejected:
+            raise
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise TaskFenceProtocolRejected(
+                "invalid_causal_envelope_json"
+            ) from exc
+        envelope = cls.from_dict(decoded)
+        if envelope.to_json() != payload:
+            raise TaskFenceProtocolRejected("noncanonical_causal_envelope_json")
+        return envelope
+
+    @classmethod
+    def invocation_from_dict(
+        cls,
+        payload: object,
+        *,
+        parent: "CausalEnvelope",
+    ) -> "CausalEnvelope":
+        """Decode a child only when it preserves exact parent authority."""
+
+        if not isinstance(parent, CausalEnvelope):
+            raise TaskFenceProtocolRejected("invalid_causal_parent_type")
+        child = cls.from_dict(payload)
+        if (
+            child.invocation_id is None
+            or child.parent_invocation_id != parent.invocation_id
+            or child._authority_tuple() != parent._authority_tuple()
+        ):
+            raise TaskFenceProtocolRejected("mixed_causal_parentage")
+        return child
+
+
+_CURRENT_CAUSAL_ENVELOPE: ContextVar[CausalEnvelope | None] = ContextVar(
+    "task_fence_causal_envelope",
+    default=None,
+)
+
+
+def current_causal_envelope() -> CausalEnvelope | None:
+    """Return process-local immutable provenance without synthesizing it."""
+
+    return _CURRENT_CAUSAL_ENVELOPE.get()
+
+
+@contextmanager
+def bind_causal_envelope(
+    envelope: CausalEnvelope | None,
+) -> Iterator[CausalEnvelope | None]:
+    """Transport an already-created envelope inside one in-process scope."""
+
+    if envelope is not None and not isinstance(envelope, CausalEnvelope):
+        raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
+    token = _CURRENT_CAUSAL_ENVELOPE.set(envelope)
+    try:
+        yield envelope
+    finally:
+        _CURRENT_CAUSAL_ENVELOPE.reset(token)
 
 
 def validate_ingress_envelope(envelope: IngressEnvelope) -> None:

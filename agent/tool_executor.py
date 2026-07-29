@@ -326,6 +326,7 @@ def _run_agent_tool_execution_middleware(
     function_args: dict,
     effective_task_id: str,
     tool_call_id: str,
+    causal_envelope,
     execute,
 ) -> tuple[Any, dict]:
     observed_args = function_args
@@ -336,18 +337,20 @@ def _run_agent_tool_execution_middleware(
         return execute(observed_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
+    from task_fence import bind_causal_envelope
 
-    result = run_tool_execution_middleware(
-        function_name,
-        function_args,
-        _execute,
-        original_args=function_args,
-        task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
-        tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-    )
+    with bind_causal_envelope(causal_envelope):
+        result = run_tool_execution_middleware(
+            function_name,
+            function_args,
+            _execute,
+            original_args=function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
     return result, observed_args
 
 
@@ -608,6 +611,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
         """Worker function executed in a thread."""
+        from task_fence import bind_causal_envelope, current_causal_envelope
+
+        generation_envelope = current_causal_envelope()
+        invocation_envelope = (
+            generation_envelope.for_invocation()
+            if generation_envelope is not None
+            else None
+        )
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
@@ -638,16 +649,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         start = time.time()
         try:
             try:
-                result = agent._invoke_tool(
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                    tool_call.id,
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                    skip_tool_request_middleware=True,
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+                with bind_causal_envelope(invocation_envelope):
+                    result = agent._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                        skip_tool_request_middleware=True,
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
             except KeyboardInterrupt:
                 try:
                     agent.interrupt("keyboard interrupt")
@@ -1281,6 +1293,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        from task_fence import current_causal_envelope
+
+        _task_fence_parent = current_causal_envelope()
+        _task_fence_invocation = (
+            _task_fence_parent.for_invocation()
+            if not _execution_blocked and _task_fence_parent is not None
+            else None
+        )
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -1329,6 +1349,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
+                causal_envelope=_task_fence_invocation,
                 execute=_execute,
             )
             tool_duration = time.time() - tool_start_time
@@ -1358,6 +1379,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
+                causal_envelope=_task_fence_invocation,
                 execute=_execute,
             )
             tool_duration = time.time() - tool_start_time
@@ -1395,6 +1417,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
+                causal_envelope=_task_fence_invocation,
                 execute=_execute,
             )
             tool_duration = time.time() - tool_start_time
@@ -1415,6 +1438,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
+                causal_envelope=_task_fence_invocation,
                 execute=_execute,
             )
             tool_duration = time.time() - tool_start_time
@@ -1434,6 +1458,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_args=function_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
+                causal_envelope=_task_fence_invocation,
                 execute=_execute,
             )
             tool_duration = time.time() - tool_start_time
@@ -1466,6 +1491,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_args=function_args,
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
+                    causal_envelope=_task_fence_invocation,
                     execute=_execute,
                 )
                 _delegate_result = function_result
@@ -1497,6 +1523,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_args=function_args,
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
+                    causal_envelope=_task_fence_invocation,
                     execute=_execute,
                 )
                 _ce_result = function_result
@@ -1531,6 +1558,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_args=function_args,
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
+                    causal_envelope=_task_fence_invocation,
                     execute=_execute,
                 )
                 _mem_result = function_result
@@ -1567,6 +1595,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    **(
+                        {"causal_envelope": _task_fence_invocation}
+                        if _task_fence_invocation is not None
+                        else {}
+                    ),
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1609,6 +1642,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    **(
+                        {"causal_envelope": _task_fence_invocation}
+                        if _task_fence_invocation is not None
+                        else {}
+                    ),
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(

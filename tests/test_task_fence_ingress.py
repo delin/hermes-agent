@@ -635,8 +635,12 @@ def test_replay_preserves_fifo_pending_projection_after_inputs_are_bound(
     )
     second_pending = db.accept_task_fence_ingress(second_envelope)
 
-    assert first_pending.pending_input_ids == (first_pending.event_id,)
+    assert first_pending.pending_input_ids == (
+        initial.event_id,
+        first_pending.event_id,
+    )
     assert second_pending.pending_input_ids == (
+        initial.event_id,
         first_pending.event_id,
         second_pending.event_id,
     )
@@ -653,6 +657,7 @@ def test_replay_preserves_fifo_pending_projection_after_inputs_are_bound(
 
     assert replay == replace(second_pending, replayed=True)
     assert replay.pending_input_ids == (
+        initial.event_id,
         first_pending.event_id,
         second_pending.event_id,
     )
@@ -729,13 +734,27 @@ def test_pending_history_replay_is_exact_across_append_discard_bind_and_reopen(
     history.append((fourth_envelope, fourth))
 
     assert initial.pending_input_ids == ()
-    assert first.pending_input_ids == (first.event_id,)
-    assert second.pending_input_ids == (first.event_id, second.event_id)
-    assert note.pending_input_ids == (first.event_id, second.event_id)
-    assert discarded.pending_input_ids == (second.event_id,)
-    assert third.pending_input_ids == (second.event_id, third.event_id)
+    assert first.pending_input_ids == (initial.event_id, first.event_id)
+    assert second.pending_input_ids == (
+        initial.event_id,
+        first.event_id,
+        second.event_id,
+    )
+    assert note.pending_input_ids == second.pending_input_ids
+    assert discarded.pending_input_ids == (initial.event_id, second.event_id)
+    assert third.pending_input_ids == (
+        initial.event_id,
+        second.event_id,
+        third.event_id,
+    )
     assert resumed.pending_input_ids == ()
-    assert fourth.pending_input_ids == (fourth.event_id,)
+    assert fourth.pending_input_ids == (
+        initial.event_id,
+        second.event_id,
+        third.event_id,
+        resumed.event_id,
+        fourth.event_id,
+    )
     db.close()
 
     reopened = SessionDB(path)
@@ -781,7 +800,7 @@ def test_pending_history_rows_grow_linearly(tmp_path) -> None:
     )
     assert halfway_rows - baseline_rows == 3 * (event_count // 2)
     assert final_rows - halfway_rows == 3 * (event_count // 2)
-    assert len(latest.pending_input_ids) == event_count
+    assert len(latest.pending_input_ids) == event_count + 1
     assert _scalar(conn, "SELECT COUNT(*) FROM task_fence_ingress") == (
         event_count + 1
     )
@@ -823,7 +842,7 @@ def test_pending_history_reconstruction_is_bounded_before_collision(
     monkeypatch.setattr(
         hermes_state,
         "_TASK_FENCE_MAX_PENDING_HISTORY_WORK",
-        3,
+        4,
     )
     traced_statements: list[str] = []
     _connection(db).set_trace_callback(traced_statements.append)
@@ -850,7 +869,7 @@ def test_pending_history_reconstruction_is_bounded_before_collision(
         and "input_effect IN ('append', 'discard_selected')" in statement
     )
     assert history_queries
-    assert all("LIMIT 4" in statement for statement in history_queries)
+    assert all("LIMIT 5" in statement for statement in history_queries)
     assert _scalar(
         _connection(db),
         "SELECT COUNT(*) FROM task_fence_ingress_collisions",
@@ -1154,7 +1173,7 @@ def test_populated_v2_migration_fault_rolls_back_exact_state(
         assert _scalar(
             check,
             "SELECT COUNT(*) FROM task_fence_acceptance_pending_inputs",
-        ) == 1
+        ) == 2
         assert _task_fence_table_state(check) == state_before
         assert check.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
@@ -1207,7 +1226,7 @@ def test_inconsistent_populated_v2_is_left_exactly_untouched(tmp_path) -> None:
         assert _scalar(
             check,
             "SELECT COUNT(*) FROM task_fence_acceptance_pending_inputs",
-        ) == 2
+        ) == 4
     finally:
         check.close()
 
@@ -2057,8 +2076,12 @@ def test_pending_history_serializes_across_two_connections(tmp_path) -> None:
         second.close()
 
     earlier, later = sorted(results, key=lambda item: item.accepted_order)
-    assert earlier.pending_input_ids == (earlier.event_id,)
-    assert later.pending_input_ids == (earlier.event_id, later.event_id)
+    assert earlier.pending_input_ids == (initial.event_id, earlier.event_id)
+    assert later.pending_input_ids == (
+        initial.event_id,
+        earlier.event_id,
+        later.event_id,
+    )
     envelope_by_source = {item.source_event_id: item for item in envelopes}
     reopened = SessionDB(path)
     try:

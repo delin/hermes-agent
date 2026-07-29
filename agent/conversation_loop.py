@@ -1084,6 +1084,63 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _reserve_task_fence_shadow_generation(agent, acceptance):
+    """Best-effort shadow reservation; never changes legacy model dispatch."""
+
+    if acceptance is None:
+        return None
+    session_db = getattr(agent, "_session_db", None)
+    reserve = getattr(session_db, "reserve_task_fence_generation", None)
+    if not callable(reserve):
+        logger.warning(
+            "Task Fence shadow generation unavailable: session store has no writer"
+        )
+        return None
+    try:
+        return reserve(acceptance)
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow generation reservation failed: %s",
+            getattr(exc, "reason", type(exc).__name__),
+        )
+        return None
+
+
+def _finish_task_fence_shadow_generation(
+    agent,
+    envelope,
+    *,
+    state: str,
+    required: bool = False,
+) -> None:
+    """Best-effort outcome observation for one exact recorded generation."""
+
+    if envelope is None:
+        if required:
+            logger.warning(
+                "Task Fence shadow provenance missing at model outcome"
+            )
+        return
+    session_db = getattr(agent, "_session_db", None)
+    finish = getattr(session_db, "finish_task_fence_generation", None)
+    if not callable(finish):
+        logger.warning(
+            "Task Fence shadow generation finish unavailable: "
+            "session store has no writer"
+        )
+        return
+    try:
+        if finish(envelope, state=state) is False:
+            logger.warning(
+                "Task Fence shadow generation outcome rejected as stale"
+            )
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow generation finish failed: %s",
+            getattr(exc, "reason", type(exc).__name__),
+        )
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1094,6 +1151,7 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    task_fence_acceptance: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1163,6 +1221,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        task_fence_acceptance=task_fence_acceptance,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1175,6 +1234,7 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _task_fence_acceptance = _ctx.task_fence_acceptance
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1974,8 +2034,10 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        _task_fence_generation_envelope = None
 
         while retry_count < max_retries:
+            _task_fence_generation_envelope = None
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -2209,17 +2271,42 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal _task_fence_generation_envelope
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                    from task_fence import bind_causal_envelope
+
+                    generation = _reserve_task_fence_shadow_generation(
+                        agent,
+                        _task_fence_acceptance,
+                    )
+                    _task_fence_generation_envelope = generation
+
+                    try:
+                        with bind_causal_envelope(generation):
+                            if _use_streaming:
+                                response = agent._interruptible_streaming_api_call(
+                                    next_api_kwargs,
+                                    on_first_delta=_stop_spinner,
+                                )
+                            else:
+                                response = agent._interruptible_api_call(
+                                    next_api_kwargs
+                                )
+                    except BaseException:
+                        _finish_task_fence_shadow_generation(
+                            agent,
+                            generation,
+                            state="failed",
+                            required=_task_fence_acceptance is not None,
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                        _task_fence_generation_envelope = None
+                        raise
+                    return response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -2233,22 +2320,33 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    try:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
+                    except BaseException:
+                        if _task_fence_generation_envelope is not None:
+                            _finish_task_fence_shadow_generation(
+                                agent,
+                                _task_fence_generation_envelope,
+                                state="failed",
+                                required=True,
+                            )
+                        _task_fence_generation_envelope = None
+                        raise
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -2266,6 +2364,14 @@ def run_conversation(
                     # redirect() observed the request as active just before this
                     # call returned. Discard that now-stale response and rebuild
                     # from the correction rather than silently losing it.
+                    if _task_fence_generation_envelope is not None:
+                        _finish_task_fence_shadow_generation(
+                            agent,
+                            _task_fence_generation_envelope,
+                            state="cancelled",
+                            required=True,
+                        )
+                    _task_fence_generation_envelope = None
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
@@ -2376,6 +2482,13 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    _finish_task_fence_shadow_generation(
+                        agent,
+                        _task_fence_generation_envelope,
+                        state="failed",
+                        required=_task_fence_acceptance is not None,
+                    )
+                    _task_fence_generation_envelope = None
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -2549,6 +2662,12 @@ def run_conversation(
                         break  # rebuild this iteration from the correction
                     continue  # Retry the API call
 
+                _finish_task_fence_shadow_generation(
+                    agent,
+                    _task_fence_generation_envelope,
+                    state="committed",
+                    required=_task_fence_acceptance is not None,
+                )
                 agent._turn_received_provider_response = True
 
                 # Check finish_reason before proceeding
@@ -6041,7 +6160,15 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                from task_fence import bind_causal_envelope
+
+                with bind_causal_envelope(_task_fence_generation_envelope):
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

@@ -1081,7 +1081,7 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
-def handle_function_call(
+def _handle_function_call_impl(
     function_name: str,
     function_args: Dict[str, Any],
     task_id: Optional[str] = None,
@@ -1096,6 +1096,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    causal_envelope=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1206,6 +1207,11 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                causal_envelope=(
+                    causal_envelope.for_invocation()
+                    if causal_envelope is not None
+                    else None
+                ),
             )
 
     _tool_original_args = dict(function_args)
@@ -1327,12 +1333,14 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        enabled_tools=sandbox_enabled,
-                    )
+                    dispatch_kwargs = {
+                        "task_id": task_id,
+                        "session_id": session_id,
+                        "enabled_tools": sandbox_enabled,
+                    }
+                    if causal_envelope is not None:
+                        dispatch_kwargs["task_fence_envelope"] = causal_envelope
+                    return registry.dispatch(function_name, next_args, **dispatch_kwargs)
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
@@ -1415,6 +1423,64 @@ def handle_function_call(
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+
+
+_CAUSAL_ENVELOPE_UNSET = object()
+
+
+def handle_function_call(
+    function_name: str,
+    function_args: Dict[str, Any],
+    task_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
+    user_task: Optional[str] = None,
+    enabled_tools: Optional[List[str]] = None,
+    skip_pre_tool_call_hook: bool = False,
+    skip_tool_request_middleware: bool = False,
+    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+    causal_envelope=_CAUSAL_ENVELOPE_UNSET,
+) -> str:
+    """Bind immutable provenance around one dispatcher invocation."""
+
+    from task_fence import (
+        CausalEnvelope,
+        TaskFenceProtocolRejected,
+        bind_causal_envelope,
+        current_causal_envelope,
+    )
+
+    envelope = (
+        current_causal_envelope()
+        if causal_envelope is _CAUSAL_ENVELOPE_UNSET
+        else causal_envelope
+    )
+    if envelope is not None and not isinstance(envelope, CausalEnvelope):
+        raise TaskFenceProtocolRejected("invalid_causal_envelope_type")
+    if envelope is not None and envelope.invocation_id is None:
+        envelope = envelope.for_invocation()
+    with bind_causal_envelope(envelope):
+        return _handle_function_call_impl(
+            function_name=function_name,
+            function_args=function_args,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+            skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            tool_request_middleware_trace=tool_request_middleware_trace,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            causal_envelope=envelope,
+        )
 
 
 # =============================================================================

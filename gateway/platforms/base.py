@@ -2361,6 +2361,19 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _carry_latest_task_fence_ingress_result(
+    existing: MessageEvent,
+    incoming: MessageEvent,
+) -> None:
+    """Keep merged text bound only to the latest event's ingress result."""
+
+    existing.task_fence_ingress = incoming.task_fence_ingress
+    existing.task_fence_acceptance = incoming.task_fence_acceptance
+    existing.task_fence_acceptance_attempted = (
+        incoming.task_fence_acceptance_attempted
+    )
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2391,6 +2404,7 @@ def merge_pending_message_event(
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
+            _carry_latest_task_fence_ingress_result(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2410,6 +2424,7 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
+            _carry_latest_task_fence_ingress_result(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2420,6 +2435,7 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            _carry_latest_task_fence_ingress_result(existing, event)
             return
 
     pending_messages[session_key] = event
@@ -4910,6 +4926,7 @@ class BasePlatformAdapter(ABC):
                     if state.event.text
                     else event.text
                 )
+            _carry_latest_task_fence_ingress_result(state.event, event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:

@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
@@ -66,6 +66,20 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _bind_task_fence_worker(target: Callable[[], Any]) -> Callable[[], Any]:
+    """Copy only the immutable Task Fence envelope into a provider thread."""
+
+    from task_fence import bind_causal_envelope, current_causal_envelope
+
+    envelope = current_causal_envelope()
+
+    def _bound() -> Any:
+        with bind_causal_envelope(envelope):
+            return target()
+
+    return _bound
 
 
 def estimate_request_context_tokens(api_payload: Any) -> int:
@@ -810,7 +824,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    t = threading.Thread(target=_bind_task_fence_worker(_call), daemon=True)
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -2476,7 +2490,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception as e:
                 result["error"] = e
 
-        t = threading.Thread(target=_bedrock_call, daemon=True)
+        t = threading.Thread(
+            target=_bind_task_fence_worker(_bedrock_call),
+            daemon=True,
+        )
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
@@ -3757,7 +3774,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    t = threading.Thread(target=_bind_task_fence_worker(_call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
