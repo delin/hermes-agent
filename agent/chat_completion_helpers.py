@@ -102,13 +102,21 @@ def _is_task_fence_openai_chat_wire(agent) -> bool:
     return not is_native_gemini_base_url(base_url)
 
 
-def _is_task_fence_wp63a_model_wire(agent) -> bool:
-    if getattr(agent, "api_mode", None) != "chat_completions":
+def _is_task_fence_supported_model_wire(agent) -> bool:
+    api_mode = getattr(agent, "api_mode", None)
+    provider = getattr(agent, "provider", None)
+    if provider in {"moa", "copilot-acp"}:
         return False
-    if getattr(agent, "provider", None) in {"moa", "copilot-acp"}:
+    if api_mode == "anthropic_messages" and provider == "bedrock":
         return False
     base_url = str(getattr(agent, "base_url", "") or "")
-    return not base_url.lower().startswith(("acp://", "acp+tcp://"))
+    if base_url.lower().startswith(("acp://", "acp+tcp://")):
+        return False
+    return api_mode in {
+        "chat_completions",
+        "anthropic_messages",
+        "codex_responses",
+    }
 
 
 def _create_openai_chat_completion(
@@ -497,10 +505,17 @@ def _dispatch_nonstreaming_api_request(
     """
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
+        if task_fence_model_policy is None:
+            return agent._run_codex_stream(
+                api_kwargs,
+                client=request_client,
+                on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+            )
         return agent._run_codex_stream(
             api_kwargs,
             client=request_client,
             on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+            _task_fence_model_policy=task_fence_model_policy,
         )
     if agent.api_mode == "anthropic_messages":
         # #67142: use a request-local Anthropic client so the stale/interrupt
@@ -509,7 +524,16 @@ def _dispatch_nonstreaming_api_request(
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
+        if task_fence_model_policy is None:
+            return agent._anthropic_messages_create(
+                api_kwargs,
+                client=request_client,
+            )
+        return agent._anthropic_messages_create(
+            api_kwargs,
+            client=request_client,
+            _task_fence_model_policy=task_fence_model_policy,
+        )
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
         # normalize_converse_response produces an OpenAI-compatible
@@ -3381,8 +3405,30 @@ def interruptible_streaming_api_call(
         sanitize_anthropic_kwargs(
             api_kwargs, log_prefix=getattr(agent, "log_prefix", "")
         )
-        # Use the Anthropic SDK's streaming context manager
-        with request_client.messages.stream(**api_kwargs) as stream:
+        from agent.task_fence_provider import task_fence_model_stream_handoff
+
+        route = {
+            "api_mode": str(getattr(agent, "api_mode", "") or ""),
+            "provider": str(getattr(agent, "provider", "") or ""),
+            "model": str(
+                api_kwargs.get("model") or getattr(agent, "model", "") or ""
+            ),
+            "endpoint": str(
+                getattr(agent, "_anthropic_base_url", None)
+                or getattr(agent, "base_url", "")
+                or ""
+            ),
+        }
+        # The Anthropic SDK performs the lazy HTTP open in __enter__.
+        with task_fence_model_stream_handoff(
+            adapter="provider:anthropic.messages.stream",
+            request=api_kwargs,
+            route=route,
+            policy=task_fence_model_policy,
+            open_stream=lambda: request_client.messages.stream(
+                **api_kwargs
+            ),
+        ) as stream:
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``.  Snapshot diagnostic headers
             # immediately so they survive a stream that dies before the

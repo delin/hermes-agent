@@ -1225,7 +1225,14 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+    *,
+    task_fence_model_policy=None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1264,7 +1271,24 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         stream_kwargs["stream"] = True
 
         try:
-            event_stream = active_client.responses.create(**stream_kwargs)
+            from agent.task_fence_provider import task_fence_model_handoff
+
+            with task_fence_model_handoff(
+                adapter="provider:openai.responses.create",
+                request=stream_kwargs,
+                route={
+                    "api_mode": str(getattr(agent, "api_mode", "") or ""),
+                    "provider": str(getattr(agent, "provider", "") or ""),
+                    "model": str(
+                        stream_kwargs.get("model")
+                        or getattr(agent, "model", "")
+                        or ""
+                    ),
+                    "endpoint": str(getattr(agent, "base_url", "") or ""),
+                },
+                policy=task_fence_model_policy,
+            ):
+                event_stream = active_client.responses.create(**stream_kwargs)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(

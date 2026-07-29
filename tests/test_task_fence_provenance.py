@@ -1303,6 +1303,552 @@ def test_real_openai_stream_worker_keeps_policy_out_of_sdk_lifecycle(
         db.close()
 
 
+def test_real_anthropic_stream_retry_starts_before_each_lazy_open(
+    provenance_agent,
+    monkeypatch,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    observed = []
+    closed = []
+    request_secret = "raw-anthropic-real-path-secret"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-anthropic-stream-retry")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(provenance_agent, [])
+        provenance_agent.api_mode = "anthropic_messages"
+        provenance_agent.provider = "anthropic"
+        provenance_agent.model = "claude-test"
+        provenance_agent.base_url = "https://api.anthropic.com"
+        provenance_agent._anthropic_base_url = provenance_agent.base_url
+        provenance_agent._anthropic_api_key = "test-anthropic-key"
+        provenance_agent._is_anthropic_oauth = False
+        provenance_agent._disable_streaming = False
+        provenance_agent.stream_delta_callback = lambda _delta: None
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+
+        final_message = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text="anthropic retry succeeded",
+                )
+            ],
+            stop_reason="end_turn",
+            usage=None,
+        )
+        success_event = SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(
+                type="text_delta",
+                text="anthropic retry succeeded",
+            ),
+        )
+
+        def inspect_started(stage, request):
+            envelope = current_causal_envelope()
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            observed.append(
+                (
+                    stage,
+                    dict(request),
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+
+        class Stream:
+            response = None
+
+            def __init__(self, request, *, fail):
+                self.request = request
+                self.fail = fail
+
+            def __enter__(self):
+                inspect_started("enter", self.request)
+                return self
+
+            def __iter__(self):
+                inspect_started("iterate", self.request)
+                if self.fail:
+                    raise httpx.RemoteProtocolError(
+                        "anthropic stream transport dropped"
+                    )
+                return iter([success_event])
+
+            def get_final_message(self):
+                inspect_started("final", self.request)
+                return final_message
+
+            def __exit__(self, *_args):
+                inspect_started("exit", self.request)
+                return False
+
+        class Messages:
+            def __init__(self):
+                self.calls = 0
+
+            def stream(self, **kwargs):
+                inspect_started("factory", kwargs)
+                self.calls += 1
+                return Stream(dict(kwargs), fail=self.calls == 1)
+
+        request_client = SimpleNamespace(messages=Messages())
+
+        def close_client(_client, *, reason):
+            closed.append(
+                (
+                    reason,
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+
+        with (
+            patch.object(
+                provenance_agent,
+                "_create_request_anthropic_client",
+                return_value=request_client,
+            ),
+            patch.object(
+                provenance_agent,
+                "_close_request_anthropic_client",
+                side_effect=close_client,
+            ),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "anthropic retry succeeded"
+        factory_entries = [
+            entry for entry in observed if entry[0] == "factory"
+        ]
+        assert len(factory_entries) == 2
+        assert {entry[3] for entry in observed} == {"STARTED"}
+        assert all(entry[4] is None for entry in observed)
+        assert not any(entry[5] for entry in observed)
+        envelopes = [entry[2] for entry in factory_entries]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert {envelope.generation_id for envelope in envelopes} == {
+            envelopes[0].generation_id
+        }
+        for envelope in envelopes:
+            lifecycle = [
+                entry
+                for entry in observed
+                if entry[2].invocation_id == envelope.invocation_id
+            ]
+            assert lifecycle
+            assert all(entry[2] == envelope for entry in lifecycle)
+        assert closed
+        assert all(entry[2] is None for entry in closed)
+        assert not any(entry[3] for entry in closed)
+        expected = model_wire_fingerprint(
+            adapter="provider:anthropic.messages.stream",
+            request=factory_entries[0][1],
+            route={
+                "api_mode": "anthropic_messages",
+                "provider": "anthropic",
+                "model": "claude-test",
+                "endpoint": provenance_agent.base_url,
+            },
+        )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            (
+                "admission",
+                "provider:anthropic.messages.stream",
+                expected,
+            ),
+            (
+                "authorization",
+                "provider:anthropic.messages.stream",
+                expected,
+            ),
+            (
+                "admission",
+                "provider:anthropic.messages.stream",
+                expected,
+            ),
+            (
+                "authorization",
+                "provider:anthropic.messages.stream",
+                expected,
+            ),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert request_secret not in audit_dump
+    finally:
+        db.close()
+
+
+def test_real_anthropic_nonstream_starts_before_messages_create(
+    provenance_agent,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    factories = []
+    creates = []
+    request_secret = "raw-anthropic-create-real-path-secret"
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text="anthropic create succeeded",
+            )
+        ],
+        stop_reason="end_turn",
+        usage=None,
+    )
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-anthropic-create")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(provenance_agent, [])
+        provenance_agent.api_mode = "anthropic_messages"
+        provenance_agent.provider = "anthropic"
+        provenance_agent.model = "claude-test"
+        provenance_agent.base_url = "https://api.anthropic.com"
+        provenance_agent._anthropic_base_url = provenance_agent.base_url
+        provenance_agent._anthropic_api_key = "test-anthropic-key"
+        provenance_agent._is_anthropic_oauth = False
+        provenance_agent._disable_streaming = True
+
+        def create(**kwargs):
+            envelope = current_causal_envelope()
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            creates.append(
+                (
+                    dict(kwargs),
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return response
+
+        request_client = SimpleNamespace(
+            messages=SimpleNamespace(create=create),
+        )
+
+        def make_client(*, reason):
+            factories.append(
+                (
+                    reason,
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return request_client
+
+        with (
+            patch.object(
+                provenance_agent,
+                "_create_request_anthropic_client",
+                side_effect=make_client,
+            ),
+            patch.object(provenance_agent, "_close_request_anthropic_client"),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "anthropic create succeeded"
+        assert len(factories) == 1
+        assert factories[0][0] == "anthropic_messages_request"
+        assert factories[0][1].invocation_id is None
+        assert factories[0][2] is None
+        assert factories[0][3] is False
+        assert len(creates) == 1
+        request, envelope, state, ambient_policy, carries_authority = creates[0]
+        assert envelope.invocation_id is not None
+        assert state == "STARTED"
+        assert ambient_policy is None
+        assert carries_authority is False
+        expected = model_wire_fingerprint(
+            adapter="provider:anthropic.messages.create",
+            request=request,
+            route={
+                "api_mode": "anthropic_messages",
+                "provider": "anthropic",
+                "model": str(request.get("model") or ""),
+                "endpoint": provenance_agent.base_url,
+            },
+        )
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, adapter, invocation_fingerprint "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            (
+                "admission",
+                "provider:anthropic.messages.create",
+                expected,
+            ),
+            (
+                "authorization",
+                "provider:anthropic.messages.create",
+                expected,
+            ),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 1
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert request_secret not in audit_dump
+    finally:
+        db.close()
+
+
+def test_real_codex_midstream_retry_starts_before_each_responses_create(
+    provenance_agent,
+    tmp_path,
+):
+    from agent.task_fence_provider import model_wire_fingerprint
+
+    db = SessionDB(tmp_path / "state.db")
+    creates = []
+    lifecycle = []
+    request_secret = "raw-codex-real-path-secret"
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-codex-midstream-retry")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(provenance_agent, [])
+        provenance_agent.api_mode = "codex_responses"
+        provenance_agent.provider = "openai-codex"
+        provenance_agent.model = "gpt-test-codex"
+        provenance_agent.base_url = "https://chatgpt.com/backend-api/codex"
+        provenance_agent._disable_streaming = False
+        provenance_agent.stream_delta_callback = lambda _delta: None
+
+        events = [
+            SimpleNamespace(
+                type="response.output_text.delta",
+                delta="codex retry succeeded",
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    usage=None,
+                    id="resp-task-fence-codex",
+                ),
+            ),
+        ]
+
+        class EventStream:
+            def __init__(self, *, fail):
+                self.fail = fail
+
+            def __iter__(self):
+                lifecycle.append(
+                    (
+                        "iterate",
+                        current_causal_envelope(),
+                        current_task_fence_policy(),
+                        _context_carries_task_fence_authority(),
+                    )
+                )
+                if self.fail:
+                    raise httpx.RemoteProtocolError(
+                        "codex responses stream dropped"
+                    )
+                return iter(events)
+
+            def close(self):
+                lifecycle.append(
+                    (
+                        "close",
+                        current_causal_envelope(),
+                        current_task_fence_policy(),
+                        _context_carries_task_fence_authority(),
+                    )
+                )
+
+        def create(**kwargs):
+            envelope = current_causal_envelope()
+            with db._lock:
+                attempt = db._conn.execute(
+                    "SELECT a.state FROM task_fence_attempts AS a "
+                    "JOIN task_fence_dispatch_permits AS p "
+                    "ON p.permit_id = a.permit_id "
+                    "WHERE p.invocation_envelope_id = ?",
+                    (envelope.invocation_id,),
+                ).fetchone()
+            creates.append(
+                (
+                    dict(kwargs),
+                    envelope,
+                    attempt["state"],
+                    current_task_fence_policy(),
+                    _context_carries_task_fence_authority(),
+                )
+            )
+            return EventStream(fail=len(creates) == 1)
+
+        request_client = SimpleNamespace(
+            responses=SimpleNamespace(create=create),
+        )
+
+        with (
+            patch.object(
+                provenance_agent,
+                "_create_request_openai_client",
+                return_value=request_client,
+            ),
+            patch.object(provenance_agent, "_close_request_openai_client"),
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            result = provenance_agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "codex retry succeeded"
+        assert len(creates) == 2
+        assert all(entry[0]["stream"] is True for entry in creates)
+        assert {entry[2] for entry in creates} == {"STARTED"}
+        assert all(entry[3] is None for entry in creates)
+        assert not any(entry[4] for entry in creates)
+        envelopes = [entry[1] for entry in creates]
+        assert len({envelope.invocation_id for envelope in envelopes}) == 2
+        assert len({envelope.generation_id for envelope in envelopes}) == 1
+        assert [entry[0] for entry in lifecycle] == [
+            "iterate",
+            "close",
+            "iterate",
+            "close",
+        ]
+        assert all(entry[2] is None for entry in lifecycle)
+        assert not any(entry[3] for entry in lifecycle)
+        route = {
+            "api_mode": "codex_responses",
+            "provider": "openai-codex",
+            "model": "gpt-test-codex",
+            "endpoint": provenance_agent.base_url,
+        }
+        expected = model_wire_fingerprint(
+            adapter="provider:openai.responses.create",
+            request=creates[0][0],
+            route=route,
+        )
+        decisions = db._conn.execute(
+            "SELECT decision_point, adapter, invocation_fingerprint "
+            "FROM task_fence_policy_decisions ORDER BY decision_order"
+        ).fetchall()
+        assert [tuple(row) for row in decisions] == [
+            (
+                "admission",
+                "provider:openai.responses.create",
+                expected,
+            ),
+            (
+                "authorization",
+                "provider:openai.responses.create",
+                expected,
+            ),
+            (
+                "admission",
+                "provider:openai.responses.create",
+                expected,
+            ),
+            (
+                "authorization",
+                "provider:openai.responses.create",
+                expected,
+            ),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert request_secret not in audit_dump
+    finally:
+        db.close()
+
+
 def test_real_native_gemini_stream_uses_worker_carrier_at_http_open(
     provenance_agent,
     tmp_path,

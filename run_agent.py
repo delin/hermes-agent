@@ -4800,10 +4800,23 @@ class AIAgent:
                 exc,
             )
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: callable = None,
+        *,
+        _task_fence_model_policy=None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+        return run_codex_stream(
+            self,
+            api_kwargs,
+            client,
+            on_first_delta,
+            task_fence_model_policy=_task_fence_model_policy,
+        )
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
@@ -5235,7 +5248,13 @@ class AIAgent:
             return False
         return pool.has_available()
 
-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
+    def _anthropic_messages_create(
+        self,
+        api_kwargs: dict,
+        *,
+        client: Any = None,
+        _task_fence_model_policy=None,
+    ):
         # When a request-local client is supplied it was already credential-
         # refreshed in ``_create_request_anthropic_client``; only the shared
         # fallback path refreshes here.
@@ -5254,6 +5273,19 @@ class AIAgent:
             # parsed Message drops. No-ops on providers that don't send the
             # matching header families (x-ratelimit-* / x-nous-credits-*).
             on_response=self._capture_anthropic_response_headers,
+            task_fence_model_policy=_task_fence_model_policy,
+            task_fence_model_route={
+                "api_mode": str(getattr(self, "api_mode", "") or ""),
+                "provider": str(getattr(self, "provider", "") or ""),
+                "model": str(
+                    api_kwargs.get("model") or getattr(self, "model", "") or ""
+                ),
+                "endpoint": str(
+                    getattr(self, "_anthropic_base_url", None)
+                    or getattr(self, "base_url", "")
+                    or ""
+                ),
+            },
         )
 
     def _rebuild_anthropic_client(self) -> None:

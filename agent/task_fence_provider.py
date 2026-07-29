@@ -7,7 +7,7 @@ import json
 import logging
 import uuid
 from contextlib import contextmanager
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 
 logger = logging.getLogger(__name__)
@@ -149,3 +149,24 @@ def task_fence_model_handoff(
         # the live policy/store facade to code beyond the audit boundary.
         with _without_task_fence_model_authority():
             yield
+
+
+@contextmanager
+def task_fence_model_stream_handoff(
+    *,
+    adapter: str,
+    request: Mapping[str, Any],
+    route: Mapping[str, Any],
+    policy: Any | None,
+    open_stream: Callable[[], Any],
+) -> Iterator[Any]:
+    """Audit the lazy stream open, then keep provider lifecycle unprivileged."""
+
+    with task_fence_model_handoff(
+        adapter=adapter,
+        request=request,
+        route=route,
+        policy=policy,
+    ):
+        with open_stream() as stream:
+            yield stream

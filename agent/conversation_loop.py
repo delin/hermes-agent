@@ -2284,7 +2284,7 @@ def run_conversation(
                         bind_task_fence_policy,
                     )
                     from agent.chat_completion_helpers import (
-                        _is_task_fence_wp63a_model_wire,
+                        _is_task_fence_supported_model_wire,
                     )
                     generation = _reserve_task_fence_shadow_generation(
                         agent,
@@ -2294,7 +2294,7 @@ def run_conversation(
                     provider_policy = None
                     if (
                         _task_fence_acceptance is not None
-                        and _is_task_fence_wp63a_model_wire(agent)
+                        and _is_task_fence_supported_model_wire(agent)
                     ):
                         provider_store = getattr(agent, "_session_db", None)
                         if provider_store is not None:

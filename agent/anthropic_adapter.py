@@ -2981,6 +2981,8 @@ def create_anthropic_message(
     prefer_stream: bool = True,
     on_stream_event=None,
     on_response=None,
+    task_fence_model_policy=None,
+    task_fence_model_route: Optional[dict] = None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available.
 
@@ -3007,13 +3009,25 @@ def create_anthropic_message(
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
+    from agent.task_fence_provider import (
+        task_fence_model_handoff,
+        task_fence_model_stream_handoff,
+    )
+
+    model_route = task_fence_model_route or {}
     messages_api = getattr(client, "messages", None)
     stream_fn = getattr(messages_api, "stream", None)
     if prefer_stream and callable(stream_fn):
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
         try:
-            with stream_fn(**stream_kwargs) as stream:
+            with task_fence_model_stream_handoff(
+                adapter="provider:anthropic.messages.stream",
+                request=stream_kwargs,
+                route=model_route,
+                policy=task_fence_model_policy,
+                open_stream=lambda: stream_fn(**stream_kwargs),
+            ) as stream:
                 if callable(on_response):
                     try:
                         on_response(getattr(stream, "response", None))
@@ -3047,4 +3061,10 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
-    return messages_api.create(**create_kwargs)
+    with task_fence_model_handoff(
+        adapter="provider:anthropic.messages.create",
+        request=create_kwargs,
+        route=model_route,
+        policy=task_fence_model_policy,
+    ):
+        return messages_api.create(**create_kwargs)

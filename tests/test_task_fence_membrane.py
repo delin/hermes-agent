@@ -726,39 +726,90 @@ def test_openai_model_wire_ignores_public_tool_policy_without_explicit_capabilit
 
 
 @pytest.mark.parametrize(
-    ("provider", "base_url", "openai_owned", "wp63a_supported"),
+    ("api_mode", "provider", "base_url", "openai_owned", "supported"),
     [
-        ("openrouter", "https://openrouter.ai/api/v1", True, True),
         (
+            "chat_completions",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            True,
+            True,
+        ),
+        (
+            "chat_completions",
             "gemini",
             "https://generativelanguage.googleapis.com/v1beta",
             False,
             True,
         ),
-        ("moa", "https://virtual.invalid/v1", False, False),
-        ("copilot-acp", "acp://copilot", False, False),
-        ("custom", "acp+tcp://127.0.0.1:7777", False, False),
+        (
+            "anthropic_messages",
+            "anthropic",
+            "https://api.anthropic.com",
+            False,
+            True,
+        ),
+        (
+            "anthropic_messages",
+            "bedrock",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            False,
+            False,
+        ),
+        (
+            "codex_responses",
+            "openai-codex",
+            "https://chatgpt.com/backend-api/codex",
+            False,
+            True,
+        ),
+        (
+            "codex_responses",
+            "copilot",
+            "https://models.github.ai/inference",
+            False,
+            True,
+        ),
+        (
+            "codex_responses",
+            "xai-oauth",
+            "https://api.x.ai/v1",
+            False,
+            True,
+        ),
+        ("codex_app_server", "openai-codex", "", False, False),
+        ("bedrock_converse", "bedrock", "", False, False),
+        ("chat_completions", "moa", "https://virtual.invalid/v1", False, False),
+        ("chat_completions", "copilot-acp", "acp://copilot", False, False),
+        (
+            "codex_responses",
+            "custom",
+            "acp+tcp://127.0.0.1:7777",
+            False,
+            False,
+        ),
     ],
 )
 def test_openai_model_wire_ownership_excludes_non_sdk_facades(
+    api_mode,
     provider,
     base_url,
     openai_owned,
-    wp63a_supported,
+    supported,
 ):
     from agent.chat_completion_helpers import (
         _is_task_fence_openai_chat_wire,
-        _is_task_fence_wp63a_model_wire,
+        _is_task_fence_supported_model_wire,
     )
 
     agent = SimpleNamespace(
-        api_mode="chat_completions",
+        api_mode=api_mode,
         provider=provider,
         base_url=base_url,
     )
 
     assert _is_task_fence_openai_chat_wire(agent) is openai_owned
-    assert _is_task_fence_wp63a_model_wire(agent) is wp63a_supported
+    assert _is_task_fence_supported_model_wire(agent) is supported
 
 
 def test_gemini_native_nonstream_starts_before_http_handoff(tmp_path):
@@ -1090,6 +1141,226 @@ async def test_async_gemini_stream_does_not_carry_policy_across_threaded_yields(
         ).fetchone()[0] == 1
     finally:
         await client.close()
+        db.close()
+
+
+def test_anthropic_stream_fallback_starts_each_physical_handoff(tmp_path):
+    from agent.anthropic_adapter import create_anthropic_message
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    prompt_secret = "raw-anthropic-fallback-secret"
+    observed = []
+    response = SimpleNamespace(content=[], stop_reason="end_turn")
+
+    def inspect_handoff(stage, request):
+        envelope = current_causal_envelope()
+        attempt = db._conn.execute(
+            "SELECT a.state FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id "
+            "WHERE p.invocation_envelope_id = ?",
+            (envelope.invocation_id,),
+        ).fetchone()
+        observed.append(
+            (
+                stage,
+                dict(request),
+                envelope,
+                attempt["state"],
+                current_task_fence_policy(),
+            )
+        )
+
+    class UnavailableStream:
+        def __enter__(self):
+            inspect_handoff("stream_enter", request)
+            raise RuntimeError("stream is not supported by this provider")
+
+        def __exit__(self, *_args):
+            return False
+
+    class Messages:
+        @staticmethod
+        def stream(**kwargs):
+            inspect_handoff("stream_factory", kwargs)
+            return UnavailableStream()
+
+        @staticmethod
+        def create(**kwargs):
+            inspect_handoff("create", kwargs)
+            return response
+
+    request = {
+        "model": "claude-test",
+        "messages": [{"role": "user", "content": prompt_secret}],
+    }
+    route = {
+        "api_mode": "anthropic_messages",
+        "provider": "anthropic",
+        "model": "claude-test",
+        "endpoint": "https://api.anthropic.com",
+    }
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+        ):
+            result = create_anthropic_message(
+                SimpleNamespace(messages=Messages()),
+                request,
+                task_fence_model_policy=policy,
+                task_fence_model_route=route,
+            )
+
+        assert result is response
+        assert [entry[0] for entry in observed] == [
+            "stream_factory",
+            "stream_enter",
+            "create",
+        ]
+        assert {entry[3] for entry in observed} == {"STARTED"}
+        assert {entry[4] for entry in observed} == {None}
+        stream_envelope = observed[0][2]
+        assert observed[1][2] == stream_envelope
+        create_envelope = observed[2][2]
+        assert stream_envelope.invocation_id != create_envelope.invocation_id
+        assert {
+            stream_envelope.generation_id,
+            create_envelope.generation_id,
+        } == {generation.generation_id}
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT decision_point, adapter "
+                "FROM task_fence_policy_decisions ORDER BY decision_order"
+            )
+        ] == [
+            ("admission", "provider:anthropic.messages.stream"),
+            ("authorization", "provider:anthropic.messages.stream"),
+            ("admission", "provider:anthropic.messages.create"),
+            ("authorization", "provider:anthropic.messages.create"),
+        ]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 2
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert prompt_secret not in audit_dump
+    finally:
+        db.close()
+
+
+def test_anthropic_create_requires_explicit_model_capability(tmp_path):
+    from agent.anthropic_adapter import create_anthropic_message
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    observed = []
+    response = SimpleNamespace(content=[], stop_reason="end_turn")
+
+    class Messages:
+        @staticmethod
+        def create(**kwargs):
+            observed.append(
+                (
+                    dict(kwargs),
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                )
+            )
+            return response
+
+    try:
+        with (
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            bind_causal_envelope(generation),
+        ):
+            result = create_anthropic_message(
+                SimpleNamespace(messages=Messages()),
+                {"model": "claude-test", "messages": []},
+                prefer_stream=False,
+            )
+
+        assert result is response
+        assert len(observed) == 1
+        assert observed[0][1] == generation
+        assert observed[0][2] is None
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_codex_responses_requires_explicit_model_capability(tmp_path):
+    from agent.codex_runtime import run_codex_stream
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    observed = []
+    response = SimpleNamespace(output=[object()])
+
+    def create(**kwargs):
+        observed.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+            )
+        )
+        return response
+
+    agent = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        model="gpt-test-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        _interrupt_requested=False,
+        _fire_stream_delta=lambda _text: None,
+        _fire_reasoning_delta=lambda _text: None,
+        _fire_streamed_codex_commentary=lambda _text: None,
+        _touch_activity=lambda _description: None,
+        _client_log_context=lambda: "",
+        interim_assistant_callback=None,
+        show_commentary=True,
+    )
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=create),
+    )
+    try:
+        with (
+            bind_task_fence_policy(TaskFencePolicy(db)),
+            bind_causal_envelope(generation),
+        ):
+            result = run_codex_stream(
+                agent,
+                {"model": "gpt-test-codex", "input": []},
+                client=client,
+            )
+
+        assert result is response
+        assert len(observed) == 1
+        assert observed[0][0]["stream"] is True
+        assert observed[0][1] == generation
+        assert observed[0][2] is None
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+    finally:
         db.close()
 
 
