@@ -2,6 +2,7 @@ from contextvars import copy_context
 from dataclasses import FrozenInstanceError
 import hashlib
 import json
+import queue
 import threading
 import time
 from types import SimpleNamespace
@@ -16,6 +17,8 @@ from task_fence import (
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
     TaskFencePolicy,
+    TaskFenceIngressRejected,
+    TaskFenceIngressUnavailable,
     bind_causal_envelope,
     bind_task_fence_policy,
     current_causal_envelope,
@@ -82,6 +85,82 @@ def _task_fence_dispatch_dump(db: SessionDB) -> str:
     ):
         rows.extend(tuple(row) for row in db._conn.execute(statement))
     return repr(rows)
+
+
+def _task_fence_execution_counts(db: SessionDB) -> tuple[int, ...]:
+    return tuple(
+        db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "task_fence_execution_runs",
+            "task_fence_model_generations",
+            "task_fence_dispatch_permits",
+            "task_fence_attempts",
+        )
+    )
+
+
+def _task_fence_authority_projection(task) -> tuple:
+    return (
+        task.task_id,
+        task.conversation_id,
+        task.cohort_key,
+        task.store_schema_version,
+        task.control_protocol_version,
+        task.intent_epoch,
+        task.control_revision,
+        task.status,
+        task.active_authority_event_id,
+        task.active_execution_run_id,
+        task.current_generation_id,
+        task.current_runtime_epoch,
+        task.last_transition_event_id,
+        task.created_at,
+    )
+
+
+def _await_completion(delegation_id: str, *, timeout: float = 10.0):
+    from tools.process_registry import process_registry
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            event = process_registry.completion_queue.get_nowait()
+        except queue.Empty:
+            time.sleep(0.02)
+            continue
+        if event.get("delegation_id") == delegation_id:
+            return event
+    raise AssertionError(f"completion not received for {delegation_id}")
+
+
+def _dispatch_completed_batch(
+    async_delegation,
+    *,
+    delegation_id: str,
+    parent_generation_id=None,
+    parent_runtime_epoch=None,
+):
+    dispatch = async_delegation.dispatch_async_delegation_batch(
+        goals=["completion evidence"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test/model",
+        session_key="legacy-session-key",
+        runner=lambda: {
+            "results": [{"status": "completed", "summary": "done"}],
+            "total_duration_seconds": 0.0,
+        },
+        max_async_children=1,
+        delegation_id=delegation_id,
+        _task_fence_parent_generation_id=parent_generation_id,
+        _task_fence_parent_runtime_epoch=parent_runtime_epoch,
+    )
+    assert dispatch == {
+        "status": "dispatched",
+        "delegation_id": delegation_id,
+    }
+    return _await_completion(delegation_id)
 
 
 class _FakeChild:
@@ -461,7 +540,7 @@ def test_superseded_child_launch_is_shadow_only(tmp_path):
         db.close()
 
 
-def test_background_batch_owns_each_exact_child_launch_only(
+def test_background_batch_separates_exact_launch_from_synthetic_completion(
     tmp_path,
     monkeypatch,
     _clean_async_registry,
@@ -470,7 +549,7 @@ def test_background_batch_owns_each_exact_child_launch_only(
     import tools.delegate_tool as delegate_tool
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    db, acceptance, generation = _live_lane(tmp_path / "state.db")
     policy = TaskFencePolicy(db)
     parent_envelope = generation.for_invocation("tfiv_background_delegate_handler")
     goals = ["background-secret-alpha", "background-secret-beta"]
@@ -562,6 +641,7 @@ def test_background_batch_owns_each_exact_child_launch_only(
             )
 
         assert dispatch["status"] == "dispatched"
+        delegation_id = dispatch["delegation_id"]
         assert all_entered.wait(timeout=10.0)
         assert len(observed) == 2
         child_envelopes = [item[3] for item in observed]
@@ -591,12 +671,148 @@ def test_background_batch_owns_each_exact_child_launch_only(
             assert attempt[0] == "STARTED"
             assert attempt[2] == "delegate:run_conversation"
 
+        durable_parent = db._conn.execute(
+            "SELECT causal_parent_generation_id, causal_parent_runtime_epoch "
+            "FROM async_delegations WHERE delegation_id = ?",
+            (delegation_id,),
+        ).fetchone()
+        assert tuple(durable_parent) == (
+            generation.generation_id,
+            generation.runtime_epoch,
+        )
+
+        held = db.accept_task_fence_ingress(
+            _ingress(
+                "comment_hold",
+                "delegation-late-hold",
+                task_id=acceptance.task_id,
+            )
+        )
+        held_task = db.inspect_task_fence_task(acceptance.task_id).task
+        assert held_task is not None
+        assert held_task.status == "paused"
+        assert held_task.active_authority_event_id == held.event_id
+        assert held_task.active_execution_run_id is None
+        assert held_task.current_generation_id is None
+
         release.set()
         deadline = time.monotonic() + 10.0
         while async_delegation.active_count() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert async_delegation.active_count() == 0
         assert finalized_contexts == [(None, None, False)]
+        event = _await_completion(delegation_id)
+        durable = db._conn.execute(
+            "SELECT dispatched_at, event_json, delivery_state, "
+            "delivery_attempts, causal_parent_generation_id, "
+            "causal_parent_runtime_epoch FROM async_delegations "
+            "WHERE delegation_id = ?",
+            (delegation_id,),
+        ).fetchone()
+        assert durable is not None
+        assert json.loads(durable["event_json"]) == event
+        assert durable["delivery_state"] == "pending"
+        assert durable["delivery_attempts"] == 0
+        assert durable["causal_parent_generation_id"] == generation.generation_id
+        assert durable["causal_parent_runtime_epoch"] == generation.runtime_epoch
+        assert "causal_parent_generation_id" not in event
+        assert "causal_parent_runtime_epoch" not in event
+        assert not any(key.startswith("_task_fence_") for key in event)
+
+        execution_counts = _task_fence_execution_counts(db)
+        ingress_count = db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0]
+        snapshot_count = db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_acceptance_snapshots"
+        ).fetchone()[0]
+
+        claim_a = async_delegation.claim_event_delivery(event, "consumer-a")
+        assert claim_a is not None
+        assert async_delegation.claim_event_delivery(event, "consumer-loser") is None
+
+        source_identity = json.dumps(
+            (delegation_id, durable["dispatched_at"]),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        expected_source_event_id = "tfadc_" + _hash(source_identity)
+        synthetic = db._conn.execute(
+            "SELECT i.event_id, i.source_event_id, i.conversation_id, "
+            "i.task_id, i.origin, i.ingress_class, i.intent, i.execution, "
+            "i.input_effect, i.correlation_kind, i.payload_hash, "
+            "i.opaque_payload_ref, i.causal_parent_generation_id, "
+            "i.accepted_order, s.opened_run_id, s.closed_run_id, "
+            "s.task_status, s.task_active_authority_event_id, "
+            "s.task_active_execution_run_id, s.task_current_generation_id "
+            "FROM task_fence_ingress AS i "
+            "JOIN task_fence_acceptance_snapshots AS s "
+            "ON s.event_id = i.event_id "
+            "WHERE i.source = 'runtime:async_delegation'"
+        ).fetchall()
+        assert len(synthetic) == 1
+        evidence = synthetic[0]
+        assert (
+            evidence["source_event_id"],
+            evidence["conversation_id"],
+            evidence["task_id"],
+            evidence["origin"],
+            evidence["ingress_class"],
+            evidence["intent"],
+            evidence["execution"],
+            evidence["input_effect"],
+            evidence["correlation_kind"],
+            evidence["payload_hash"],
+            evidence["opaque_payload_ref"],
+            evidence["causal_parent_generation_id"],
+            evidence["opened_run_id"],
+            evidence["closed_run_id"],
+        ) == (
+            expected_source_event_id,
+            "delegation-conversation",
+            acceptance.task_id,
+            "runtime",
+            "synthetic",
+            "keep",
+            "none",
+            "none",
+            "none",
+            _hash(durable["event_json"]),
+            f"async-delegation:{delegation_id}:{expected_source_event_id}",
+            generation.generation_id,
+            None,
+            None,
+        )
+        assert (
+            evidence["task_status"],
+            evidence["task_active_authority_event_id"],
+            evidence["task_active_execution_run_id"],
+            evidence["task_current_generation_id"],
+        ) == ("paused", held.event_id, None, None)
+
+        after_claim = db.inspect_task_fence_task(acceptance.task_id).task
+        assert after_claim is not None
+        assert _task_fence_authority_projection(after_claim) == (
+            _task_fence_authority_projection(held_task)
+        )
+        assert after_claim.last_accepted_order == evidence["accepted_order"]
+        assert _task_fence_execution_counts(db) == execution_counts
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0] == ingress_count + 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_acceptance_snapshots"
+        ).fetchone()[0] == snapshot_count + 1
+
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 0
+        assert _task_fence_execution_counts(db) == execution_counts
+        assert async_delegation.complete_completion_delivery(
+            delegation_id,
+            claim_a,
+        )
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 2
@@ -610,4 +826,258 @@ def test_background_batch_owns_each_exact_child_launch_only(
         deadline = time.monotonic() + 10.0
         while async_delegation.active_count() and time.monotonic() < deadline:
             time.sleep(0.02)
+        db.close()
+
+
+def test_synthetic_evidence_replays_before_epoch_gate(tmp_path):
+    db, acceptance, generation = _live_lane(tmp_path / "state.db")
+    source_event_id = "tfadc_" + _hash("one-producer-incarnation")
+    opaque_payload_ref = "async-delegation:feedbeef:one-producer-incarnation"
+    common = {
+        "source_event_id": source_event_id,
+        "parent_generation_id": generation.generation_id,
+        "parent_runtime_epoch": generation.runtime_epoch,
+        "opaque_payload_ref": opaque_payload_ref,
+    }
+    before = db.inspect_task_fence_task(acceptance.task_id).task
+    execution_counts = _task_fence_execution_counts(db)
+    try:
+        assert before is not None
+        accepted = db.accept_task_fence_synthetic_evidence(
+            **common,
+            payload_hash=_hash("completion"),
+        )
+        assert accepted.opened_run_id is None
+        assert accepted.closed_run_id is None
+        assert accepted.replayed is False
+
+        db._conn.execute(
+            "UPDATE task_fence_control SET runtime_epoch = 1 WHERE singleton = 1"
+        )
+        replay = db.accept_task_fence_synthetic_evidence(
+            **common,
+            payload_hash=_hash("completion"),
+        )
+        assert replay.event_id == accepted.event_id
+        assert replay.replayed is True
+
+        with pytest.raises(
+            TaskFenceIngressRejected,
+            match="source_event_id_collision",
+        ):
+            db.accept_task_fence_synthetic_evidence(
+                **common,
+                payload_hash=_hash("mutated-completion"),
+            )
+        with pytest.raises(
+            TaskFenceIngressUnavailable,
+            match="runtime_epoch_mismatch",
+        ):
+            db.accept_task_fence_synthetic_evidence(
+                **{
+                    **common,
+                    "source_event_id": "tfadc_" + _hash("stale-new-event"),
+                },
+                payload_hash=_hash("completion"),
+            )
+
+        after = db.inspect_task_fence_task(acceptance.task_id).task
+        assert after is not None
+        assert _task_fence_authority_projection(after) == (
+            _task_fence_authority_projection(before)
+        )
+        assert _task_fence_execution_counts(db) == execution_counts
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:async_delegation'"
+        ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_completion_claim_never_falls_back_to_ambient_authority(
+    tmp_path,
+    monkeypatch,
+    _clean_async_registry,
+):
+    from tools import async_delegation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db, acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    ambient = generation.for_invocation("tfiv_completion_ambient_only")
+    before_task = db.inspect_task_fence_task(acceptance.task_id).task
+    table_names = tuple(
+        row[0]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name GLOB 'task_fence_*' "
+            "ORDER BY name"
+        )
+    )
+    before_counts = tuple(
+        db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in table_names
+    )
+    cases = (
+        (None, None),
+        (None, generation.runtime_epoch),
+        (generation.generation_id, None),
+        ("unknown-parent-generation", generation.runtime_epoch),
+        (generation.generation_id, generation.runtime_epoch + 1),
+    )
+    try:
+        assert before_task is not None
+        for index, (parent_generation_id, parent_runtime_epoch) in enumerate(cases):
+            delegation_id = f"badf00{index:02d}"
+            event = _dispatch_completed_batch(
+                async_delegation,
+                delegation_id=delegation_id,
+                parent_generation_id=parent_generation_id,
+                parent_runtime_epoch=parent_runtime_epoch,
+            )
+            with (
+                bind_causal_envelope(ambient),
+                bind_task_fence_policy(policy),
+            ):
+                claim = async_delegation.claim_event_delivery(
+                    event,
+                    f"negative-{index}",
+                )
+            assert claim is not None
+            assert async_delegation.complete_completion_delivery(
+                delegation_id,
+                claim,
+            )
+
+        malformed_id = "badf0099"
+        malformed_event = _dispatch_completed_batch(
+            async_delegation,
+            delegation_id=malformed_id,
+            parent_generation_id=generation.generation_id,
+            parent_runtime_epoch=generation.runtime_epoch,
+        )
+        db._conn.execute(
+            "UPDATE async_delegations SET event_json = '{' "
+            "WHERE delegation_id = ?",
+            (malformed_id,),
+        )
+        db._conn.commit()
+        malformed_claim = async_delegation.claim_event_delivery(
+            malformed_event,
+            "malformed-durable-event",
+        )
+        assert malformed_claim is not None
+        assert async_delegation.complete_completion_delivery(
+            malformed_id,
+            malformed_claim,
+        )
+
+        after_task = db.inspect_task_fence_task(acceptance.task_id).task
+        after_counts = tuple(
+            db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in table_names
+        )
+        assert after_task == before_task
+        assert after_counts == before_counts
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:async_delegation'"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_restored_completion_uses_exact_durable_evidence(
+    tmp_path,
+    monkeypatch,
+    _clean_async_registry,
+):
+    from tools import async_delegation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db, acceptance, generation = _live_lane(tmp_path / "state.db")
+    delegation_id = "feedbeef"
+    try:
+        live_event = _dispatch_completed_batch(
+            async_delegation,
+            delegation_id=delegation_id,
+            parent_generation_id=generation.generation_id,
+            parent_runtime_epoch=generation.runtime_epoch,
+        )
+        durable = db._conn.execute(
+            "SELECT dispatched_at, event_json FROM async_delegations "
+            "WHERE delegation_id = ?",
+            (delegation_id,),
+        ).fetchone()
+        assert durable is not None
+        exact_event = json.loads(durable["event_json"])
+        assert live_event == exact_event
+        execution_counts = _task_fence_execution_counts(db)
+
+        async_delegation._reset_for_tests()
+        restored_queue = queue.Queue()
+        assert async_delegation.restore_undelivered_completions(restored_queue) == 1
+        restored = restored_queue.get_nowait()
+        assert restored == {**exact_event, "restored": True}
+        assert "restored" not in exact_event
+        assert "causal_parent_generation_id" not in restored
+        assert "causal_parent_runtime_epoch" not in restored
+
+        restored["causal_parent_generation_id"] = "forged-in-memory-parent"
+        restored["causal_parent_runtime_epoch"] = generation.runtime_epoch + 99
+        claim_a = async_delegation.claim_event_delivery(restored, "restore-a")
+        assert claim_a is not None
+
+        source_identity = json.dumps(
+            (delegation_id, durable["dispatched_at"]),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        expected_source_event_id = "tfadc_" + _hash(source_identity)
+        evidence = db._conn.execute(
+            "SELECT source_event_id, task_id, payload_hash, "
+            "causal_parent_generation_id FROM task_fence_ingress "
+            "WHERE source = 'runtime:async_delegation'"
+        ).fetchone()
+        assert tuple(evidence) == (
+            expected_source_event_id,
+            acceptance.task_id,
+            _hash(durable["event_json"]),
+            generation.generation_id,
+        )
+        assert _task_fence_execution_counts(db) == execution_counts
+
+        assert async_delegation.release_completion_delivery(
+            delegation_id,
+            claim_a,
+        )
+        replay_queue = queue.Queue()
+        assert async_delegation.restore_undelivered_completions(replay_queue) == 1
+        replay_event = replay_queue.get_nowait()
+        claim_b = async_delegation.claim_event_delivery(replay_event, "restore-b")
+        assert claim_b is not None and claim_b != claim_a
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:async_delegation'"
+        ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT delivery_attempts FROM async_delegations "
+            "WHERE delegation_id = ?",
+            (delegation_id,),
+        ).fetchone()[0] == 2
+        assert async_delegation.complete_completion_delivery(
+            delegation_id,
+            claim_b,
+        )
+        assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
+        assert _task_fence_execution_counts(db) == execution_counts
+    finally:
         db.close()

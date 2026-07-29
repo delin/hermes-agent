@@ -3398,6 +3398,16 @@ def delegate_task(
         _goals = [t["goal"] for t in task_list]
         from task_fence import bind_causal_envelope, bind_task_fence_policy
 
+        _task_fence_completion_generation_id = None
+        _task_fence_completion_runtime_epoch = None
+        if _task_fence_parent is not None and _task_fence_policy is not None:
+            _task_fence_completion_generation_id = (
+                _task_fence_parent.generation_id
+            )
+            _task_fence_completion_runtime_epoch = (
+                _task_fence_parent.runtime_epoch
+            )
+
         # The async registry owns scheduling and completion, not child launch.
         # Its worker copies ContextVars, so scrub live Task Fence authority
         # while it captures that context. The launch capability above remains
@@ -3425,6 +3435,12 @@ def delegate_task(
                 # returned delegation_id matches cache/delegation/live/<id>/.
                 delegation_id=live_deleg_id,
                 progress_fn=_batch_progress,
+                _task_fence_parent_generation_id=(
+                    _task_fence_completion_generation_id
+                ),
+                _task_fence_parent_runtime_epoch=(
+                    _task_fence_completion_runtime_epoch
+                ),
             )
 
         if dispatch.get("status") == "dispatched":

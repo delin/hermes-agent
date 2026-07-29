@@ -1616,6 +1616,8 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_pid INTEGER,
     owner_started_at INTEGER,
     task_json TEXT,
+    causal_parent_generation_id TEXT,
+    causal_parent_runtime_epoch INTEGER,
     delivery_claim TEXT,
     delivery_claimed_at REAL
 );
@@ -9417,6 +9419,120 @@ class SessionDB:
             raise TaskFencePolicyUnavailable(
                 "audit_degraded" if degraded else "store_unavailable"
             ) from None
+
+    def accept_task_fence_synthetic_evidence(
+        self,
+        *,
+        source_event_id: str,
+        parent_generation_id: str,
+        parent_runtime_epoch: int,
+        payload_hash: str,
+        opaque_payload_ref: str,
+    ) -> IngressAcceptance:
+        """Accept delegation evidence without letting its caller choose authority."""
+
+        source = "runtime:async_delegation"
+        if not _task_fence_v2_identifier_compatible(parent_generation_id):
+            raise TaskFenceProtocolRejected("invalid_parent_generation_id")
+        if type(parent_runtime_epoch) is not int or parent_runtime_epoch < 0:
+            raise TaskFenceProtocolRejected("invalid_parent_runtime_epoch")
+        if self.read_only:
+            raise TaskFenceIngressUnavailable("read_only_store")
+        if self._conn is None:
+            raise TaskFenceIngressUnavailable("closed_store")
+
+        def _accept(conn: sqlite3.Connection):
+            store = self._inspect_task_fence_store_unlocked(
+                include_counts=False
+            )
+            if not store.compatible:
+                return _TaskFenceIngressFailure(store.reason, unavailable=True)
+            existing = conn.execute(
+                "SELECT conversation_id, task_id "
+                "FROM main.task_fence_ingress "
+                "WHERE source = ? AND source_event_id = ?",
+                (source, source_event_id),
+            ).fetchone()
+            if existing is not None:
+                envelope = IngressEnvelope(
+                    source=source,
+                    source_event_id=source_event_id,
+                    conversation_id=existing["conversation_id"],
+                    task_id=existing["task_id"],
+                    action=TASK_FENCE_ACTIONS["synthetic_notice"],
+                    payload_hash=payload_hash,
+                    opaque_payload_ref=opaque_payload_ref,
+                    causal_parent_generation_id=parent_generation_id,
+                )
+                validate_ingress_envelope(envelope)
+                return self._accept_task_fence_ingress_unlocked(conn, envelope)
+            control = conn.execute(
+                "SELECT runtime_epoch FROM main.task_fence_control "
+                "WHERE singleton = 1"
+            ).fetchone()
+            if (
+                control is None
+                or type(control["runtime_epoch"]) is not int
+                or control["runtime_epoch"] < 0
+            ):
+                return _TaskFenceIngressFailure(
+                    "malformed_control_metadata",
+                    unavailable=True,
+                )
+            parent = conn.execute(
+                "SELECT g.task_id, g.runtime_epoch, t.conversation_id "
+                "FROM main.task_fence_model_generations AS g "
+                "JOIN main.task_fence_tasks AS t ON t.task_id = g.task_id "
+                "WHERE g.generation_id = ?",
+                (parent_generation_id,),
+            ).fetchone()
+            if parent is None:
+                return _TaskFenceIngressFailure("unknown_causal_parent")
+            if type(parent["runtime_epoch"]) is not int:
+                return _TaskFenceIngressFailure(
+                    "incompatible_causal_parent",
+                    unavailable=True,
+                )
+            if parent["runtime_epoch"] != parent_runtime_epoch:
+                return _TaskFenceIngressFailure(
+                    "causal_parent_runtime_epoch_mismatch"
+                )
+            if control["runtime_epoch"] != parent_runtime_epoch:
+                return _TaskFenceIngressFailure(
+                    "runtime_epoch_mismatch",
+                    unavailable=True,
+                )
+            envelope = IngressEnvelope(
+                source=source,
+                source_event_id=source_event_id,
+                conversation_id=parent["conversation_id"],
+                task_id=parent["task_id"],
+                action=TASK_FENCE_ACTIONS["synthetic_notice"],
+                payload_hash=payload_hash,
+                opaque_payload_ref=opaque_payload_ref,
+                causal_parent_generation_id=parent_generation_id,
+            )
+            validate_ingress_envelope(envelope)
+            return self._accept_task_fence_ingress_unlocked(conn, envelope)
+
+        try:
+            result = self._execute_write(_accept)
+        except sqlite3.OperationalError as exc:
+            raise TaskFenceIngressUnavailable(
+                "acceptance_unavailable"
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            raise TaskFenceIngressUnavailable(
+                "acceptance_database_error"
+            ) from exc
+        if isinstance(result, _TaskFenceIngressFailure):
+            if result.unavailable:
+                raise TaskFenceIngressUnavailable(result.reason)
+            raise TaskFenceIngressRejected(
+                result.reason,
+                incident_id=result.incident_id,
+            )
+        return result
 
     def accept_task_fence_ingress(
         self,

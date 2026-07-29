@@ -36,8 +36,10 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -156,6 +158,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             task_json TEXT,
+            causal_parent_generation_id TEXT,
+            causal_parent_runtime_epoch INTEGER,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
             origin_session_id TEXT NOT NULL DEFAULT ''
@@ -166,6 +170,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("owner_pid", "INTEGER"),
         ("owner_started_at", "INTEGER"),
         ("task_json", "TEXT"),
+        ("causal_parent_generation_id", "TEXT"),
+        ("causal_parent_runtime_epoch", "INTEGER"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
         # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
@@ -175,7 +181,23 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("origin_session_id", "TEXT"),
     ):
         if name not in columns:
-            conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+            try:
+                conn.execute(
+                    f'ALTER TABLE async_delegations ADD COLUMN "{name}" {sql_type}'
+                )
+            except sqlite3.OperationalError:
+                # Another Hermes process may have completed the same additive
+                # migration after our PRAGMA snapshot. Preserve every other
+                # DDL failure instead of weakening legacy dispatch startup.
+                live_columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(async_delegations)"
+                    )
+                }
+                if name not in live_columns:
+                    raise
+            columns.add(name)
 
 
 @contextmanager
@@ -215,12 +237,15 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_started_at, task_json, causal_parent_generation_id,
+                causal_parent_runtime_epoch, origin_session_id)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload),
+             record.get("_task_fence_parent_generation_id"),
+             record.get("_task_fence_parent_runtime_epoch"),
              record.get("origin_session_id", "")),
         )
     _prune_durable_records()
@@ -380,12 +405,87 @@ def mark_completion_delivered(delegation_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _observe_task_fence_completion_claim(
+    *,
+    delegation_id: str,
+    state: object,
+    dispatched_at: object,
+    event_json: object,
+    parent_generation_id: object,
+    parent_runtime_epoch: object,
+) -> None:
+    """Best-effort durable synthetic evidence after one winning claim."""
+
+    if parent_generation_id is None and parent_runtime_epoch is None:
+        return
+    try:
+        if state in {"running", "finalizing"}:
+            return
+        if (
+            type(dispatched_at) not in {int, float}
+            or not math.isfinite(float(dispatched_at))
+            or dispatched_at < 0
+            or not isinstance(event_json, str)
+        ):
+            raise ValueError("invalid durable completion evidence")
+        event = json.loads(event_json)
+        if (
+            not isinstance(event, dict)
+            or event.get("type") != "async_delegation"
+            or event.get("delegation_id") != delegation_id
+        ):
+            raise ValueError("mismatched durable completion evidence")
+        identity = json.dumps(
+            (
+                delegation_id,
+                dispatched_at,
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        source_event_id = "tfadc_" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()
+        payload_hash = hashlib.sha256(event_json.encode("utf-8")).hexdigest()
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(_db_path())
+        try:
+            acceptance = db.accept_task_fence_synthetic_evidence(
+                source_event_id=source_event_id,
+                parent_generation_id=parent_generation_id,
+                parent_runtime_epoch=parent_runtime_epoch,
+                payload_hash=payload_hash,
+                opaque_payload_ref=(
+                    f"async-delegation:{delegation_id}:{source_event_id}"
+                ),
+            )
+            if (
+                acceptance.opened_run_id is not None
+                or acceptance.closed_run_id is not None
+            ):
+                raise RuntimeError("synthetic evidence changed run state")
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow async-completion evidence failed: %s",
+            type(exc).__name__,
+        )
+
+
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
+    evidence = None
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            "SELECT state, dispatched_at, event_json, "
+            "causal_parent_generation_id, "
+            "causal_parent_runtime_epoch "
+            "FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
         ).fetchone()
         if row is None:
@@ -397,7 +497,25 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (claim_id, now, now, delegation_id, now - 300),
         )
-        return cur.rowcount == 1
+        claimed = cur.rowcount == 1
+        if claimed:
+            evidence = (
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+            )
+    if evidence is not None:
+        _observe_task_fence_completion_claim(
+            delegation_id=delegation_id,
+            state=evidence[0],
+            dispatched_at=evidence[1],
+            event_json=evidence[2],
+            parent_generation_id=evidence[3],
+            parent_runtime_epoch=evidence[4],
+        )
+    return claimed
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
@@ -862,6 +980,8 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    _task_fence_parent_generation_id: Optional[str] = None,
+    _task_fence_parent_runtime_epoch: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -911,6 +1031,12 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "_task_fence_parent_generation_id": (
+            _task_fence_parent_generation_id
+        ),
+        "_task_fence_parent_runtime_epoch": (
+            _task_fence_parent_runtime_epoch
+        ),
     }
     with _records_lock:
         running = sum(
