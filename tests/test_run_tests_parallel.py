@@ -279,6 +279,53 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     assert "test_flagprobe.py" in proc.stdout, proc.stdout
 
 
+def test_canonical_runner_preserves_only_docker_image_selector(
+    tmp_path: Path,
+) -> None:
+    """Exact-image Docker tests keep their selector without leaking credentials."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests.sh"
+    probe = tmp_path / "test_env_probe.py"
+    sentinel = "ghcr.io/delin/hermes-agent@sha256:" + "a" * 64
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            import os
+
+            def test_canonical_environment():
+                assert os.environ.get("HERMES_TEST_IMAGE") == {sentinel!r}
+                assert "GH_TOKEN" not in os.environ
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_TEST_IMAGE"] = sentinel
+    env["GH_TOKEN"] = "must-not-cross-the-runner-boundary"
+
+    proc = subprocess.run(
+        [
+            str(runner),
+            "--files",
+            str(probe),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert "1 passed" in proc.stdout or "1✓" in proc.stdout, proc.stdout
+
+
 def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     """A pass-on-retry is green, loud, and retains the failing traceback."""
     repo_root = Path(__file__).resolve().parent.parent
