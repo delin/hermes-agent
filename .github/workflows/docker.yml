@@ -27,11 +27,11 @@ env:
   IMAGE_NAME: nousresearch/hermes-agent
 
 jobs:
-  # Build and test the image for each architecture. This job runs PR code,
-  # so it must remain secret-free. Publishing happens in the separate,
-  # protected publish job after these tests pass.
+  # Build and test the image for each architecture on untrusted PRs. This job
+  # must remain secret-free. Trusted push/release runs use the protected
+  # publish job below and test its exact pushed descriptor before tagging.
   build:
-    if: github.repository == 'NousResearch/hermes-agent'
+    if: github.repository == 'NousResearch/hermes-agent' && github.event_name == 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -56,8 +56,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      # Build once, load into the local daemon for testing.  Cached
-      # per-arch; the push step below reuses every layer from this build.
+      # Build once, load into the local daemon for unprivileged testing.
+      # Trusted publish runs reuse the cache, then independently test the
+      # exact pushed descriptor before it can enter the merge job.
       - name: Build image (${{ matrix.arch }})
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -114,12 +115,12 @@ jobs:
           scripts/run_tests.sh tests/docker/ --file-timeout 600
 
   # ---------------------------------------------------------------------------
-  # Rebuild and push each architecture only after the unprivileged build/test
-  # matrix passes. This job is the sole Docker Hub credential boundary.
+  # Build and push each trusted architecture as an untagged descriptor. This
+  # job is the sole Docker Hub credential boundary. Each output is then tested
+  # by its immutable registry digest before its receipt can reach the merge job.
   # ---------------------------------------------------------------------------
   publish:
     if: github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release')
-    needs: [build]
     environment: container-publish
     strategy:
       fail-fast: false
@@ -136,7 +137,7 @@ jobs:
             cache-from: type=gha,scope=docker-arm64
             cache-to: type=gha,mode=max,scope=docker-arm64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout trusted source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -167,19 +168,123 @@ jobs:
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ matrix.cache-to }}
 
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.push.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+      - name: Remove registry credentials before tests
+        run: docker logout
 
-      - name: Upload digest artifact
+      - name: Pull exact published descriptor
+        uses: ./.github/actions/retry
+        with:
+          command: docker pull --platform "${{ matrix.platform }}" "${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+
+      - name: Install uv (for published-image tests)
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+
+      - name: Set up Python 3.11 (for published-image tests)
+        run: uv python install 3.11
+
+      - name: Install Python dependencies (for published-image tests)
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run docker integration tests against exact published descriptor
+        env:
+          HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: scripts/run_tests.sh tests/docker/ --file-timeout 600
+
+      # This receipt is a trusted CI workflow claim, not runtime
+      # attestation. The later startup owner must still observe the actual
+      # deployed digest before comparing it with durable Task Fence state.
+      - name: Export tested artifact receipt
+        env:
+          ARTIFACT_DIGEST: ${{ steps.push.outputs.digest }}
+          TESTED_COMMIT: ${{ github.sha }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "$TESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ "$TESTED_COMMIT" =~ ^0+$ ]]; then
+            echo "::error::invalid tested commit identity"
+            exit 1
+          fi
+          if [[ ! "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::invalid published artifact digest"
+            exit 1
+          fi
+          artifact_hex="${ARTIFACT_DIGEST#sha256:}"
+          if [[ "$artifact_hex" =~ ^0+$ ]]; then
+            echo "::error::zero published artifact digest"
+            exit 1
+          fi
+          case "$TARGET_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *)
+              echo "::error::unsupported tested artifact platform"
+              exit 1
+              ;;
+          esac
+
+          checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [[ "$checkout_commit" != "$TESTED_COMMIT" ]]; then
+            echo "::error::checked-out commit does not match the workflow commit"
+            exit 1
+          fi
+
+          committed_lock="${RUNNER_TEMP}/task-fence-uv.lock"
+          git cat-file blob "${TESTED_COMMIT}:uv.lock" > "$committed_lock"
+          if ! cmp --silent "$committed_lock" uv.lock; then
+            echo "::error::checked-out uv.lock does not match the committed raw blob"
+            exit 1
+          fi
+          lock_line="$(sha256sum --binary "$committed_lock")"
+          lock_hex="${lock_line%% *}"
+          if [[ ! "$lock_hex" =~ ^[0-9a-f]{64}$ ]] || [[ "$lock_hex" =~ ^0+$ ]]; then
+            echo "::error::invalid raw uv.lock digest"
+            exit 1
+          fi
+
+          image_commit="$(docker run --rm --entrypoint cat "$IMAGE_REF" /opt/hermes/.hermes_build_sha)"
+          image_lock_line="$(docker run --rm --entrypoint sha256sum "$IMAGE_REF" /opt/hermes/uv.lock)"
+          image_lock_hex="${image_lock_line%% *}"
+          image_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE_REF")"
+          if [[ "$image_commit" != "$TESTED_COMMIT" ]]; then
+            echo "::error::published image commit does not match the workflow commit"
+            exit 1
+          fi
+          if [[ "$image_lock_hex" != "$lock_hex" ]]; then
+            echo "::error::published image uv.lock does not match the tested raw bytes"
+            exit 1
+          fi
+          if [[ "$image_platform" != "$TARGET_PLATFORM" ]]; then
+            echo "::error::published image platform does not match the target platform"
+            exit 1
+          fi
+
+          mkdir --parents /tmp/tested-artifact
+          jq --null-input --compact-output --sort-keys \
+            --arg schema "hermes.task-fence.tested-artifact-receipt/v1" \
+            --arg platform "$TARGET_PLATFORM" \
+            --arg commit "$TESTED_COMMIT" \
+            --arg artifact "$ARTIFACT_DIGEST" \
+            --arg lock "sha256:${lock_hex}" \
+            '{
+              schema: $schema,
+              target_platform: $platform,
+              tested_artifact_commit: $commit,
+              tested_artifact_checksum: $artifact,
+              dependency_lock_fingerprint: $lock
+            }' > "/tmp/tested-artifact/${{ matrix.arch }}.json"
+
+      - name: Upload tested artifact receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: digest-${{ matrix.arch }}
-          path: /tmp/digests/*
+          name: tested-artifact-${{ matrix.arch }}
+          path: /tmp/tested-artifact/${{ matrix.arch }}.json
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
 
   # ---------------------------------------------------------------------------
   # Stitch both per-arch digests into a single tagged multi-arch manifest.
@@ -196,11 +301,11 @@ jobs:
     timeout-minutes: 10
     environment: container-publish
     steps:
-      - name: Download digests
+      - name: Download tested artifact receipts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: /tmp/digests
-          pattern: digest-*
+          path: /tmp/tested-artifacts
+          pattern: tested-artifact-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -213,15 +318,63 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create manifest list and push
-        working-directory: /tmp/digests
+        working-directory: /tmp/tested-artifacts
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TESTED_COMMIT: ${{ github.sha }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          receipt_files=(amd64.json arm64.json)
+          expected_platforms=(linux/amd64 linux/arm64)
+          shopt -s nullglob
+          downloaded_receipts=(*.json)
+          if [ "${#downloaded_receipts[@]}" -ne "${#receipt_files[@]}" ]; then
+            echo "::error::expected exactly two tested artifact receipts"
+            exit 1
+          fi
           args=()
-          for digest_file in *; do
-            args+=("${IMAGE_NAME}@sha256:${digest_file}")
+          lock_fingerprint=""
+          previous_digest=""
+          for index in 0 1; do
+            receipt_file="${receipt_files[$index]}"
+            expected_platform="${expected_platforms[$index]}"
+            if [ ! -f "$receipt_file" ]; then
+              echo "::error::missing tested artifact receipt: $receipt_file"
+              exit 1
+            fi
+            if [ "$(jq --raw-output 'keys | sort | join(",")' "$receipt_file")" != "dependency_lock_fingerprint,schema,target_platform,tested_artifact_checksum,tested_artifact_commit" ]; then
+              echo "::error::unexpected tested artifact receipt fields: $receipt_file"
+              exit 1
+            fi
+            schema="$(jq --exit-status --raw-output '.schema' "$receipt_file")"
+            platform="$(jq --exit-status --raw-output '.target_platform' "$receipt_file")"
+            commit="$(jq --exit-status --raw-output '.tested_artifact_commit' "$receipt_file")"
+            digest="$(jq --exit-status --raw-output '.tested_artifact_checksum' "$receipt_file")"
+            receipt_lock="$(jq --exit-status --raw-output '.dependency_lock_fingerprint' "$receipt_file")"
+            if [[ "$schema" != "hermes.task-fence.tested-artifact-receipt/v1" ]] || [[ "$platform" != "$expected_platform" ]] || [[ "$commit" != "$TESTED_COMMIT" ]]; then
+              echo "::error::tested artifact receipt identity mismatch: $receipt_file"
+              exit 1
+            fi
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || [[ "${digest#sha256:}" =~ ^0+$ ]]; then
+              echo "::error::invalid tested artifact digest: $receipt_file"
+              exit 1
+            fi
+            if [[ ! "$receipt_lock" =~ ^sha256:[0-9a-f]{64}$ ]] || [[ "${receipt_lock#sha256:}" =~ ^0+$ ]]; then
+              echo "::error::invalid dependency lock fingerprint: $receipt_file"
+              exit 1
+            fi
+            if [[ -n "$lock_fingerprint" && "$receipt_lock" != "$lock_fingerprint" ]]; then
+              echo "::error::tested artifacts disagree on dependency lock fingerprint"
+              exit 1
+            fi
+            if [[ -n "$previous_digest" && "$digest" == "$previous_digest" ]]; then
+              echo "::error::tested platform artifacts unexpectedly share one descriptor"
+              exit 1
+            fi
+            lock_fingerprint="$receipt_lock"
+            previous_digest="$digest"
+            args+=("${IMAGE_NAME}@${digest}")
           done
           if [ "${{ github.event_name }}" = "release" ]; then
             tags=(-t "${IMAGE_NAME}:${RELEASE_TAG}")
