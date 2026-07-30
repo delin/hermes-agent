@@ -251,6 +251,23 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
 
     monkeypatch.setattr(startup, "_parse_receipt", traced_parse)
 
+    real_checkpoint_snapshot = startup._read_process_checkpoint_snapshot
+
+    def traced_checkpoint_snapshot(path: Path, *, shadow_session_key: str):
+        events.append("checkpoint")
+        observations = real_checkpoint_snapshot(
+            path,
+            shadow_session_key=shadow_session_key,
+        )
+        assert len(observations) == 1
+        return observations
+
+    monkeypatch.setattr(
+        startup,
+        "_read_process_checkpoint_snapshot",
+        traced_checkpoint_snapshot,
+    )
+
     real_recover = SessionDB.recover_task_fence_state
 
     def traced_recover(self: SessionDB, **kwargs):
@@ -307,6 +324,20 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     finally:
         delivery_seed.close()
 
+    process_checkpoint = tmp_path / "processes.json"
+    process_checkpoint.write_text(
+        json.dumps(
+            [{
+                "session_id": "proc_startup_candidate",
+                "pid": 999_999_999,
+                "session_key": _SHADOW_SESSION_KEY,
+                "watcher_interval": 5,
+            }]
+        ),
+        encoding="utf-8",
+    )
+    process_checkpoint_before = process_checkpoint.read_bytes()
+
     class ReopeningRunner:
         def __init__(self, config: GatewayConfig):
             events.append("runner")
@@ -316,6 +347,7 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
             self.exit_code = None
             self.adapters = {}
 
+            assert process_checkpoint.read_bytes() == process_checkpoint_before
             database = SessionDB(tmp_path / "state.db")
             try:
                 store = database.inspect_task_fence_store()
@@ -401,10 +433,11 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     )
 
     assert ok is True
-    assert events[:6] == [
+    assert events[:7] == [
         "lock",
         "pid",
         "receipt",
+        "checkpoint",
         "composite",
         "runner",
         "start",
@@ -453,6 +486,13 @@ async def test_empty_shadow_key_preserves_legacy_startup(
             AssertionError("legacy startup read Task Fence receipt")
         ),
     )
+    monkeypatch.setattr(
+        startup,
+        "_read_process_checkpoint_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy startup read process checkpoint")
+        ),
+    )
 
     class LegacyRunner:
         def __init__(self, config: GatewayConfig):
@@ -479,6 +519,41 @@ async def test_empty_shadow_key_preserves_legacy_startup(
     assert ok is True
     assert events[:4] == ["lock", "pid", "runner", "start"]
     assert not (tmp_path / "state.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_process_checkpoint_failure_releases_claim_without_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    receipt_path = tmp_path / "tested-artifact.json"
+    _write_receipt(receipt_path)
+    _pretend_receipt_is_root_owned(monkeypatch)
+    monkeypatch.setattr(startup, "_TESTED_ARTIFACT_RECEIPT_PATH", receipt_path)
+    (tmp_path / "processes.json").write_text("{", encoding="utf-8")
+
+    class RunnerMustNotOpen:
+        def __init__(self, config: GatewayConfig):
+            raise AssertionError("runner opened after unsafe process checkpoint")
+
+    gateway_run = _install_start_gateway_shell(
+        monkeypatch,
+        tmp_path,
+        events,
+        RunnerMustNotOpen,
+    )
+
+    ok = await gateway_run.start_gateway(
+        config=GatewayConfig(
+            task_fence_shadow_session_key=_SHADOW_SESSION_KEY,
+            sessions_dir=tmp_path / "sessions",
+        ),
+        verbosity=None,
+    )
+
+    assert ok is False
+    assert events == ["lock", "pid", "remove_pid", "release_lock"]
 
 
 @pytest.mark.asyncio
