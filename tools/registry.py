@@ -64,14 +64,15 @@ def _audit_task_fence_tool_start(
     policy: Any,
     envelope: Any | None,
     kwargs: dict,
-) -> None:
-    """Best-effort shadow observation immediately before a tool handler."""
+) -> str | None:
+    """Observe a tool start and return its exact durable attempt when available."""
 
     from task_fence import (
         DecisionOutcome,
         OperationDescriptor,
         OperationKind,
     )
+
     invocation_id = (
         envelope.invocation_id
         if envelope is not None and envelope.invocation_id is not None
@@ -88,7 +89,13 @@ def _audit_task_fence_tool_start(
         admitted.outcome is DecisionOutcome.WOULD_RESERVE
         and admitted.permit_id is not None
     ):
-        policy.authorize_and_start(envelope, operation, admitted.permit_id)
+        started = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+        return started.attempt_id
+    return None
 
 
 @contextmanager

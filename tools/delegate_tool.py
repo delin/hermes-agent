@@ -2163,6 +2163,9 @@ def _run_single_child(
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
+        _task_fence_attempt_holder: Dict[str, Optional[str]] = {
+            "attempt_id": None,
+        }
 
         def _relay_child_text(delta: str) -> None:
             # Forward the child's streamed reply text up the progress relay so
@@ -2187,11 +2190,17 @@ def _run_single_child(
                     stream_callback=_relay_child_text,
                     parent_envelope=_task_fence_parent,
                     policy=_task_fence_policy,
+                    attempt_holder=_task_fence_attempt_holder,
                 )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
+            _finish_task_fence_child_launch(
+                policy=_task_fence_policy,
+                attempt_id=_task_fence_attempt_holder["attempt_id"],
+                result=result,
+            )
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2624,8 +2633,9 @@ def _run_task_fence_child_launch(
     stream_callback,
     parent_envelope=None,
     policy=None,
+    attempt_holder=None,
 ):
-    """Observe one physical child launch, then clear the live policy facade."""
+    """Observe one child launch while keeping the child runtime unprivileged."""
 
     try:
         from task_fence import bind_causal_envelope, bind_task_fence_policy
@@ -2642,6 +2652,7 @@ def _run_task_fence_child_launch(
 
     launch_envelope = None
     audit_start = None
+    attempt_id = None
     if parent_envelope is not None and policy is not None:
         try:
             launch_envelope = parent_envelope.for_invocation()
@@ -2660,7 +2671,7 @@ def _run_task_fence_child_launch(
         task_fence_scope.enter_context(bind_task_fence_policy(None))
         if audit_start is not None:
             try:
-                audit_start(
+                attempt_id = audit_start(
                     "delegate_child_launch",
                     {"goal": goal},
                     adapter="delegate:run_conversation",
@@ -2668,6 +2679,8 @@ def _run_task_fence_child_launch(
                     envelope=launch_envelope,
                     kwargs={"task_id": child_task_id},
                 )
+                if type(attempt_holder) is dict:
+                    attempt_holder["attempt_id"] = attempt_id
             except Exception as exc:
                 logger.warning(
                     "Task Fence shadow child-launch observation failed: %s",
@@ -2677,6 +2690,31 @@ def _run_task_fence_child_launch(
             user_message=goal,
             task_id=child_task_id,
             stream_callback=stream_callback,
+        )
+
+
+def _finish_task_fence_child_launch(*, policy, attempt_id, result) -> None:
+    """Record only an exact completed return after legacy timeout selection."""
+
+    if (
+        policy is None
+        or not isinstance(attempt_id, str)
+        or type(result) is not dict
+        or result.get("completed") is not True
+    ):
+        return
+    try:
+        from task_fence import AttemptTerminal
+
+        policy.finish_attempt(
+            attempt_id,
+            AttemptTerminal.SUCCEEDED,
+            f"delegate:run_conversation:completed:v1:{attempt_id}",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow child-launch terminal observation failed: %s",
+            type(exc).__name__,
         )
 
 

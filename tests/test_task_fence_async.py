@@ -376,8 +376,395 @@ def test_exact_child_launch_is_started_before_run_conversation(
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 1
+        terminal = db._conn.execute(
+            "SELECT a.attempt_id, a.state, a.acknowledgement_ref, "
+            "a.terminal_at IS NOT NULL "
+            "FROM task_fence_attempts AS a "
+            "JOIN task_fence_dispatch_permits AS p "
+            "ON p.permit_id = a.permit_id "
+            "WHERE p.invocation_envelope_id = ?",
+            (child_envelope.invocation_id,),
+        ).fetchone()
+        evidence = f"delegate:run_conversation:completed:v1:{terminal['attempt_id']}"
+        assert tuple(terminal[1:4]) == ("SUCCEEDED", evidence, 1)
+        transitions = [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref "
+                "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                "ORDER BY transition_order",
+                (terminal["attempt_id"],),
+            )
+        ]
+        assert len(transitions) == 2
+        assert transitions[0][:3] == (None, "STARTED", "would_allow")
+        assert len(transitions[0][3]) == 64
+        assert set(transitions[0][3]) <= set("0123456789abcdef")
+        assert transitions[1] == (
+            "STARTED",
+            "SUCCEEDED",
+            "SUCCEEDED",
+            evidence,
+        )
         assert secret_goal not in _task_fence_dispatch_dump(db)
     finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "result_sentinel",
+    (
+        {"completed": False, "final_response": "not complete"},
+        {"completed": 1, "final_response": "not an exact boolean"},
+        {"final_response": "missing acknowledgement"},
+    ),
+)
+def test_child_launch_requires_exact_completed_acknowledgement(
+    tmp_path,
+    monkeypatch,
+    result_sentinel,
+):
+    from tools.delegate_tool import _run_single_child
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    parent_envelope = generation.for_invocation("tfiv_delegate_non_success")
+    calls = []
+
+    def run_conversation(**kwargs):
+        calls.append(kwargs)
+        return result_sentinel
+
+    child = _FakeChild("sa-task-fence-non-success", run_conversation)
+    parent = _parent(db, active_children=[child])
+    try:
+        result = _run_single_child(
+            0,
+            "conservative terminal evidence",
+            child,
+            parent,
+            _task_fence_parent=parent_envelope,
+            _task_fence_policy=policy,
+        )
+
+        assert result["status"] == "completed"
+        assert result["summary"] == result_sentinel["final_response"]
+        assert len(calls) == 1
+        assert calls[0]["user_message"] == "conservative terminal evidence"
+        assert calls[0]["task_id"] == child._subagent_id
+        assert callable(calls[0]["stream_callback"])
+        assert child.closed
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts"
+            ).fetchone()
+        ) == ("STARTED", None, None)
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_attempt_transitions"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        db.close()
+
+
+def test_child_launch_exception_is_ambiguous_and_preserves_identity(tmp_path):
+    from tools.delegate_tool import _run_task_fence_child_launch
+
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    parent_envelope = generation.for_invocation("tfiv_delegate_exception")
+    expected = ConnectionError("ambiguous child connection")
+    calls = 0
+
+    def run_conversation(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise expected
+
+    child = _FakeChild("sa-task-fence-exception", run_conversation)
+    try:
+        with pytest.raises(ConnectionError) as raised:
+            _run_task_fence_child_launch(
+                child=child,
+                goal="ambiguous exception",
+                child_task_id=child._subagent_id,
+                stream_callback=lambda _delta: None,
+                parent_envelope=parent_envelope,
+                policy=policy,
+            )
+
+        assert raised.value is expected
+        assert calls == 1
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts"
+            ).fetchone()
+        ) == ("STARTED", None, None)
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_attempt_transitions"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        db.close()
+
+
+def test_child_launch_terminal_evidence_fault_is_fail_open(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from tools.delegate_tool import _run_single_child
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    parent_envelope = generation.for_invocation("tfiv_delegate_terminal_fault")
+    result_sentinel = {"completed": True, "final_response": "done"}
+    calls = 0
+
+    def run_conversation(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return result_sentinel
+
+    child = _FakeChild("sa-task-fence-terminal-fault", run_conversation)
+    parent = _parent(db, active_children=[child])
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_delegate_terminal_transition "
+        "BEFORE INSERT ON task_fence_attempt_transitions "
+        "WHEN NEW.from_state = 'STARTED' BEGIN "
+        "SELECT RAISE(ABORT, 'secret delegate terminal fault'); END"
+    )
+    try:
+        with caplog.at_level(logging.WARNING):
+            result = _run_single_child(
+                0,
+                "terminal fault",
+                child,
+                parent,
+                _task_fence_parent=parent_envelope,
+                _task_fence_policy=policy,
+            )
+
+        assert result["status"] == "completed"
+        assert result["summary"] == result_sentinel["final_response"]
+        assert calls == 1
+        assert child.closed
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts"
+            ).fetchone()
+        ) == ("STARTED", None, None)
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_attempt_transitions"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_cohorts WHERE audit_degraded = 1"
+            ).fetchone()[0]
+            == 1
+        )
+        assert "TaskFencePolicyUnavailable" in caplog.text
+        assert "secret delegate terminal fault" not in caplog.text
+    finally:
+        db.close()
+
+
+def test_child_launch_terminal_observer_runs_on_caller_after_child_returns(
+    tmp_path,
+    monkeypatch,
+):
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 5.0)
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    parent_envelope = generation.for_invocation("tfiv_delegate_timeout_boundary")
+    caller_thread = threading.current_thread()
+    child_threads = []
+    finish_threads = []
+    original_finish = TaskFencePolicy.finish_attempt
+
+    def run_conversation(**_kwargs):
+        child_threads.append(threading.current_thread())
+        return {"completed": True, "final_response": "done"}
+
+    def observe_finish(self, *args, **kwargs):
+        finish_threads.append(threading.current_thread())
+        return original_finish(self, *args, **kwargs)
+
+    child = _FakeChild("sa-task-fence-timeout-boundary", run_conversation)
+    parent = _parent(db, active_children=[child])
+    try:
+        monkeypatch.setattr(TaskFencePolicy, "finish_attempt", observe_finish)
+        result = delegate_tool._run_single_child(
+            0,
+            "timeout boundary",
+            child,
+            parent,
+            _task_fence_parent=parent_envelope,
+            _task_fence_policy=policy,
+        )
+
+        assert result["status"] == "completed"
+        assert len(child_threads) == 1
+        assert child_threads[0] is not caller_thread
+        assert finish_threads == [caller_thread]
+        assert not child.interrupted
+        assert (
+            db._conn.execute("SELECT state FROM task_fence_attempts").fetchone()[0]
+            == "SUCCEEDED"
+        )
+    finally:
+        db.close()
+
+
+def test_child_launch_timeout_does_not_accept_late_success(
+    tmp_path,
+    monkeypatch,
+):
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 1.0)
+    monkeypatch.setattr(
+        delegate_tool,
+        "_dump_subagent_timeout_diagnostic",
+        lambda **_kwargs: None,
+    )
+    db, acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    parent_envelope = generation.for_invocation("tfiv_delegate_real_timeout")
+    entered = threading.Event()
+    release = threading.Event()
+    worker_exited = threading.Event()
+    result_ready = threading.Event()
+    original_launch = delegate_tool._run_task_fence_child_launch
+    results = []
+    errors = []
+
+    def run_conversation(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=10.0)
+        return {"completed": True, "final_response": "late success"}
+
+    def observe_worker_exit(**kwargs):
+        try:
+            return original_launch(**kwargs)
+        finally:
+            worker_exited.set()
+
+    child = _FakeChild("sa-task-fence-real-timeout", run_conversation)
+    parent = _parent(db, active_children=[child])
+
+    def run_parent():
+        try:
+            results.append(
+                delegate_tool._run_single_child(
+                    0,
+                    "timeout must stay ambiguous",
+                    child,
+                    parent,
+                    _task_fence_parent=parent_envelope,
+                    _task_fence_policy=policy,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            result_ready.set()
+
+    runner = threading.Thread(target=run_parent)
+    try:
+        monkeypatch.setattr(
+            delegate_tool,
+            "_run_task_fence_child_launch",
+            observe_worker_exit,
+        )
+        runner.start()
+        assert entered.wait(timeout=10.0)
+        assert not result_ready.is_set()
+        assert result_ready.wait(timeout=10.0)
+        runner.join(timeout=10.0)
+        assert not runner.is_alive()
+        assert errors == []
+        assert len(results) == 1
+        result = results[0]
+        assert result["status"] == "timeout"
+        assert result["exit_reason"] == "timeout"
+        assert result["summary"] is None
+        assert result["timeout_seconds"] == 1.0
+        assert child.interrupted
+        assert child.closed
+        attempt_id = db._conn.execute(
+            "SELECT attempt_id FROM task_fence_attempts"
+        ).fetchone()[0]
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        ) == ("STARTED", None, None)
+
+        release.set()
+        assert worker_exited.wait(timeout=10.0)
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        ) == ("STARTED", None, None)
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_attempt_transitions "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+        inspection = db.inspect_task_fence_store()
+        recovery = db.recover_task_fence_state(
+            expected_runtime_epoch=inspection.runtime_epoch,
+            expected_mode_generation=inspection.mode_generation,
+        )
+        assert recovery.runtime_epoch == generation.runtime_epoch + 1
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, disposition, acknowledgement_ref, "
+                "terminal_at IS NOT NULL FROM task_fence_attempts "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        ) == ("OUTCOME_UNKNOWN", "OUTCOME_UNKNOWN", None, 1)
+        assert [
+            row["attempt_id"]
+            for row in db._conn.execute(
+                "SELECT link.attempt_id FROM task_fence_incident_attempts AS link "
+                "JOIN task_fence_incidents AS incident "
+                "ON incident.incident_id = link.incident_id "
+                "WHERE incident.task_id = ?",
+                (acceptance.task_id,),
+            )
+        ] == [attempt_id]
+    finally:
+        release.set()
+        runner.join(timeout=10.0)
+        worker_exited.wait(timeout=10.0)
         db.close()
 
 
@@ -876,9 +1263,23 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
             delegation_id,
             claim_a,
         )
-        assert db._conn.execute(
-            "SELECT COUNT(*) FROM task_fence_attempts"
-        ).fetchone()[0] == 2
+        attempts = db._conn.execute(
+            "SELECT attempt_id, state, acknowledgement_ref, "
+            "terminal_at IS NOT NULL FROM task_fence_attempts"
+        ).fetchall()
+        assert len(attempts) == 2
+        assert {row["state"] for row in attempts} == {"SUCCEEDED"}
+        for attempt in attempts:
+            evidence = f"delegate:run_conversation:completed:v1:{attempt['attempt_id']}"
+            assert tuple(attempt[1:]) == ("SUCCEEDED", evidence, 1)
+            assert (
+                db._conn.execute(
+                    "SELECT COUNT(*) FROM task_fence_attempt_transitions "
+                    "WHERE attempt_id = ?",
+                    (attempt["attempt_id"],),
+                ).fetchone()[0]
+                == 2
+            )
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_policy_decisions"
         ).fetchone()[0] == 4
@@ -889,6 +1290,294 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
         deadline = time.monotonic() + 10.0
         while async_delegation.active_count() and time.monotonic() < deadline:
             time.sleep(0.02)
+        db.close()
+
+
+def test_recovery_incidents_only_ambiguous_child_launch(tmp_path, monkeypatch):
+    from tools.delegate_tool import _run_single_child
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "state.db"
+    db, acceptance, generation = _live_lane(path)
+    policy = TaskFencePolicy(db)
+    parent_envelope = generation.for_invocation("tfiv_delegate_recovery")
+    success_result = {"completed": True, "final_response": "done"}
+    ambiguous_result = {"completed": False, "final_response": "incomplete"}
+
+    def run_child(subagent_id, result):
+        child = _FakeChild(
+            subagent_id,
+            lambda **_kwargs: result,
+        )
+        parent = _parent(db, active_children=[child])
+        observed = _run_single_child(
+            0,
+            f"recovery {subagent_id}",
+            child,
+            parent,
+            _task_fence_parent=parent_envelope,
+            _task_fence_policy=policy,
+        )
+        assert observed["summary"] == result["final_response"]
+        assert child.closed
+
+    try:
+        run_child("sa-task-fence-success", success_result)
+        run_child("sa-task-fence-ambiguous", ambiguous_result)
+        attempts_before = db._conn.execute(
+            "SELECT attempt_id, state, acknowledgement_ref, terminal_at "
+            "FROM task_fence_attempts ORDER BY prepared_at, attempt_id"
+        ).fetchall()
+        assert {row["state"] for row in attempts_before} == {
+            "STARTED",
+            "SUCCEEDED",
+        }
+        succeeded_before = next(
+            tuple(row) for row in attempts_before if row["state"] == "SUCCEEDED"
+        )
+        ambiguous_id = next(
+            row["attempt_id"]
+            for row in attempts_before
+            if row["state"] == "STARTED"
+        )
+        succeeded_id = succeeded_before[0]
+        succeeded_transitions_before = tuple(
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref, "
+                "transitioned_at FROM task_fence_attempt_transitions "
+                "WHERE attempt_id = ? ORDER BY transition_order",
+                (succeeded_id,),
+            )
+        )
+    finally:
+        db.close()
+
+    reopened = SessionDB(path)
+    try:
+        inspection = reopened.inspect_task_fence_store()
+        recovery = reopened.recover_task_fence_state(
+            expected_runtime_epoch=inspection.runtime_epoch,
+            expected_mode_generation=inspection.mode_generation,
+        )
+        assert (recovery.previous_runtime_epoch, recovery.runtime_epoch) == (0, 1)
+        assert tuple(
+            reopened._conn.execute(
+                "SELECT attempt_id, state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts WHERE attempt_id = ?",
+                (succeeded_id,),
+            ).fetchone()
+        ) == succeeded_before
+        assert tuple(
+            reopened._conn.execute(
+                "SELECT state, disposition, acknowledgement_ref, "
+                "terminal_at IS NOT NULL FROM task_fence_attempts "
+                "WHERE attempt_id = ?",
+                (ambiguous_id,),
+            ).fetchone()
+        ) == ("OUTCOME_UNKNOWN", "OUTCOME_UNKNOWN", None, 1)
+        assert tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref, "
+                "transitioned_at FROM task_fence_attempt_transitions "
+                "WHERE attempt_id = ? ORDER BY transition_order",
+                (succeeded_id,),
+            )
+        ) == succeeded_transitions_before
+        incident_attempts = reopened._conn.execute(
+            "SELECT link.attempt_id FROM task_fence_incident_attempts AS link "
+            "JOIN task_fence_incidents AS incident "
+            "ON incident.incident_id = link.incident_id "
+            "WHERE incident.task_id = ?",
+            (acceptance.task_id,),
+        ).fetchall()
+        assert [row["attempt_id"] for row in incident_attempts] == [ambiguous_id]
+        assert [
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT state, reason_code FROM task_fence_incidents "
+                "WHERE task_id = ?",
+                (acceptance.task_id,),
+            )
+        ] == [("open", "outcome_unknown")]
+    finally:
+        reopened.close()
+
+
+def test_recovery_first_rejects_late_child_success_without_erasing_incident(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from tools.delegate_tool import _run_single_child
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "state.db"
+    db, acceptance, generation = _live_lane(path)
+    policy = TaskFencePolicy(db)
+    parent_envelope = generation.for_invocation(
+        "tfiv_delegate_recovery_first"
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    secret_goal = "recovery-first-secret-goal"
+    secret_response = "recovery-first-secret-response"
+    results = []
+    errors = []
+
+    def run_conversation(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=10.0)
+        return {"completed": True, "final_response": secret_response}
+
+    child = _FakeChild("sa-task-fence-recovery-first", run_conversation)
+    parent = _parent(db, active_children=[child])
+
+    def run_parent():
+        try:
+            results.append(
+                _run_single_child(
+                    0,
+                    secret_goal,
+                    child,
+                    parent,
+                    _task_fence_parent=parent_envelope,
+                    _task_fence_policy=policy,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_parent)
+    reopened = None
+    try:
+        with caplog.at_level(logging.WARNING):
+            runner.start()
+            assert entered.wait(timeout=10.0)
+            attempt = db._conn.execute(
+                "SELECT attempt_id, state FROM task_fence_attempts"
+            ).fetchone()
+            assert tuple(attempt) == (attempt["attempt_id"], "STARTED")
+
+            reopened = SessionDB(path)
+            inspection = reopened.inspect_task_fence_store()
+            recovery = reopened.recover_task_fence_state(
+                expected_runtime_epoch=inspection.runtime_epoch,
+                expected_mode_generation=inspection.mode_generation,
+            )
+            assert recovery.runtime_epoch == generation.runtime_epoch + 1
+
+            recovered_attempt = tuple(
+                reopened._conn.execute(
+                    "SELECT state, disposition, recovery_classification, "
+                    "handoff_ref, acknowledgement_ref, prepared_at, started_at, "
+                    "terminal_at FROM task_fence_attempts WHERE attempt_id = ?",
+                    (attempt["attempt_id"],),
+                ).fetchone()
+            )
+            assert recovered_attempt[:3] == (
+                "OUTCOME_UNKNOWN",
+                "OUTCOME_UNKNOWN",
+                "may_effect",
+            )
+            assert recovered_attempt[4] is None
+            assert recovered_attempt[7] is not None
+            recovered_transitions = tuple(
+                tuple(row)
+                for row in reopened._conn.execute(
+                    "SELECT transition_order, from_state, to_state, disposition, "
+                    "evidence_ref, transitioned_at "
+                    "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                    "ORDER BY transition_order",
+                    (attempt["attempt_id"],),
+                )
+            )
+            assert [row[2] for row in recovered_transitions] == [
+                "STARTED",
+                "OUTCOME_UNKNOWN",
+            ]
+            recovered_incidents = tuple(
+                tuple(row)
+                for row in reopened._conn.execute(
+                    "SELECT incident_id, task_id, source_run_id, reason_code, "
+                    "state, opened_at, resolved_at FROM task_fence_incidents "
+                    "WHERE task_id = ? ORDER BY incident_id",
+                    (acceptance.task_id,),
+                )
+            )
+            recovered_links = tuple(
+                tuple(row)
+                for row in reopened._conn.execute(
+                    "SELECT incident_id, attempt_id "
+                    "FROM task_fence_incident_attempts ORDER BY incident_id, attempt_id"
+                )
+            )
+            assert len(recovered_incidents) == 1
+            assert recovered_incidents[0][3:5] == (
+                "outcome_unknown",
+                "open",
+            )
+            assert recovered_links == (
+                (recovered_incidents[0][0], attempt["attempt_id"]),
+            )
+
+            release.set()
+            runner.join(timeout=10.0)
+
+        assert not runner.is_alive()
+        assert errors == []
+        assert len(results) == 1
+        assert results[0]["status"] == "completed"
+        assert results[0]["summary"] == secret_response
+        assert results[0]["exit_reason"] == "completed"
+        assert not child.interrupted
+        assert child.closed
+        assert tuple(
+            reopened._conn.execute(
+                "SELECT state, disposition, recovery_classification, "
+                "handoff_ref, acknowledgement_ref, prepared_at, started_at, "
+                "terminal_at FROM task_fence_attempts WHERE attempt_id = ?",
+                (attempt["attempt_id"],),
+            ).fetchone()
+        ) == recovered_attempt
+        assert tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT transition_order, from_state, to_state, disposition, "
+                "evidence_ref, transitioned_at "
+                "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                "ORDER BY transition_order",
+                (attempt["attempt_id"],),
+            )
+        ) == recovered_transitions
+        assert tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT incident_id, task_id, source_run_id, reason_code, "
+                "state, opened_at, resolved_at FROM task_fence_incidents "
+                "WHERE task_id = ? ORDER BY incident_id",
+                (acceptance.task_id,),
+            )
+        ) == recovered_incidents
+        assert tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT incident_id, attempt_id "
+                "FROM task_fence_incident_attempts ORDER BY incident_id, attempt_id"
+            )
+        ) == recovered_links
+        assert "TaskFencePolicyRejected" in caplog.text
+        assert secret_goal not in caplog.text
+        assert secret_response not in caplog.text
+        durable_dump = _task_fence_dispatch_dump(reopened)
+        assert secret_goal not in durable_dump
+        assert secret_response not in durable_dump
+    finally:
+        release.set()
+        runner.join(timeout=10.0)
+        if reopened is not None:
+            reopened.close()
         db.close()
 
 
