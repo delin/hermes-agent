@@ -1,6 +1,7 @@
 from dataclasses import replace
 import hashlib
 import sqlite3
+import threading
 
 import pytest
 
@@ -76,6 +77,64 @@ def _recover(db: SessionDB):
         expected_runtime_epoch=inspection.runtime_epoch,
         expected_mode_generation=inspection.mode_generation,
     )
+
+
+def _start_effect(
+    db: SessionDB,
+    *,
+    marker: str,
+    conversation_id: str = "recovery-conversation",
+):
+    accepted = db.accept_task_fence_ingress(
+        _ingress(
+            "initial_submit",
+            f"{marker}-initial",
+            conversation_id=conversation_id,
+        )
+    )
+    generation = db.reserve_task_fence_generation(accepted)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    invocation = generation.for_invocation(f"tfiv-{marker}")
+    operation = _operation(invocation.invocation_id)
+    policy = TaskFencePolicy(db)
+    admitted = policy.admit_operation(invocation, operation)
+    started = policy.authorize_and_start(
+        invocation,
+        operation,
+        admitted.permit_id,
+    )
+    return accepted, started
+
+
+def _terminal_unknown_incident(
+    db: SessionDB,
+    *,
+    marker: str,
+    conversation_id: str = "recovery-conversation",
+):
+    accepted, started = _start_effect(
+        db,
+        marker=marker,
+        conversation_id=conversation_id,
+    )
+    stopped = db.accept_task_fence_ingress(
+        _ingress(
+            "stop",
+            f"{marker}-stop",
+            task_id=accepted.task_id,
+            conversation_id=conversation_id,
+        )
+    )
+    assert stopped.task_projection is not None
+    assert stopped.task_projection.status == "stopped"
+    _recover(db)
+    incident = db._conn.execute(
+        "SELECT incident_id FROM task_fence_incidents "
+        "WHERE task_id = ? AND state = 'open'",
+        (accepted.task_id,),
+    ).fetchone()
+    assert incident is not None
+    return accepted, started, incident[0]
 
 
 def _task_fence_state(db: SessionDB) -> tuple[tuple[str, tuple[tuple, ...]], ...]:
@@ -1256,6 +1315,14 @@ def test_recovery_preserves_terminal_task_and_records_unknown_started_effect(
     assert terminal_frontier.reason == "no_active_task"
     assert terminal_frontier.task is None
     assert terminal_frontier.open_incident is None
+    assert len(terminal_frontier.terminal_open_incidents) == 1
+    terminal_incident = terminal_frontier.terminal_open_incidents[0]
+    assert terminal_incident.task_id == accepted.task_id
+    assert terminal_incident.task_status == "stopped"
+    assert terminal_incident.incident.incident_id == incident[0]
+    assert terminal_incident.incident.source_run_id == accepted.opened_run_id
+    assert terminal_incident.incident.reason_code == "outcome_unknown"
+    assert terminal_incident.incident.attempt_ids == (started.attempt_id,)
 
     second = _recover(db)
     assert (second.previous_runtime_epoch, second.runtime_epoch) == (1, 2)
@@ -1269,7 +1336,344 @@ def test_recovery_preserves_terminal_task_and_records_unknown_started_effect(
         ).fetchone()[0]
         == 1
     )
+    terminal_replay = db.inspect_task_fence_conversation("recovery-conversation")
+    assert (
+        terminal_replay.terminal_open_incidents
+        == terminal_frontier.terminal_open_incidents
+    )
     db.close()
+
+
+def test_terminal_open_incident_coexists_with_new_active_task_and_is_exact(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    conversation_id = "terminal-exact:raw-secret-lane"
+    terminal, started, incident_id = _terminal_unknown_incident(
+        db,
+        marker="terminal-exact-target",
+        conversation_id=conversation_id,
+    )
+    foreign, _, foreign_incident_id = _terminal_unknown_incident(
+        db,
+        marker="terminal-exact-foreign",
+        conversation_id="terminal-exact:foreign-secret-lane",
+    )
+    active = db.accept_task_fence_ingress(
+        _ingress(
+            "initial_submit",
+            "terminal-exact-active",
+            conversation_id=conversation_id,
+        )
+    )
+
+    inspected = db.inspect_task_fence_conversation(conversation_id)
+    db.close()
+
+    assert inspected.compatible is True
+    assert inspected.task is not None
+    assert inspected.task.task_id == active.task_id
+    assert inspected.active_run is not None
+    assert inspected.active_run.run_id == active.opened_run_id
+    assert len(inspected.terminal_open_incidents) == 1
+    projection = inspected.terminal_open_incidents[0]
+    assert projection.task_id == terminal.task_id
+    assert projection.task_status == "stopped"
+    assert projection.incident.incident_id == incident_id
+    assert projection.incident.source_run_id == terminal.opened_run_id
+    assert projection.incident.attempt_ids == (started.attempt_id,)
+    rendered = repr(inspected)
+    assert foreign.task_id not in rendered
+    assert foreign_incident_id not in rendered
+    assert conversation_id not in rendered
+    assert "foreign-secret-lane" not in rendered
+
+
+def test_terminal_open_incident_set_is_deterministic_and_exact_bounded(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    conversation_id = "terminal-set-bound"
+    first, _, _ = _terminal_unknown_incident(
+        db,
+        marker="terminal-set-first",
+        conversation_id=conversation_id,
+    )
+    second, _, _ = _terminal_unknown_incident(
+        db,
+        marker="terminal-set-second",
+        conversation_id=conversation_id,
+    )
+    db._conn.execute(
+        "UPDATE task_fence_tasks SET status = 'done' WHERE task_id = ?",
+        (first.task_id,),
+    )
+    db._conn.commit()
+    active = db.accept_task_fence_ingress(
+        _ingress(
+            "initial_submit",
+            "terminal-set-active",
+            conversation_id=conversation_id,
+        )
+    )
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_TERMINAL_OPEN_INCIDENTS",
+        2,
+    )
+    complete = db.inspect_task_fence_conversation(conversation_id)
+    replay = db.inspect_task_fence_conversation(conversation_id)
+    assert complete.compatible is True
+    assert complete.task is not None
+    assert complete.task.task_id == active.task_id
+    assert complete.terminal_open_incidents == replay.terminal_open_incidents
+    assert tuple(item.task_id for item in complete.terminal_open_incidents) == tuple(
+        sorted((first.task_id, second.task_id))
+    )
+    assert {
+        item.task_id: item.task_status
+        for item in complete.terminal_open_incidents
+    } == {first.task_id: "done", second.task_id: "stopped"}
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_TERMINAL_OPEN_INCIDENTS",
+        1,
+    )
+    overflow = db.inspect_task_fence_conversation(conversation_id)
+    db.close()
+
+    assert overflow.compatible is False
+    assert overflow.reason == "terminal_open_incident_limit_exceeded"
+    assert overflow.task is None
+    assert overflow.active_run is None
+    assert overflow.open_incident is None
+    assert overflow.terminal_open_incidents == ()
+
+
+def test_terminal_open_incident_scan_uses_partial_index_and_global_work_bound(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    _terminal_unknown_incident(
+        db,
+        marker="terminal-work-first",
+        conversation_id="terminal-work-foreign-a",
+    )
+    _terminal_unknown_incident(
+        db,
+        marker="terminal-work-second",
+        conversation_id="terminal-work-foreign-b",
+    )
+    plan = tuple(
+        row[-1]
+        for row in db._conn.execute(
+            "EXPLAIN QUERY PLAN "
+            + hermes_state._TASK_FENCE_TERMINAL_OPEN_INCIDENT_SCAN_SQL,
+            (hermes_state._TASK_FENCE_MAX_INSPECTION_WORK + 1,),
+        )
+    )
+    assert any("idx_task_fence_incidents_one_open" in detail for detail in plan)
+    assert all("USE TEMP B-TREE" not in detail.upper() for detail in plan)
+
+    monkeypatch.setattr(hermes_state, "_TASK_FENCE_MAX_INSPECTION_WORK", 2)
+    complete = db.inspect_task_fence_conversation("terminal-work-empty-target")
+    assert complete.compatible is True
+    assert complete.reason == "no_active_task"
+    assert complete.terminal_open_incidents == ()
+
+    monkeypatch.setattr(hermes_state, "_TASK_FENCE_MAX_INSPECTION_WORK", 1)
+    overflow = db.inspect_task_fence_conversation("terminal-work-empty-target")
+    db.close()
+
+    assert overflow.compatible is False
+    assert overflow.reason == "terminal_open_incident_work_limit_exceeded"
+    assert overflow.task is None
+    assert overflow.terminal_open_incidents == ()
+
+
+def test_terminal_open_incident_projection_reuses_exact_link_validation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    conversation_id = "terminal-exact-links"
+    _, started, _ = _terminal_unknown_incident(
+        db,
+        marker="terminal-exact-links",
+        conversation_id=conversation_id,
+    )
+    incident_attempt_limit = hermes_state._TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS",
+        0,
+    )
+    over_limit = db.inspect_task_fence_conversation(conversation_id)
+    assert over_limit.compatible is False
+    assert over_limit.reason == "open_incident_attempt_limit_exceeded"
+    assert over_limit.terminal_open_incidents == ()
+
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS",
+        incident_attempt_limit,
+    )
+    db._conn.execute(
+        "UPDATE task_fence_attempts SET recovery_classification = 'known_read' "
+        "WHERE attempt_id = ?",
+        (started.attempt_id,),
+    )
+    db._conn.commit()
+    malformed = db.inspect_task_fence_conversation(conversation_id)
+    db.close()
+
+    assert malformed.compatible is False
+    assert malformed.reason == "incompatible_open_incident_projection"
+    assert malformed.task is None
+    assert malformed.terminal_open_incidents == ()
+
+
+def test_resolved_and_incident_free_terminal_tasks_are_not_projected(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    conversation_id = "terminal-resolved-history"
+    resolved_task, started = _start_effect(
+        db,
+        marker="terminal-resolved",
+        conversation_id=conversation_id,
+    )
+    _recover(db)
+    db.accept_task_fence_ingress(
+        _ingress(
+            "resolve_incident",
+            "terminal-resolved-decision",
+            task_id=resolved_task.task_id,
+            correlation_ids=(started.attempt_id,),
+            conversation_id=conversation_id,
+            resolution_disposition=(ResolutionDisposition.ACCEPTED_UNKNOWN_NO_RETRY),
+            evidence_refs=("operator:terminal-review",),
+        )
+    )
+    db.accept_task_fence_ingress(
+        _ingress(
+            "stop",
+            "terminal-resolved-stop",
+            task_id=resolved_task.task_id,
+            conversation_id=conversation_id,
+        )
+    )
+    incident_free = db.accept_task_fence_ingress(
+        _ingress(
+            "initial_submit",
+            "terminal-incident-free-initial",
+            conversation_id=conversation_id,
+        )
+    )
+    db.accept_task_fence_ingress(
+        _ingress(
+            "stop",
+            "terminal-incident-free-stop",
+            task_id=incident_free.task_id,
+            conversation_id=conversation_id,
+        )
+    )
+
+    inspected = db.inspect_task_fence_conversation(conversation_id)
+    db.close()
+
+    assert inspected.compatible is True
+    assert inspected.reason == "no_active_task"
+    assert inspected.task is None
+    assert inspected.terminal_open_incidents == ()
+
+
+def test_terminal_open_incidents_share_the_active_frontier_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.db"
+    conversation_id = "terminal-snapshot"
+    db = SessionDB(path)
+    accepted, started = _start_effect(
+        db,
+        marker="terminal-snapshot",
+        conversation_id=conversation_id,
+    )
+    _recover(db)
+    active = db.inspect_task_fence_conversation(conversation_id)
+    assert active.open_incident is not None
+    incident_id = active.open_incident.incident_id
+    db.close()
+
+    reader = SessionDB(path, read_only=True)
+    store_read = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    original_inspect = reader._inspect_task_fence_store_unlocked
+
+    def pause_after_store(*, include_counts):
+        inspected = original_inspect(include_counts=include_counts)
+        store_read.set()
+        if not writer_done.wait(timeout=5):
+            raise RuntimeError("terminal snapshot update timed out")
+        return inspected
+
+    def stop_task():
+        try:
+            if not store_read.wait(timeout=5):
+                raise RuntimeError("inspection did not establish its snapshot")
+            writer = SessionDB(path)
+            try:
+                writer.accept_task_fence_ingress(
+                    _ingress(
+                        "stop",
+                        "terminal-snapshot-stop",
+                        task_id=accepted.task_id,
+                        conversation_id=conversation_id,
+                    )
+                )
+            finally:
+                writer.close()
+        except Exception as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    monkeypatch.setattr(
+        reader,
+        "_inspect_task_fence_store_unlocked",
+        pause_after_store,
+    )
+    writer_thread = threading.Thread(target=stop_task)
+    writer_thread.start()
+    try:
+        before = reader.inspect_task_fence_conversation(conversation_id)
+        writer_thread.join(timeout=5)
+        after = reader.inspect_task_fence_conversation(conversation_id)
+    finally:
+        reader.close()
+
+    assert writer_thread.is_alive() is False
+    assert writer_errors == []
+    assert before.compatible is True
+    assert before.task is not None
+    assert before.task.task_id == accepted.task_id
+    assert before.open_incident is not None
+    assert before.open_incident.incident_id == incident_id
+    assert before.terminal_open_incidents == ()
+    assert after.compatible is True
+    assert after.task is None
+    assert after.open_incident is None
+    assert len(after.terminal_open_incidents) == 1
+    terminal = after.terminal_open_incidents[0]
+    assert terminal.task_id == accepted.task_id
+    assert terminal.incident.incident_id == incident_id
+    assert terminal.incident.attempt_ids == (started.attempt_id,)
 
 
 @pytest.mark.parametrize(

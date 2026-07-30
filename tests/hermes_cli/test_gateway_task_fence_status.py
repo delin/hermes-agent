@@ -145,7 +145,7 @@ def test_gateway_status_default_off_does_not_open_or_create_store(
 
     output = capsys.readouterr().out
     assert "Gateway is not running" in output
-    assert "Task Fence shadow (active non-terminal task only):" in output
+    assert "Task Fence shadow (configured conversation only):" in output
     assert "State: not configured" in output
     assert not (tmp_path / "state.db").exists()
 
@@ -194,7 +194,14 @@ def test_gateway_status_renders_bounded_current_profile_without_writes_or_leaks(
     assert held[0].event_id in output
     assert "showing first 64; truncated" in output
     assert "Open incident for active task: none" in output
-    assert "terminal tasks, history, and their incidents are not inspected" in output
+    assert (
+        "Open incidents on terminal tasks in configured conversation: none"
+        in output
+    )
+    assert (
+        "resolved incidents and other terminal/history state are not inspected"
+        in output
+    )
     assert conversation_id not in output
     assert "status-secret-source" not in output
     assert "status-secret-held" not in output
@@ -241,19 +248,31 @@ def test_gateway_status_scopes_incident_and_terminal_history_honestly(
     assert stopped.task_projection is not None
     assert stopped.task_projection.status == "stopped"
     db.close()
+    db_path = tmp_path / "state.db"
+    before = _db_identity(db_path)
 
     _run_status(tmp_path)
     terminal_output = capsys.readouterr().out
     assert "Inspection: no_active_task" in terminal_output
     assert "Active task: none" in terminal_output
     assert (
-        "terminal tasks, history, and their incidents are not inspected"
+        "Open incidents on terminal tasks in configured conversation: 1"
+        in terminal_output
+    )
+    assert f"task={accepted.task_id}, status=stopped" in terminal_output
+    assert f"incident={incident_id}, reason=outcome_unknown" in terminal_output
+    assert f"source_run={accepted.opened_run_id}" in terminal_output
+    assert f"attempts={started.attempt_id}" in terminal_output
+    assert (
+        "resolved incidents and other terminal/history state are not inspected"
         in terminal_output
     )
     assert "Cohort: not materialized" not in terminal_output
-    assert incident_id not in terminal_output
     assert "Open incident for active task: none" not in terminal_output
     assert conversation_id not in terminal_output
+    assert "status-incident-secret" not in terminal_output
+    assert "status-terminal-secret" not in terminal_output
+    assert _db_identity(db_path) == before
 
 
 def test_gateway_status_configured_missing_store_is_nonfatal_and_secret_free(

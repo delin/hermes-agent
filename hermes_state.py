@@ -348,7 +348,10 @@ _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS = 64
 _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
 _TASK_FENCE_MAX_PROCESS_CHECKPOINT_OPERATIONS = 64
 _TASK_FENCE_MAX_INSPECTION_ITEMS = 64
+_TASK_FENCE_MAX_TERMINAL_OPEN_INCIDENTS = 64
 _TASK_FENCE_MAX_INSPECTION_WORK = 8_192
+_TASK_FENCE_ACTIVE_INCIDENT_TASK_STATUSES = frozenset({"incident"})
+_TASK_FENCE_TERMINAL_TASK_STATUSES = frozenset({"stopped", "done"})
 _TASK_FENCE_MAX_RUNTIME_EPOCH = 2**63 - 1
 _TASK_FENCE_ASYNC_RESTORE_ADAPTER = "runtime:async_delegation_restore_ready"
 _TASK_FENCE_ASYNC_RECOVERY_PENDING_ADAPTER = "runtime:async_delegation_recovery_pending"
@@ -390,6 +393,14 @@ _TASK_FENCE_INSPECTION_ATTEMPT_SELECT_COLUMNS = (
     "run.task_id AS selected_run_task_id, "
     "generation.task_id AS selected_generation_task_id, "
     "generation.run_id AS selected_generation_run_id"
+)
+_TASK_FENCE_TERMINAL_OPEN_INCIDENT_SCAN_SQL = (
+    "SELECT incident.task_id AS incident_task_id, task.* "
+    "FROM main.task_fence_incidents AS incident "
+    "INDEXED BY idx_task_fence_incidents_one_open "
+    "LEFT JOIN main.task_fence_tasks AS task ON task.task_id = incident.task_id "
+    "WHERE incident.state = 'open' "
+    "ORDER BY incident.task_id LIMIT ?"
 )
 _TASK_FENCE_POLICY_DECISION_SELECT_COLUMNS = (
     "decision_order, decided_at, decision_id, decision_point, outcome, "
@@ -551,8 +562,17 @@ class TaskFenceOpenIncidentProjection:
 
 
 @dataclass(frozen=True)
+class TaskFenceTerminalOpenIncidentProjection:
+    """One terminal task and its unresolved exact incident projection."""
+
+    task_id: str
+    task_status: str
+    incident: TaskFenceOpenIncidentProjection
+
+
+@dataclass(frozen=True)
 class TaskFenceConversationInspection:
-    """SELECT-only current authority for one exact conversation."""
+    """SELECT-only current authority and terminal unknowns for one conversation."""
 
     store: TaskFenceStoreInspection
     compatible: bool
@@ -566,6 +586,9 @@ class TaskFenceConversationInspection:
     started_attempts: Tuple[TaskFenceStartedAttemptProjection, ...]
     started_attempts_truncated: bool
     open_incident: Optional[TaskFenceOpenIncidentProjection]
+    terminal_open_incidents: Tuple[
+        TaskFenceTerminalOpenIncidentProjection, ...
+    ]
 
 
 @dataclass(frozen=True)
@@ -8430,6 +8453,10 @@ class SessionDB:
     def _task_fence_open_incident_projection_unlocked(
         self,
         task: sqlite3.Row,
+        *,
+        allowed_task_statuses: frozenset[str] = (
+            _TASK_FENCE_ACTIVE_INCIDENT_TASK_STATUSES
+        ),
     ) -> Tuple[Optional[TaskFenceOpenIncidentProjection], Optional[str]]:
         rows = self._conn.execute(
             "SELECT incident.incident_id, incident.source_run_id, "
@@ -8443,10 +8470,10 @@ class SessionDB:
             (task["task_id"],),
         ).fetchall()
         if not rows:
-            if task["status"] == "incident":
+            if task["status"] in allowed_task_statuses:
                 return None, "incompatible_open_incident_projection"
             return None, None
-        if task["status"] != "incident" or len(rows) != 1:
+        if task["status"] not in allowed_task_statuses or len(rows) != 1:
             return None, "incompatible_open_incident_projection"
 
         row = rows[0]
@@ -8512,6 +8539,62 @@ class SessionDB:
             None,
         )
 
+    def _task_fence_terminal_open_incident_projection_unlocked(
+        self,
+        *,
+        conversation_id: str,
+        runtime_epoch: int,
+    ) -> Tuple[
+        Tuple[TaskFenceTerminalOpenIncidentProjection, ...],
+        Optional[str],
+    ]:
+        rows = self._conn.execute(
+            _TASK_FENCE_TERMINAL_OPEN_INCIDENT_SCAN_SQL,
+            (_TASK_FENCE_MAX_INSPECTION_WORK + 1,),
+        ).fetchall()
+        if len(rows) > _TASK_FENCE_MAX_INSPECTION_WORK:
+            return (), "terminal_open_incident_work_limit_exceeded"
+
+        terminal_rows = tuple(
+            row
+            for row in rows
+            if row["conversation_id"] == conversation_id
+            and row["status"] in _TASK_FENCE_TERMINAL_TASK_STATUSES
+        )
+        if len(terminal_rows) > _TASK_FENCE_MAX_TERMINAL_OPEN_INCIDENTS:
+            return (), "terminal_open_incident_limit_exceeded"
+
+        projected = []
+        for row in terminal_rows:
+            if (
+                row["incident_task_id"] != row["task_id"]
+                or not self._task_fence_task_projection_compatible(row)
+                or not _task_fence_v2_identifier_compatible(row["task_id"])
+                or not _task_fence_v2_identifier_compatible(
+                    row["cohort_key"],
+                    optional=True,
+                )
+            ):
+                return (), "malformed_terminal_open_incident_task"
+            if row["current_runtime_epoch"] != runtime_epoch:
+                return (), "task_runtime_epoch_mismatch"
+            incident, failure = self._task_fence_open_incident_projection_unlocked(
+                row,
+                allowed_task_statuses=_TASK_FENCE_TERMINAL_TASK_STATUSES,
+            )
+            if failure is not None:
+                return (), failure
+            if incident is None:
+                return (), "incompatible_open_incident_projection"
+            projected.append(
+                TaskFenceTerminalOpenIncidentProjection(
+                    task_id=row["task_id"],
+                    task_status=row["status"],
+                    incident=incident,
+                )
+            )
+        return tuple(projected), None
+
     def _inspect_task_fence_conversation(
         self,
         conversation_id: str,
@@ -8542,6 +8625,9 @@ class SessionDB:
                     open_incident: Optional[
                         TaskFenceOpenIncidentProjection
                     ] = None,
+                    terminal_open_incidents: Tuple[
+                        TaskFenceTerminalOpenIncidentProjection, ...
+                    ] = (),
                 ) -> TaskFenceConversationInspection:
                     return TaskFenceConversationInspection(
                         store=store,
@@ -8556,6 +8642,7 @@ class SessionDB:
                         started_attempts=started_attempts,
                         started_attempts_truncated=started_attempts_truncated,
                         open_incident=open_incident,
+                        terminal_open_incidents=terminal_open_incidents,
                     )
 
                 if not store.compatible:
@@ -8569,6 +8656,15 @@ class SessionDB:
                     b"hermes.task_fence.conversation.v1\0"
                     + conversation_id.encode("utf-8")
                 ).hexdigest()
+
+                terminal_open_incidents, failure = (
+                    self._task_fence_terminal_open_incident_projection_unlocked(
+                        conversation_id=conversation_id,
+                        runtime_epoch=store.runtime_epoch,
+                    )
+                )
+                if failure is not None:
+                    return result(compatible=False, reason=failure)
 
                 task_rows = self._conn.execute(
                     f"SELECT {_TASK_FENCE_TASK_SELECT_COLUMNS} "
@@ -8620,6 +8716,7 @@ class SessionDB:
                     return result(
                         compatible=True,
                         reason="no_active_task",
+                        terminal_open_incidents=terminal_open_incidents,
                     )
 
                 implicit_binding = task_row["cohort_key"] is None
@@ -8731,6 +8828,7 @@ class SessionDB:
                     started_attempts=started_attempts,
                     started_attempts_truncated=started_truncated,
                     open_incident=open_incident,
+                    terminal_open_incidents=terminal_open_incidents,
                 )
             finally:
                 self._end_task_fence_read_snapshot_unlocked(owned_snapshot)
@@ -8739,7 +8837,7 @@ class SessionDB:
         self,
         conversation_id: str,
     ) -> TaskFenceConversationInspection:
-        """Select one active task's current authority in one read snapshot."""
+        """Select current authority and terminal unknowns in one read snapshot."""
 
         try:
             return self._inspect_task_fence_conversation(conversation_id)
@@ -8759,6 +8857,7 @@ class SessionDB:
                 started_attempts=(),
                 started_attempts_truncated=False,
                 open_incident=None,
+                terminal_open_incidents=(),
             )
 
     @staticmethod

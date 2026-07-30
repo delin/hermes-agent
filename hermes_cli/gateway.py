@@ -1415,7 +1415,7 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
 def _print_task_fence_shadow_status() -> None:
     """Render the configured profile's bounded, read-only shadow projection."""
     print()
-    print("Task Fence shadow (active non-terminal task only):")
+    print("Task Fence shadow (configured conversation only):")
     try:
         session_key = load_task_fence_shadow_session_key()
     except Exception:
@@ -1462,11 +1462,30 @@ def _print_task_fence_shadow_status() -> None:
         f"ever_enforced={'yes' if store.ever_enforced else 'no'}"
     )
 
+    def print_terminal_open_incidents() -> None:
+        incidents = inspection.terminal_open_incidents
+        label = "  Open incidents on terminal tasks in configured conversation"
+        if not incidents:
+            print(f"{label}: none")
+            return
+        print(f"{label}: {len(incidents)}")
+        for projection in incidents:
+            incident = projection.incident
+            attempt_ids = ", ".join(incident.attempt_ids)
+            print(
+                "    "
+                f"task={projection.task_id}, status={projection.task_status}, "
+                f"incident={incident.incident_id}, reason={incident.reason_code}, "
+                f"source_run={incident.source_run_id or 'none'}, "
+                f"attempts={attempt_ids}"
+            )
+
     task = inspection.task
     if task is None:
         print("  Active task: none")
+        print_terminal_open_incidents()
         print(
-            "  Scope: terminal tasks, history, and their incidents are not inspected."
+            "  Scope: resolved incidents and other terminal/history state are not inspected."
         )
         return
 
@@ -1532,7 +1551,10 @@ def _print_task_fence_shadow_status() -> None:
             f"source_run={incident.source_run_id or 'none'}, "
             f"attempts={attempt_ids}"
         )
-    print("  Scope: terminal tasks, history, and their incidents are not inspected.")
+    print_terminal_open_incidents()
+    print(
+        "  Scope: resolved incidents and other terminal/history state are not inspected."
+    )
 
 
 def _print_other_profiles_gateway_status() -> None:
