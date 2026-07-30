@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
@@ -24,6 +25,9 @@ from gateway.session import SessionEntry, SessionSource, build_session_key
 from gateway.task_fence_delivery import (
     TASK_FENCE_DELIVERY_CAPABILITY_ATTR,
     _CURRENT_DELIVERY_CAPABILITY,
+    _slack_post_message_acknowledgement_ref,
+    bind_task_fence_delivery_capability,
+    take_task_fence_delivery_capability,
 )
 from hermes_state import AsyncSessionDB, SessionDB
 from plugins.platforms.slack.adapter import SlackAdapter
@@ -236,10 +240,45 @@ def _count(db: SessionDB, table: str) -> int:
         return db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
+def test_slack_acknowledgement_ref_is_bounded_and_binds_exact_identity():
+    base = {
+        "team_id": "T123",
+        "request": {"channel": "D123"},
+        "result": {"ts": "1710000000.000001"},
+    }
+    reference = _slack_post_message_acknowledgement_ref(**base)
+    assert reference == _slack_post_message_acknowledgement_ref(**base)
+    assert reference is not None
+    assert len(reference.encode("utf-8")) < 128
+    assert all(value not in reference for value in ("T123", "D123", "1710000000"))
+    assert (
+        len({
+            reference,
+            _slack_post_message_acknowledgement_ref(**{**base, "team_id": "T124"}),
+            _slack_post_message_acknowledgement_ref(**{
+                **base,
+                "request": {"channel": "D124"},
+            }),
+            _slack_post_message_acknowledgement_ref(**{
+                **base,
+                "result": {"ts": "1710000000.000002"},
+            }),
+        })
+        == 4
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
-    ["single", "chunks", "base-retry", "block-fallback"],
+    [
+        "single",
+        "chunks",
+        "base-retry",
+        "block-fallback",
+        "missing-ack",
+        "invalid-ack",
+    ],
 )
 async def test_real_slack_final_response_audits_every_physical_post(
     tmp_path,
@@ -264,22 +303,37 @@ async def test_real_slack_final_response_audits_every_physical_post(
     else:
         _stage_capability(runner, event, session_key, response, parent)
     physical_calls: list[dict] = []
+    physical_results: list[dict | None] = []
     sdk_envelopes: list[CausalEnvelope] = []
 
     async def post_message(**kwargs):
         # Admission and authorization are durable before physical SDK entry.
         assert _count(db, "task_fence_attempts") == len(physical_calls) + 1
+        with db._lock:
+            latest_attempt = db._conn.execute(
+                "SELECT state FROM task_fence_attempts "
+                "ORDER BY prepared_at DESC LIMIT 1"
+            ).fetchone()
+        assert latest_attempt["state"] == "STARTED"
         assert current_task_fence_policy() is None
         assert _CURRENT_DELIVERY_CAPABILITY.get() is None
         envelope = current_causal_envelope()
         assert isinstance(envelope, CausalEnvelope)
         sdk_envelopes.append(envelope)
         physical_calls.append(dict(kwargs))
+        physical_results.append(None)
         if case == "base-retry" and len(physical_calls) == 1:
             raise ConnectionError("connection reset")
         if case == "block-fallback" and len(physical_calls) == 1:
             raise _SlackRejectedBlocks()
-        return {"ts": f"1710000000.{len(physical_calls):06d}"}
+        if case == "missing-ack":
+            result = {"ok": True}
+        elif case == "invalid-ack":
+            result = {"ok": True, "ts": "not-a-slack-timestamp"}
+        else:
+            result = {"ts": f"1710000000.{len(physical_calls):06d}"}
+        physical_results[-1] = result
+        return result
 
     client.chat_postMessage.side_effect = post_message
     try:
@@ -305,7 +359,9 @@ async def test_real_slack_final_response_audits_every_physical_post(
                 "FROM task_fence_dispatch_permits ORDER BY reserved_at"
             ).fetchall()
             attempts = db._conn.execute(
-                "SELECT state FROM task_fence_attempts ORDER BY prepared_at"
+                "SELECT attempt_id, state, acknowledgement_ref, "
+                "terminal_at IS NOT NULL "
+                "FROM task_fence_attempts ORDER BY prepared_at"
             ).fetchall()
             operation_fingerprints = db._conn.execute(
                 "SELECT invocation_fingerprint "
@@ -322,7 +378,70 @@ async def test_real_slack_final_response_audits_every_physical_post(
         assert {(row[3], row[4], row[5]) for row in permits} == {
             ("delivery", "gateway:slack:chat_post_message", "consumed")
         }
-        assert [row[0] for row in attempts] == ["STARTED"] * len(physical_calls)
+        expected_evidence = [
+            (
+                _slack_post_message_acknowledgement_ref(
+                    team_id="T123",
+                    request=request,
+                    result=result,
+                )
+                if result is not None
+                else None
+            )
+            for request, result in zip(physical_calls, physical_results, strict=True)
+        ]
+        expected_states = [
+            "SUCCEEDED" if evidence is not None else "STARTED"
+            for evidence in expected_evidence
+        ]
+        assert [row["state"] for row in attempts] == expected_states
+        terminal_evidence = []
+        for result, evidence, attempt in zip(
+            physical_results,
+            expected_evidence,
+            attempts,
+            strict=True,
+        ):
+            transitions = db._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref "
+                "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                "ORDER BY transition_order",
+                (attempt["attempt_id"],),
+            ).fetchall()
+            assert tuple(transitions[0][:3]) == (
+                None,
+                "STARTED",
+                "would_allow",
+            )
+            if evidence is None:
+                assert tuple(attempt[1:]) == ("STARTED", None, 0)
+                assert len(transitions) == 1
+                continue
+            assert result is not None
+            assert tuple(attempt[1:]) == (
+                "SUCCEEDED",
+                evidence,
+                1,
+            )
+            assert tuple(transitions[1]) == (
+                "STARTED",
+                "SUCCEEDED",
+                "SUCCEEDED",
+                evidence,
+            )
+            terminal_evidence.append(evidence)
+        assert len(terminal_evidence) == len(set(terminal_evidence))
+        assert all(
+            evidence.startswith("slack:chat_post_message:ack:sha256:")
+            and len(evidence.encode("utf-8")) < 128
+            for evidence in terminal_evidence
+        )
+        assert all(
+            result["ts"] not in "\n".join(terminal_evidence)
+            for result in physical_results
+            if result is not None and "ts" in result
+        )
+        assert "not-a-slack-timestamp" not in dump
         assert len({envelope.invocation_id for envelope in sdk_envelopes}) == len(
             physical_calls
         )
@@ -342,6 +461,204 @@ async def test_real_slack_final_response_audits_every_physical_post(
         assert current_task_fence_policy() is None
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_slack_terminal_evidence_fault_is_fail_open(
+    tmp_path,
+    caplog,
+):
+    db, runner, event, session_key, parent = await _accepted_lane(tmp_path)
+    response = "terminal evidence fault preserves the delivery"
+    _stage_capability(runner, event, session_key, response, parent)
+    capability = take_task_fence_delivery_capability(event)
+    assert capability is not None
+    adapter, client = _slack_adapter()
+    adapter.gateway_runner = runner
+    sdk_result = {"ok": True, "ts": "1710000000.000099"}
+    client.chat_postMessage.return_value = sdk_result
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_delivery_terminal_transition "
+        "BEFORE INSERT ON task_fence_attempt_transitions "
+        "WHEN NEW.from_state = 'STARTED' BEGIN "
+        "SELECT RAISE(ABORT, 'secret terminal evidence fault'); END"
+    )
+
+    try:
+        with (
+            caplog.at_level(logging.WARNING),
+            bind_task_fence_delivery_capability(capability),
+        ):
+            result = await adapter.send(
+                "D123",
+                response,
+                reply_to="1700000000.000001",
+                metadata={"scope_id": "T123"},
+            )
+
+        assert result.success
+        assert result.message_id == sdk_result["ts"]
+        assert result.raw_response is sdk_result
+        client.chat_postMessage.assert_awaited_once_with(
+            channel="D123",
+            text=response,
+            mrkdwn=True,
+            thread_ts="1700000000.000001",
+        )
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts"
+            ).fetchone()
+        ) == ("STARTED", None, None)
+        assert _count(db, "task_fence_attempt_transitions") == 1
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_cohorts WHERE audit_degraded = 1"
+            ).fetchone()[0]
+            == 1
+        )
+        assert "TaskFencePolicyUnavailable" in caplog.text
+        assert "secret terminal evidence fault" not in caplog.text
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_slack_terminal_observer_adds_no_post_ack_cancellation_point(tmp_path):
+    db, runner, event, session_key, parent = await _accepted_lane(tmp_path)
+    response = "post acknowledgement cancellation boundary"
+    _stage_capability(runner, event, session_key, response, parent)
+    capability = take_task_fence_delivery_capability(event)
+    assert capability is not None
+    adapter, client = _slack_adapter()
+    adapter.gateway_runner = runner
+    sdk_result = {"ok": True, "ts": "1710000000.000101"}
+
+    async def post_message(**_kwargs):
+        delivery_task = asyncio.current_task()
+        assert delivery_task is not None
+        asyncio.get_running_loop().call_soon(delivery_task.cancel)
+        return sdk_result
+
+    client.chat_postMessage.side_effect = post_message
+
+    async def send():
+        with bind_task_fence_delivery_capability(capability):
+            return await adapter.send(
+                "D123",
+                response,
+                metadata={"scope_id": "T123"},
+            )
+
+    try:
+        delivery_task = asyncio.create_task(send())
+        result = await delivery_task
+
+        assert result.success
+        assert result.raw_response is sdk_result
+        assert not delivery_task.cancelled()
+        assert client.chat_postMessage.await_count == 1
+        assert (
+            db._conn.execute("SELECT state FROM task_fence_attempts").fetchone()[0]
+            == "SUCCEEDED"
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_only_incidents_ambiguous_slack_post(tmp_path):
+    path = tmp_path / "state.db"
+    db, runner, event, session_key, parent = await _accepted_lane(tmp_path)
+    response = "retry with one ambiguous Slack handoff"
+    _stage_capability(runner, event, session_key, response, parent)
+    adapter, client = _slack_adapter()
+    adapter.gateway_runner = runner
+    calls = 0
+
+    async def post_message(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("connection reset")
+        return {"ok": True, "ts": "1710000000.000100"}
+
+    client.chat_postMessage.side_effect = post_message
+    try:
+        with patch("gateway.platforms.base.asyncio.sleep", new=AsyncMock()):
+            await _run_base_final(adapter, event, session_key, response)
+        assert calls == 2
+        attempts_before = db._conn.execute(
+            "SELECT attempt_id, state, acknowledgement_ref, terminal_at "
+            "FROM task_fence_attempts ORDER BY prepared_at"
+        ).fetchall()
+        assert [row["state"] for row in attempts_before] == [
+            "STARTED",
+            "SUCCEEDED",
+        ]
+        succeeded_id = attempts_before[1]["attempt_id"]
+        succeeded_before = tuple(attempts_before[1])
+        succeeded_transitions_before = tuple(
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref, "
+                "transitioned_at FROM task_fence_attempt_transitions "
+                "WHERE attempt_id = ? ORDER BY transition_order",
+                (succeeded_id,),
+            )
+        )
+    finally:
+        db.close()
+
+    reopened = SessionDB(path)
+    try:
+        inspection = reopened.inspect_task_fence_store()
+        recovery = reopened.recover_task_fence_state(
+            expected_runtime_epoch=inspection.runtime_epoch,
+            expected_mode_generation=inspection.mode_generation,
+        )
+        assert (recovery.previous_runtime_epoch, recovery.runtime_epoch) == (0, 1)
+        attempts_after = reopened._conn.execute(
+            "SELECT attempt_id, state, acknowledgement_ref, terminal_at "
+            "FROM task_fence_attempts ORDER BY prepared_at"
+        ).fetchall()
+        assert [row["state"] for row in attempts_after] == [
+            "OUTCOME_UNKNOWN",
+            "SUCCEEDED",
+        ]
+        assert tuple(attempts_after[1]) == succeeded_before
+        assert (
+            tuple(
+                tuple(row)
+                for row in reopened._conn.execute(
+                    "SELECT from_state, to_state, disposition, evidence_ref, "
+                    "transitioned_at FROM task_fence_attempt_transitions "
+                    "WHERE attempt_id = ? ORDER BY transition_order",
+                    (succeeded_id,),
+                )
+            )
+            == succeeded_transitions_before
+        )
+        incident_attempts = reopened._conn.execute(
+            "SELECT link.attempt_id FROM task_fence_incident_attempts AS link "
+            "JOIN task_fence_incidents AS incident "
+            "ON incident.incident_id = link.incident_id "
+            "WHERE incident.task_id = ?",
+            (parent.task_id,),
+        ).fetchall()
+        assert [row["attempt_id"] for row in incident_attempts] == [
+            attempts_before[0]["attempt_id"]
+        ]
+        incidents = reopened._conn.execute(
+            "SELECT state, reason_code FROM task_fence_incidents WHERE task_id = ?",
+            (parent.task_id,),
+        ).fetchall()
+        assert [tuple(row) for row in incidents] == [("open", "outcome_unknown")]
+    finally:
+        reopened.close()
 
 
 @pytest.mark.asyncio

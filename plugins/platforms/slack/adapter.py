@@ -2586,13 +2586,13 @@ class SlackAdapter(BasePlatformAdapter):
                 try:
                     client = self._get_client(chat_id, team_id=team_id)
                     post_message = client.chat_postMessage
-                    async with task_fence_slack_post_message_handoff(
+                    last_result = await task_fence_slack_post_message_handoff(
                         capability=delivery_capability,
                         runner=getattr(self, "gateway_runner", None),
                         team_id=team_id,
                         request=kwargs,
-                    ):
-                        last_result = await post_message(**kwargs)
+                        post_message=post_message,
+                    )
                 except Exception as e:
                     if kwargs.get("blocks") and self._is_block_payload_rejection(e):
                         retry_kwargs = dict(kwargs)
@@ -2603,13 +2603,13 @@ class SlackAdapter(BasePlatformAdapter):
                         )
                         retry_client = self._get_client(chat_id, team_id=team_id)
                         retry_post_message = retry_client.chat_postMessage
-                        async with task_fence_slack_post_message_handoff(
+                        last_result = await task_fence_slack_post_message_handoff(
                             capability=delivery_capability,
                             runner=getattr(self, "gateway_runner", None),
                             team_id=team_id,
                             request=retry_kwargs,
-                        ):
-                            last_result = await retry_post_message(**retry_kwargs)
+                            post_message=retry_post_message,
+                        )
                     else:
                         raise
 

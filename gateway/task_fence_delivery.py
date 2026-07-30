@@ -7,12 +7,13 @@ import hashlib
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Iterator, Mapping
+from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from task_fence import (
+    AttemptTerminal,
     CausalEnvelope,
     DecisionOutcome,
     OperationDescriptor,
@@ -124,7 +125,7 @@ def _audit_slack_post_message_start(
     invocation_id: str,
     team_id: str | None,
     request: Mapping[str, Any],
-) -> None:
+) -> str | None:
     operation = OperationDescriptor(
         invocation_id=invocation_id,
         kind=OperationKind.DELIVERY,
@@ -139,30 +140,85 @@ def _audit_slack_post_message_start(
         admitted.outcome is DecisionOutcome.WOULD_RESERVE
         and admitted.permit_id is not None
     ):
-        policy.authorize_and_start(
+        started = policy.authorize_and_start(
             child,
             operation,
             admitted.permit_id,
         )
+        return started.attempt_id
+    return None
 
 
-@asynccontextmanager
+def _slack_post_message_acknowledgement_ref(
+    *,
+    team_id: str | None,
+    request: Mapping[str, Any],
+    result: Any,
+) -> str | None:
+    """Return a bounded opaque commitment to a concrete Slack message ID."""
+
+    try:
+        channel = request.get("channel")
+        message_ts = result.get("ts")
+    except Exception:
+        return None
+    if (
+        not isinstance(channel, str)
+        or not channel
+        or not isinstance(message_ts, str)
+        or not message_ts
+        or len(channel) > 256
+        or len(message_ts) > 64
+        or (team_id is not None and (not isinstance(team_id, str) or not team_id))
+        or (isinstance(team_id, str) and len(team_id) > 256)
+    ):
+        return None
+    seconds, separator, fraction = message_ts.partition(".")
+    if (
+        separator != "."
+        or not seconds.isascii()
+        or not fraction.isascii()
+        or not seconds.isdigit()
+        or not fraction.isdigit()
+    ):
+        return None
+    acknowledgement = json.dumps(
+        {
+            "channel": channel,
+            "team_id": team_id,
+            "ts": message_ts,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8", errors="surrogatepass")
+    if len(acknowledgement) > 1_024:
+        return None
+    return (
+        "slack:chat_post_message:ack:sha256:"
+        f"{hashlib.sha256(acknowledgement).hexdigest()}"
+    )
+
+
 async def task_fence_slack_post_message_handoff(
     *,
     capability: TaskFenceDeliveryCapability | None,
     runner: Any,
     team_id: str | None,
     request: Mapping[str, Any],
-) -> AsyncIterator[None]:
-    """Audit one physical chat.postMessage entry without gating it."""
+    post_message: Callable[..., Awaitable[Any]],
+) -> Any:
+    """Audit and invoke one physical chat.postMessage without gating it."""
 
     if capability is None:
         with bind_task_fence_policy(None):
-            yield
-        return
+            return await post_message(**dict(request))
 
     child = None
     invocation_id = f"tfiv_{uuid.uuid4().hex}"
+    policy = None
+    attempt_id = None
     try:
         if capability.parent is not None:
             child = capability.parent.for_invocation()
@@ -171,9 +227,10 @@ async def task_fence_slack_post_message_handoff(
         store = getattr(session_db, "_db", session_db)
         if store is None:
             raise RuntimeError("missing Task Fence delivery store")
-        await asyncio.to_thread(
+        policy = TaskFencePolicy(store)
+        attempt_id = await asyncio.to_thread(
             _audit_slack_post_message_start,
-            TaskFencePolicy(store),
+            policy,
             child,
             invocation_id,
             team_id,
@@ -192,6 +249,34 @@ async def task_fence_slack_post_message_handoff(
     token = _CURRENT_DELIVERY_CAPABILITY.set(None)
     try:
         with bind_causal_envelope(child), bind_task_fence_policy(None):
-            yield
+            result = await post_message(**dict(request))
+        if policy is not None and attempt_id is not None:
+            evidence_reference = _slack_post_message_acknowledgement_ref(
+                team_id=team_id,
+                request=request,
+                result=result,
+            )
+            if evidence_reference is None:
+                logger.warning(
+                    "Task Fence shadow delivery acknowledgement missing for %s",
+                    _SLACK_CHAT_POST_MESSAGE_ADAPTER,
+                )
+            else:
+                try:
+                    # A post-ack await would add a cancellation point that can
+                    # turn a confirmed legacy send into a failed/retried send.
+                    policy.finish_attempt(
+                        attempt_id,
+                        AttemptTerminal.SUCCEEDED,
+                        evidence_reference,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Task Fence shadow delivery terminal observation failed "
+                        "for %s: %s",
+                        _SLACK_CHAT_POST_MESSAGE_ADAPTER,
+                        type(exc).__name__,
+                    )
+        return result
     finally:
         _CURRENT_DELIVERY_CAPABILITY.reset(token)
