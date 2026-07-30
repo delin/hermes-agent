@@ -259,6 +259,22 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
 
     monkeypatch.setattr(SessionDB, "recover_task_fence_state", traced_recover)
 
+    queued_event = json.dumps({
+        "type": "async_delegation",
+        "delegation_id": "deadbeef",
+        "status": "completed",
+    })
+    seed = SessionDB(tmp_path / "state.db")
+    seed._conn.execute(
+        "INSERT INTO async_delegations ("
+        "delegation_id, origin_session, state, dispatched_at, completed_at, "
+        "updated_at, event_json, result_json, delivery_state"
+        ") VALUES (?, ?, 'completed', 1.0, 2.0, 2.0, ?, ?, 'pending')",
+        ("deadbeef", _SHADOW_SESSION_KEY, queued_event, queued_event),
+    )
+    seed._conn.commit()
+    seed.close()
+
     class ReopeningRunner:
         def __init__(self, config: GatewayConfig):
             events.append("runner")
@@ -280,6 +296,26 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
             assert store.tested_artifact_commit == _COMMIT
             assert store.tested_artifact_checksum == _ARTIFACT_DIGEST
             assert store.dependency_lock_fingerprint == _LOCK_DIGEST
+            database = SessionDB(tmp_path / "state.db")
+            try:
+                decision = database._conn.execute(
+                    "SELECT outcome, reason_code, decision_point, "
+                    "operation_kind, adapter FROM task_fence_policy_decisions"
+                ).fetchone()
+                queued = database._conn.execute(
+                    "SELECT delivery_state, event_json FROM async_delegations "
+                    "WHERE delegation_id = 'deadbeef'"
+                ).fetchone()
+            finally:
+                database.close()
+            assert tuple(decision) == (
+                "would_block",
+                "missing_provenance",
+                "admission",
+                "delivery",
+                "runtime:async_delegation_restore_ready",
+            )
+            assert tuple(queued) == ("pending", queued_event)
 
         async def start(self) -> bool:
             events.append("start")

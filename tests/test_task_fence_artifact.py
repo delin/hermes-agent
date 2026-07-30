@@ -504,6 +504,37 @@ def test_artifact_pin_and_shadow_recovery_have_only_two_serial_orders(tmp_path) 
     recovered.close()
 
 
+@pytest.mark.parametrize(
+    ("shadow_session_key", "with_artifact", "reason"),
+    (
+        ("", True, "invalid_shadow_session_key"),
+        ("lane\x00key", True, "invalid_shadow_session_key"),
+        ("x" * 513, True, "invalid_shadow_session_key"),
+        ("lane-key", False, "shadow_session_key_requires_artifact"),
+    ),
+)
+def test_shadow_session_recovery_scope_is_closed(
+    tmp_path,
+    shadow_session_key,
+    with_artifact,
+    reason,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    before = _task_fence_state(db)
+
+    with pytest.raises(TaskFenceProtocolRejected, match=reason) as exc:
+        db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_identity() if with_artifact else None,
+            shadow_session_key=shadow_session_key,
+        )
+
+    assert exc.value.reason == reason
+    assert _task_fence_state(db) == before
+    db.close()
+
+
 def test_startup_artifact_first_pin_recovers_durable_authority(tmp_path) -> None:
     path = tmp_path / "state.db"
     db = SessionDB(path)

@@ -346,6 +346,7 @@ _TASK_FENCE_MAX_RECOVERY_AUTHORITIES = 8_192
 _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS = 64
 _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
 _TASK_FENCE_MAX_RUNTIME_EPOCH = 2**63 - 1
+_TASK_FENCE_ASYNC_RESTORE_ADAPTER = "runtime:async_delegation_restore_ready"
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
 _TASK_FENCE_POLICY_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 _TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
@@ -6168,8 +6169,9 @@ class SessionDB:
         expected_runtime_epoch: int,
         expected_mode_generation: int,
         tested_artifact_identity: Optional[TaskFenceArtifactIdentity] = None,
+        shadow_session_key: Optional[str] = None,
     ) -> TaskFenceRecovery:
-        """Recover shadow state, optionally atomically pinning one artifact."""
+        """Recover shadow state and observe restore-ready async completions."""
 
         if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
             raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
@@ -6180,6 +6182,11 @@ class SessionDB:
             TaskFenceArtifactIdentity,
         ):
             raise TaskFenceProtocolRejected("invalid_artifact_identity")
+        if shadow_session_key is not None:
+            if not _task_fence_v2_identifier_compatible(shadow_session_key):
+                raise TaskFenceProtocolRejected("invalid_shadow_session_key")
+            if tested_artifact_identity is None:
+                raise TaskFenceProtocolRejected("shadow_session_key_requires_artifact")
         if self.read_only or self._conn is None:
             raise TaskFenceRecoveryUnavailable("store_unavailable")
 
@@ -7062,8 +7069,204 @@ class SessionDB:
                     "incompatible_recovery_projection"
                 )
 
+            async_restore_observations: List[
+                Tuple[
+                    Optional[CausalEnvelope],
+                    OperationDescriptor,
+                    DispatchDecision,
+                ]
+            ] = []
+            if shadow_session_key is not None:
+                async_rows = bounded_authority_rows(
+                    "SELECT delegation.delegation_id, "
+                    "delegation.dispatched_at, delegation.event_json, "
+                    "delegation.causal_parent_generation_id, "
+                    "delegation.causal_parent_runtime_epoch, "
+                    "generation.generation_id, generation.task_id, "
+                    "generation.run_id, generation.intent_epoch, "
+                    "generation.control_revision, "
+                    "generation.runtime_epoch AS generation_runtime_epoch, "
+                    "generation.input_manifest_hash, "
+                    "generation.snapshot_event_id, "
+                    "generation.state AS generation_state, "
+                    "task.conversation_id AS task_conversation_id, "
+                    "task.cohort_key AS task_cohort_key, "
+                    "task.store_schema_version, "
+                    "task.control_protocol_version, "
+                    "run.task_id AS run_task_id, "
+                    "run.authority_event_id, "
+                    "run.intent_epoch AS run_intent_epoch, "
+                    "run.control_revision AS run_control_revision, "
+                    "run.runtime_epoch AS run_runtime_epoch, "
+                    "run.bound_input_hash AS run_bound_input_hash, "
+                    "run.open_event_id, "
+                    "snapshot.task_id AS snapshot_task_id, "
+                    "snapshot.accepted_order, "
+                    "authority.task_id AS authority_task_id, "
+                    "acceptance.event_id AS acceptance_event_id, "
+                    "acceptance.task_id AS acceptance_task_id, "
+                    "acceptance.task_conversation_id "
+                    "AS acceptance_task_conversation_id, "
+                    "acceptance.task_cohort_key "
+                    "AS acceptance_task_cohort_key, "
+                    "acceptance.task_store_schema_version "
+                    "AS acceptance_task_store_schema_version, "
+                    "acceptance.task_control_protocol_version "
+                    "AS acceptance_task_control_protocol_version, "
+                    "acceptance.task_intent_epoch "
+                    "AS acceptance_task_intent_epoch, "
+                    "acceptance.task_control_revision "
+                    "AS acceptance_task_control_revision, "
+                    "acceptance.task_status AS acceptance_task_status, "
+                    "acceptance.task_active_authority_event_id "
+                    "AS acceptance_task_active_authority_event_id, "
+                    "acceptance.task_active_execution_run_id "
+                    "AS acceptance_task_active_execution_run_id, "
+                    "acceptance.task_current_runtime_epoch "
+                    "AS acceptance_task_current_runtime_epoch, "
+                    "acceptance.task_last_accepted_order "
+                    "AS acceptance_task_last_accepted_order "
+                    "FROM main.async_delegations AS delegation "
+                    "LEFT JOIN main.task_fence_model_generations AS generation "
+                    "ON generation.generation_id = "
+                    "delegation.causal_parent_generation_id "
+                    "LEFT JOIN main.task_fence_tasks AS task "
+                    "ON task.task_id = generation.task_id "
+                    "LEFT JOIN main.task_fence_execution_runs AS run "
+                    "ON run.run_id = generation.run_id "
+                    "LEFT JOIN main.task_fence_ingress AS snapshot "
+                    "ON snapshot.event_id = generation.snapshot_event_id "
+                    "LEFT JOIN main.task_fence_ingress AS authority "
+                    "ON authority.event_id = run.authority_event_id "
+                    "LEFT JOIN main.task_fence_acceptance_snapshots AS acceptance "
+                    "ON acceptance.event_id = generation.snapshot_event_id "
+                    "WHERE delegation.origin_session = ? "
+                    "AND delegation.state != 'running' "
+                    "AND delegation.delivery_state = 'pending' "
+                    "AND delegation.event_json IS NOT NULL "
+                    "ORDER BY delegation.completed_at, "
+                    "delegation.delegation_id LIMIT ?",
+                    (shadow_session_key,),
+                )
+                for row in async_rows:
+                    delegation_id = row["delegation_id"]
+                    dispatched_at = row["dispatched_at"]
+                    event_json = row["event_json"]
+                    if (
+                        not _task_fence_v2_identifier_compatible(delegation_id)
+                        or type(dispatched_at) not in {int, float}
+                        or not math.isfinite(float(dispatched_at))
+                        or dispatched_at < 0
+                        or not isinstance(event_json, str)
+                    ):
+                        raise TaskFenceRecoveryUnavailable(
+                            "incompatible_recovery_projection"
+                        )
+                    try:
+                        event_bytes = event_json.encode("utf-8")
+                    except UnicodeEncodeError:
+                        raise TaskFenceRecoveryUnavailable(
+                            "incompatible_recovery_projection"
+                        ) from None
+                    invocation_identity = json.dumps(
+                        (delegation_id, float(dispatched_at)),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    invocation_digest = hashlib.sha256(invocation_identity).hexdigest()
+                    operation = OperationDescriptor(
+                        invocation_id=f"tfqr_{invocation_digest}",
+                        kind=OperationKind.DELIVERY,
+                        adapter=_TASK_FENCE_ASYNC_RESTORE_ADAPTER,
+                        invocation_fingerprint=hashlib.sha256(event_bytes).hexdigest(),
+                    )
+
+                    parent_generation_id = row["causal_parent_generation_id"]
+                    parent_runtime_epoch = row["causal_parent_runtime_epoch"]
+                    envelope = None
+                    if (
+                        _task_fence_v2_identifier_compatible(parent_generation_id)
+                        and type(parent_runtime_epoch) is int
+                        and 0 <= parent_runtime_epoch <= expected_runtime_epoch
+                        and row["generation_id"] == parent_generation_id
+                        and row["generation_runtime_epoch"] == parent_runtime_epoch
+                        and row["generation_state"] == "committed"
+                        and row["task_conversation_id"] == shadow_session_key
+                        and row["run_task_id"] == row["task_id"]
+                        and row["run_intent_epoch"] == row["intent_epoch"]
+                        and row["run_control_revision"] == row["control_revision"]
+                        and row["run_runtime_epoch"] == row["generation_runtime_epoch"]
+                        and row["run_bound_input_hash"] == row["input_manifest_hash"]
+                        and row["open_event_id"] == row["authority_event_id"]
+                        and row["snapshot_task_id"] == row["task_id"]
+                        and row["authority_task_id"] == row["task_id"]
+                        and row["acceptance_event_id"] == row["snapshot_event_id"]
+                        and row["acceptance_task_id"] == row["task_id"]
+                        and row["task_conversation_id"]
+                        == row["acceptance_task_conversation_id"]
+                        and row["task_cohort_key"] == row["acceptance_task_cohort_key"]
+                        and row["store_schema_version"]
+                        == row["acceptance_task_store_schema_version"]
+                        and row["control_protocol_version"]
+                        == row["acceptance_task_control_protocol_version"]
+                        and row["intent_epoch"] == row["acceptance_task_intent_epoch"]
+                        and row["control_revision"]
+                        == row["acceptance_task_control_revision"]
+                        and row["acceptance_task_status"] == "running"
+                        and row["authority_event_id"]
+                        == row["acceptance_task_active_authority_event_id"]
+                        and row["run_id"]
+                        == row["acceptance_task_active_execution_run_id"]
+                        and row["generation_runtime_epoch"]
+                        == row["acceptance_task_current_runtime_epoch"]
+                        and row["accepted_order"]
+                        == row["acceptance_task_last_accepted_order"]
+                    ):
+                        try:
+                            envelope = CausalEnvelope(
+                                task_id=row["task_id"],
+                                authority_event_id=row["authority_event_id"],
+                                run_id=row["run_id"],
+                                generation_id=row["generation_id"],
+                                snapshot_event_id=row["snapshot_event_id"],
+                                input_manifest_hash=row["input_manifest_hash"],
+                                store_schema_version=row["store_schema_version"],
+                                control_protocol_version=row[
+                                    "control_protocol_version"
+                                ],
+                                intent_epoch=row["intent_epoch"],
+                                control_revision=row["control_revision"],
+                                runtime_epoch=row["generation_runtime_epoch"],
+                                accepted_order=row["accepted_order"],
+                            )
+                        except TaskFenceProtocolRejected:
+                            envelope = None
+                    reason = (
+                        DecisionReason.STALE_AUTHORITY
+                        if envelope is not None
+                        else DecisionReason.MISSING_PROVENANCE
+                    )
+                    async_restore_observations.append((
+                        envelope,
+                        operation,
+                        DispatchDecision(
+                            DecisionOutcome.WOULD_BLOCK,
+                            reason,
+                        ),
+                    ))
+
             now = time.time()
             next_runtime_epoch = expected_runtime_epoch + 1
+            for envelope, operation, decision in async_restore_observations:
+                self._record_task_fence_policy_decision_unlocked(
+                    conn,
+                    decision_point="admission",
+                    envelope=envelope,
+                    operation=operation,
+                    decision=decision,
+                    decided_at=now,
+                )
             for task, run, generation_id, input_ids, committed in running_plans:
                 if not committed:
                     conn.executemany(

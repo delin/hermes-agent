@@ -20,9 +20,11 @@ from task_fence import (
     DecisionReason,
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
+    TaskFenceArtifactIdentity,
     TaskFencePolicy,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
+    TaskFenceRecoveryUnavailable,
     bind_causal_envelope,
     bind_task_fence_policy,
     current_causal_envelope,
@@ -31,8 +33,66 @@ from task_fence import (
 from tools.registry import _task_fence_tool_fingerprint
 
 
+_SHADOW_SESSION_KEY = "slack:workspace:channel:user"
+
+
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _artifact_identity() -> TaskFenceArtifactIdentity:
+    return TaskFenceArtifactIdentity(
+        tested_artifact_commit="d" * 40,
+        tested_artifact_checksum="sha256:" + "e" * 64,
+        dependency_lock_fingerprint="sha256:" + "f" * 64,
+    )
+
+
+def _async_rows(db: SessionDB) -> tuple[tuple, ...]:
+    return tuple(
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT * FROM async_delegations ORDER BY delegation_id"
+        )
+    )
+
+
+def _task_fence_rows(db: SessionDB) -> tuple:
+    tables = tuple(
+        row[0]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name GLOB 'task_fence_*' ORDER BY name"
+        )
+    )
+    rows = tuple(
+        (
+            table,
+            tuple(
+                tuple(row)
+                for row in db._conn.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ),
+        )
+        for table in tables
+    )
+    sequence = tuple(
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT name, seq FROM sqlite_sequence "
+            "WHERE name GLOB 'task_fence_*' ORDER BY name"
+        )
+    )
+    return rows, sequence
+
+
+def _async_restore_invocation(delegation_id: str, dispatched_at: float) -> str:
+    identity = json.dumps(
+        (delegation_id, float(dispatched_at)),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "tfqr_" + _hash(identity)
 
 
 def _ingress(
@@ -40,21 +100,26 @@ def _ingress(
     source_event_id: str,
     *,
     task_id: str | None = None,
+    conversation_id: str = "delegation-conversation",
 ) -> IngressEnvelope:
     return IngressEnvelope(
         source="gateway:test:delegation",
         source_event_id=source_event_id,
-        conversation_id="delegation-conversation",
+        conversation_id=conversation_id,
         action=TASK_FENCE_ACTIONS[action],
         payload_hash=_hash(source_event_id),
         task_id=task_id,
     )
 
 
-def _live_lane(path):
+def _live_lane(path, *, conversation_id: str = "delegation-conversation"):
     db = SessionDB(path)
     acceptance = db.accept_task_fence_ingress(
-        _ingress("initial_submit", "delegation-initial")
+        _ingress(
+            "initial_submit",
+            "delegation-initial",
+            conversation_id=conversation_id,
+        )
     )
     generation = db.reserve_task_fence_generation(acceptance)
     assert db.finish_task_fence_generation(generation, state="committed")
@@ -143,6 +208,7 @@ def _dispatch_completed_batch(
     delegation_id: str,
     parent_generation_id=None,
     parent_runtime_epoch=None,
+    session_key: str = "legacy-session-key",
 ):
     dispatch = async_delegation.dispatch_async_delegation_batch(
         goals=["completion evidence"],
@@ -150,7 +216,7 @@ def _dispatch_completed_batch(
         toolsets=None,
         role="leaf",
         model="test/model",
-        session_key="legacy-session-key",
+        session_key=session_key,
         runner=lambda: {
             "results": [{"status": "completed", "summary": "done"}],
             "total_duration_seconds": 0.0,
@@ -1833,6 +1899,501 @@ def test_restored_completion_uses_exact_durable_evidence(
         assert _task_fence_execution_counts(db) == execution_counts
     finally:
         db.close()
+
+
+def test_startup_recovery_observes_stale_async_completions_without_changing_delivery(
+    tmp_path,
+    monkeypatch,
+    _clean_async_registry,
+):
+    from tools import async_delegation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "state.db"
+    db, acceptance, generation = _live_lane(
+        path,
+        conversation_id=_SHADOW_SESSION_KEY,
+    )
+    foreign_acceptance = db.accept_task_fence_ingress(
+        _ingress(
+            "initial_submit",
+            "foreign-delegation-initial",
+            conversation_id="foreign-conversation",
+        )
+    )
+    foreign_generation = db.reserve_task_fence_generation(foreign_acceptance)
+    assert db.finish_task_fence_generation(
+        foreign_generation,
+        state="committed",
+    )
+    cases = (
+        (
+            "f00d0001",
+            _SHADOW_SESSION_KEY,
+            generation.generation_id,
+            generation.runtime_epoch,
+            DecisionReason.STALE_AUTHORITY.value,
+        ),
+        (
+            "f00d0002",
+            _SHADOW_SESSION_KEY,
+            None,
+            None,
+            DecisionReason.MISSING_PROVENANCE.value,
+        ),
+        (
+            "f00d0003",
+            _SHADOW_SESSION_KEY,
+            generation.generation_id,
+            None,
+            DecisionReason.MISSING_PROVENANCE.value,
+        ),
+        (
+            "f00d0004",
+            _SHADOW_SESSION_KEY,
+            "unknown-parent-generation",
+            generation.runtime_epoch,
+            DecisionReason.MISSING_PROVENANCE.value,
+        ),
+        (
+            "f00d0005",
+            _SHADOW_SESSION_KEY,
+            foreign_generation.generation_id,
+            foreign_generation.runtime_epoch,
+            DecisionReason.MISSING_PROVENANCE.value,
+        ),
+        (
+            "f00d0006",
+            "foreign-session",
+            generation.generation_id,
+            generation.runtime_epoch,
+            None,
+        ),
+    )
+    secret = "raw-queued-result-must-not-enter-task-fence-journal"
+    excluded_running_id = "f00d0007"
+    try:
+        for (
+            delegation_id,
+            session_key,
+            parent_generation_id,
+            parent_runtime_epoch,
+            _reason,
+        ) in cases:
+            _dispatch_completed_batch(
+                async_delegation,
+                delegation_id=delegation_id,
+                session_key=session_key,
+                parent_generation_id=parent_generation_id,
+                parent_runtime_epoch=parent_runtime_epoch,
+            )
+        db._conn.execute(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, state, dispatched_at, updated_at, "
+            "delivery_state, task_json"
+            ") VALUES (?, ?, 'running', 7.0, 7.0, 'pending', '{}')",
+            (excluded_running_id, _SHADOW_SESSION_KEY),
+        )
+        secret_event = json.loads(
+            db._conn.execute(
+                "SELECT event_json FROM async_delegations "
+                "WHERE delegation_id = 'f00d0002'"
+            ).fetchone()[0]
+        )
+        secret_event["summary"] = secret
+        db._conn.execute(
+            "UPDATE async_delegations SET event_json = ?, result_json = ? "
+            "WHERE delegation_id = 'f00d0002'",
+            (
+                json.dumps(secret_event),
+                json.dumps({"status": "completed", "summary": secret}),
+            ),
+        )
+        db._conn.commit()
+        before_async = _async_rows(db)
+    finally:
+        db.close()
+
+    reopened = SessionDB(path)
+    try:
+        recovery = reopened.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SHADOW_SESSION_KEY,
+        )
+        assert (recovery.previous_runtime_epoch, recovery.runtime_epoch) == (0, 1)
+        assert _async_rows(reopened) == before_async
+
+        durable_identity = {
+            row["delegation_id"]: row["dispatched_at"]
+            for row in reopened._conn.execute(
+                "SELECT delegation_id, dispatched_at FROM async_delegations"
+            )
+        }
+        decisions = {
+            row["operation_invocation_id"]: row
+            for row in reopened._conn.execute(
+                "SELECT operation_invocation_id, outcome, reason_code, "
+                "decision_point, operation_kind, adapter, "
+                "invocation_fingerprint, candidate_task_id, "
+                "candidate_generation_id, candidate_runtime_epoch, "
+                "permit_id, attempt_id FROM task_fence_policy_decisions "
+                "WHERE adapter = 'runtime:async_delegation_restore_ready'"
+            )
+        }
+        assert len(decisions) == 5
+        assert (
+            _async_restore_invocation(
+                excluded_running_id,
+                durable_identity[excluded_running_id],
+            )
+            not in decisions
+        )
+        for (
+            delegation_id,
+            session_key,
+            _parent_generation_id,
+            _parent_runtime_epoch,
+            reason,
+        ) in cases:
+            invocation_id = _async_restore_invocation(
+                delegation_id,
+                durable_identity[delegation_id],
+            )
+            if session_key != _SHADOW_SESSION_KEY:
+                assert invocation_id not in decisions
+                continue
+            decision = decisions[invocation_id]
+            assert (
+                decision["outcome"],
+                decision["reason_code"],
+                decision["decision_point"],
+                decision["operation_kind"],
+                decision["adapter"],
+                decision["permit_id"],
+                decision["attempt_id"],
+            ) == (
+                DecisionOutcome.WOULD_BLOCK.value,
+                reason,
+                "admission",
+                "delivery",
+                "runtime:async_delegation_restore_ready",
+                None,
+                None,
+            )
+            event_json = reopened._conn.execute(
+                "SELECT event_json FROM async_delegations WHERE delegation_id = ?",
+                (delegation_id,),
+            ).fetchone()[0]
+            assert (
+                decision["invocation_fingerprint"]
+                == hashlib.sha256(event_json.encode("utf-8")).hexdigest()
+            )
+            if reason == DecisionReason.STALE_AUTHORITY.value:
+                assert (
+                    decision["candidate_task_id"],
+                    decision["candidate_generation_id"],
+                    decision["candidate_runtime_epoch"],
+                ) == (
+                    acceptance.task_id,
+                    generation.generation_id,
+                    generation.runtime_epoch,
+                )
+            else:
+                assert (
+                    decision["candidate_task_id"],
+                    decision["candidate_generation_id"],
+                    decision["candidate_runtime_epoch"],
+                ) == (None, None, None)
+
+        journal_dump = repr(tuple(tuple(row) for row in decisions.values()))
+        assert secret not in journal_dump
+        assert _SHADOW_SESSION_KEY not in journal_dump
+        assert all(delegation_id not in journal_dump for delegation_id, *_ in cases)
+
+        first_decision_ids = tuple(
+            row[0]
+            for row in reopened._conn.execute(
+                "SELECT decision_id FROM task_fence_policy_decisions "
+                "WHERE adapter = 'runtime:async_delegation_restore_ready' "
+                "ORDER BY decision_id"
+            )
+        )
+        replay = reopened.recover_task_fence_state(
+            expected_runtime_epoch=1,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SHADOW_SESSION_KEY,
+        )
+        assert (replay.previous_runtime_epoch, replay.runtime_epoch) == (1, 2)
+        assert _async_rows(reopened) == before_async
+        assert (
+            tuple(
+                row[0]
+                for row in reopened._conn.execute(
+                    "SELECT decision_id FROM task_fence_policy_decisions "
+                    "WHERE adapter = 'runtime:async_delegation_restore_ready' "
+                    "ORDER BY decision_id"
+                )
+            )
+            == first_decision_ids
+        )
+
+        changed_event = json.loads(
+            reopened._conn.execute(
+                "SELECT event_json FROM async_delegations "
+                "WHERE delegation_id = 'f00d0002'"
+            ).fetchone()[0]
+        )
+        changed_event["summary"] = "changed-exact-queued-payload"
+        reopened._conn.execute(
+            "UPDATE async_delegations SET event_json = ? "
+            "WHERE delegation_id = 'f00d0002'",
+            (json.dumps(changed_event),),
+        )
+        reopened._conn.commit()
+        changed_async = _async_rows(reopened)
+        changed = reopened.recover_task_fence_state(
+            expected_runtime_epoch=2,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SHADOW_SESSION_KEY,
+        )
+        assert (changed.previous_runtime_epoch, changed.runtime_epoch) == (2, 3)
+        assert _async_rows(reopened) == changed_async
+        changed_identity = _async_restore_invocation(
+            "f00d0002",
+            durable_identity["f00d0002"],
+        )
+        changed_decisions = reopened._conn.execute(
+            "SELECT decision_id, invocation_fingerprint "
+            "FROM task_fence_policy_decisions "
+            "WHERE operation_invocation_id = ? ORDER BY decision_id",
+            (changed_identity,),
+        ).fetchall()
+        assert len(changed_decisions) == 2
+        assert len({row["decision_id"] for row in changed_decisions}) == 2
+        assert len({row["invocation_fingerprint"] for row in changed_decisions}) == 2
+    finally:
+        reopened.close()
+
+    restored_queue = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restored_queue) == 7
+    restored = [restored_queue.get_nowait() for _ in range(7)]
+    assert {event["delegation_id"] for event in restored} == {
+        *(case[0] for case in cases),
+        excluded_running_id,
+    }
+    for event in restored:
+        claim_id = async_delegation.claim_event_delivery(
+            event,
+            "shadow-recovery-legacy",
+        )
+        assert claim_id is not None
+        assert async_delegation.complete_completion_delivery(
+            event["delegation_id"],
+            claim_id,
+        )
+    assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("generation-state", "manifest", "acceptance-snapshot"),
+)
+def test_async_restore_corrupt_historical_parent_is_missing_provenance(
+    tmp_path,
+    monkeypatch,
+    _clean_async_registry,
+    corruption,
+):
+    from tools import async_delegation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db, acceptance, generation = _live_lane(
+        tmp_path / "state.db",
+        conversation_id=_SHADOW_SESSION_KEY,
+    )
+    delegation_id = {
+        "generation-state": "cafe0001",
+        "manifest": "cafe0002",
+        "acceptance-snapshot": "cafe0003",
+    }[corruption]
+    _dispatch_completed_batch(
+        async_delegation,
+        delegation_id=delegation_id,
+        session_key=_SHADOW_SESSION_KEY,
+        parent_generation_id=generation.generation_id,
+        parent_runtime_epoch=generation.runtime_epoch,
+    )
+    held = db.accept_task_fence_ingress(
+        _ingress(
+            "comment_hold",
+            f"hold-{corruption}",
+            task_id=acceptance.task_id,
+            conversation_id=_SHADOW_SESSION_KEY,
+        )
+    )
+    assert held.task_projection is not None
+    assert held.task_projection.status == "paused"
+
+    if corruption == "generation-state":
+        db._conn.execute(
+            "UPDATE task_fence_model_generations SET state = 'failed' "
+            "WHERE generation_id = ?",
+            (generation.generation_id,),
+        )
+    elif corruption == "manifest":
+        db._conn.execute(
+            "UPDATE task_fence_model_generations "
+            "SET input_manifest_hash = ? WHERE generation_id = ?",
+            ("0" * 64, generation.generation_id),
+        )
+    else:
+        trigger_sql = db._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' "
+            "AND name = 'task_fence_acceptance_snapshots_no_delete'"
+        ).fetchone()[0]
+        db._conn.execute("DROP TRIGGER task_fence_acceptance_snapshots_no_delete")
+        db._conn.execute(
+            "DELETE FROM task_fence_acceptance_snapshots WHERE event_id = ?",
+            (generation.snapshot_event_id,),
+        )
+        db._conn.execute(trigger_sql)
+    db._conn.commit()
+    before_async = _async_rows(db)
+
+    recovery = db.recover_task_fence_state(
+        expected_runtime_epoch=0,
+        expected_mode_generation=0,
+        tested_artifact_identity=_artifact_identity(),
+        shadow_session_key=_SHADOW_SESSION_KEY,
+    )
+
+    assert recovery.runtime_epoch == 1
+    decision = db._conn.execute(
+        "SELECT outcome, reason_code, candidate_task_id, "
+        "candidate_generation_id, candidate_runtime_epoch "
+        "FROM task_fence_policy_decisions "
+        "WHERE adapter = 'runtime:async_delegation_restore_ready'"
+    ).fetchone()
+    assert tuple(decision) == (
+        DecisionOutcome.WOULD_BLOCK.value,
+        DecisionReason.MISSING_PROVENANCE.value,
+        None,
+        None,
+        None,
+    )
+    assert _async_rows(db) == before_async
+    db.close()
+
+
+@pytest.mark.parametrize("fault_target", ("decision", "control"))
+def test_async_restore_observation_rolls_back_with_startup_recovery(
+    tmp_path,
+    monkeypatch,
+    _clean_async_registry,
+    fault_target,
+):
+    from tools import async_delegation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "state.db"
+    db, _acceptance, generation = _live_lane(
+        path,
+        conversation_id=_SHADOW_SESSION_KEY,
+    )
+    _dispatch_completed_batch(
+        async_delegation,
+        delegation_id=f"fade000{int(fault_target == 'control')}",
+        session_key=_SHADOW_SESSION_KEY,
+        parent_generation_id=generation.generation_id,
+        parent_runtime_epoch=generation.runtime_epoch,
+    )
+    trigger = {
+        "decision": (
+            "BEFORE INSERT ON main.task_fence_policy_decisions",
+            "private async observation fault",
+        ),
+        "control": (
+            "BEFORE UPDATE OF runtime_epoch ON main.task_fence_control "
+            "WHEN NEW.runtime_epoch != OLD.runtime_epoch",
+            "private recovery control fault",
+        ),
+    }[fault_target]
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_async_restore_recovery "
+        f"{trigger[0]} BEGIN SELECT RAISE(ABORT, '{trigger[1]}'); END"
+    )
+    before_task_fence = _task_fence_rows(db)
+    before_async = _async_rows(db)
+
+    with pytest.raises(
+        TaskFenceRecoveryUnavailable,
+        match="recovery_database_error",
+    ) as exc:
+        db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SHADOW_SESSION_KEY,
+        )
+
+    assert exc.value.reason == "recovery_database_error"
+    assert exc.value.__cause__ is None
+    assert "private" not in str(exc.value)
+    assert _task_fence_rows(db) == before_task_fence
+    assert _async_rows(db) == before_async
+    db.close()
+
+    reopened = SessionDB(path)
+    try:
+        assert _task_fence_rows(reopened) == before_task_fence
+        assert _async_rows(reopened) == before_async
+    finally:
+        reopened.close()
+
+
+def test_async_restore_observation_shares_recovery_authority_bound(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import hermes_state
+
+    db = SessionDB(tmp_path / "state.db")
+    event = json.dumps({
+        "type": "async_delegation",
+        "delegation_id": "face0001",
+        "status": "completed",
+    })
+    db._conn.execute(
+        "INSERT INTO async_delegations ("
+        "delegation_id, origin_session, state, dispatched_at, completed_at, "
+        "updated_at, event_json, result_json, delivery_state"
+        ") VALUES (?, ?, 'completed', 1.0, 2.0, 2.0, ?, ?, 'pending')",
+        ("face0001", _SHADOW_SESSION_KEY, event, event),
+    )
+    db._conn.commit()
+    before_task_fence = _task_fence_rows(db)
+    before_async = _async_rows(db)
+    monkeypatch.setattr(hermes_state, "_TASK_FENCE_MAX_RECOVERY_AUTHORITIES", 0)
+
+    with pytest.raises(
+        TaskFenceRecoveryUnavailable,
+        match="recovery_authority_limit_exceeded",
+    ):
+        db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SHADOW_SESSION_KEY,
+        )
+
+    assert _task_fence_rows(db) == before_task_fence
+    assert _async_rows(db) == before_async
+    db.close()
 
 
 @pytest.mark.parametrize(

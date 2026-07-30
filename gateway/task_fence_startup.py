@@ -148,6 +148,7 @@ def prepare_task_fence_shadow_startup(config: Any) -> TaskFenceRecovery | None:
             expected_runtime_epoch=store.runtime_epoch,
             expected_mode_generation=store.mode_generation,
             tested_artifact_identity=identity,
+            shadow_session_key=config.task_fence_shadow_session_key,
         )
     except TaskFenceStartupUnavailable:
         raise
