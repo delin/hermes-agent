@@ -57,6 +57,15 @@ def _async_rows(db: SessionDB) -> tuple[tuple, ...]:
     )
 
 
+def _delivery_rows(db: SessionDB) -> tuple[tuple, ...]:
+    return tuple(
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT * FROM delivery_obligations ORDER BY obligation_id"
+        )
+    )
+
+
 def _task_fence_rows(db: SessionDB) -> tuple:
     tables = tuple(
         row[0]
@@ -93,6 +102,16 @@ def _async_restore_invocation(delegation_id: str, dispatched_at: float) -> str:
         allow_nan=False,
     )
     return "tfqr_" + _hash(identity)
+
+
+def _delivery_recovery_invocation(obligation_id: str, created_at: float) -> str:
+    identity = json.dumps(
+        (obligation_id, float(created_at)),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "tfqo_" + _hash(identity)
 
 
 def _ingress(
@@ -2436,6 +2455,300 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
     assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
 
 
+def test_startup_recovery_observes_delivery_candidates_without_mutating_ledger(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from gateway import delivery_ledger
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(delivery_ledger, "_db_path", lambda: path)
+    db = SessionDB(path)
+    cases = {
+        "pending": (_SHADOW_SESSION_KEY, "private-pending-content"),
+        "attempting": (_SHADOW_SESSION_KEY, "private-attempting-content"),
+        "failed": (_SHADOW_SESSION_KEY, "private-failed-content"),
+        "delivered": (_SHADOW_SESSION_KEY, "private-delivered-content"),
+        "abandoned": (_SHADOW_SESSION_KEY, "private-abandoned-content"),
+        "foreign": ("foreign-session", "private-foreign-content"),
+    }
+    obligation_ids = {}
+    for name, (session_key, content) in cases.items():
+        obligation_id = delivery_ledger.compute_obligation_id(
+            session_key,
+            f"message-{name}",
+            content,
+        )
+        obligation_ids[name] = obligation_id
+        delivery_ledger.record_obligation(
+            obligation_id=obligation_id,
+            session_key=session_key,
+            platform="unknown-platform" if name == "pending" else "slack",
+            chat_id=f"private-chat-{name}",
+            thread_id=f"private-thread-{name}",
+            content=content,
+        )
+    delivery_ledger.mark_attempting(obligation_ids["attempting"])
+    delivery_ledger.mark_failed(
+        obligation_ids["failed"],
+        "private-last-error",
+    )
+    delivery_ledger.mark_delivered(obligation_ids["delivered"])
+    db._conn.execute(
+        "UPDATE delivery_obligations SET state = 'abandoned' "
+        "WHERE obligation_id = ?",
+        (obligation_ids["abandoned"],),
+    )
+    db._conn.execute(
+        "UPDATE delivery_obligations SET attempts = ?, created_at = ? "
+        "WHERE obligation_id = ?",
+        (
+            delivery_ledger.MAX_ATTEMPTS,
+            time.time() - delivery_ledger.STALE_AFTER_SECONDS - 60,
+            obligation_ids["pending"],
+        ),
+    )
+    db._conn.commit()
+    before_delivery = _delivery_rows(db)
+
+    monkeypatch.setattr(
+        delivery_ledger,
+        "_owner_alive",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("startup barrier probed ledger ownership")
+        ),
+    )
+    recovery = db.recover_task_fence_state(
+        expected_runtime_epoch=0,
+        expected_mode_generation=0,
+        tested_artifact_identity=_artifact_identity(),
+        shadow_session_key=_SHADOW_SESSION_KEY,
+    )
+
+    assert recovery.runtime_epoch == 1
+    assert _delivery_rows(db) == before_delivery
+    source_rows = {
+        row["obligation_id"]: row
+        for row in db._conn.execute(
+            "SELECT obligation_id, session_key, platform, chat_id, thread_id, "
+            "content, state, attempts, created_at, owner_pid, owner_started_at "
+            "FROM delivery_obligations"
+        )
+    }
+    decisions = {
+        row["operation_invocation_id"]: row
+        for row in db._conn.execute(
+            "SELECT operation_invocation_id, outcome, reason_code, "
+            "decision_point, operation_kind, adapter, invocation_fingerprint, "
+            "candidate_task_id, candidate_generation_id, "
+            "candidate_runtime_epoch, permit_id, attempt_id "
+            "FROM task_fence_policy_decisions "
+            "WHERE adapter = 'runtime:delivery_obligation_recovery_pending'"
+        )
+    }
+    assert len(decisions) == 3
+    for name in ("pending", "attempting", "failed"):
+        source = source_rows[obligation_ids[name]]
+        decision = decisions[
+            _delivery_recovery_invocation(
+                source["obligation_id"],
+                source["created_at"],
+            )
+        ]
+        assert tuple(decision)[1:6] == (
+            DecisionOutcome.WOULD_BLOCK.value,
+            DecisionReason.MISSING_PROVENANCE.value,
+            "admission",
+            "delivery",
+            "runtime:delivery_obligation_recovery_pending",
+        )
+        observation = json.dumps(
+            (
+                source["session_key"],
+                source["platform"],
+                source["chat_id"],
+                source["thread_id"],
+                source["content"],
+                source["state"],
+                source["attempts"],
+                source["owner_pid"],
+                source["owner_started_at"],
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        assert decision["invocation_fingerprint"] == hashlib.sha256(
+            observation
+        ).hexdigest()
+        assert tuple(decision)[7:] == (None, None, None, None, None)
+    for name in ("delivered", "abandoned", "foreign"):
+        source = source_rows[obligation_ids[name]]
+        assert _delivery_recovery_invocation(
+            source["obligation_id"],
+            source["created_at"],
+        ) not in decisions
+
+    journal_dump = repr(tuple(tuple(row) for row in decisions.values()))
+    assert _SHADOW_SESSION_KEY not in journal_dump
+    assert "private-last-error" not in journal_dump
+    assert all(content not in journal_dump for _, content in cases.values())
+    assert all(value not in journal_dump for value in obligation_ids.values())
+
+    decision_ids = tuple(
+        row[0]
+        for row in db._conn.execute(
+            "SELECT decision_id FROM task_fence_policy_decisions "
+            "WHERE adapter = 'runtime:delivery_obligation_recovery_pending' "
+            "ORDER BY decision_id"
+        )
+    )
+    replay = db.recover_task_fence_state(
+        expected_runtime_epoch=1,
+        expected_mode_generation=0,
+        tested_artifact_identity=_artifact_identity(),
+        shadow_session_key=_SHADOW_SESSION_KEY,
+    )
+    assert replay.runtime_epoch == 2
+    assert _delivery_rows(db) == before_delivery
+    assert tuple(
+        row[0]
+        for row in db._conn.execute(
+            "SELECT decision_id FROM task_fence_policy_decisions "
+            "WHERE adapter = 'runtime:delivery_obligation_recovery_pending' "
+            "ORDER BY decision_id"
+        )
+    ) == decision_ids
+
+    pending = source_rows[obligation_ids["pending"]]
+    pending_invocation = _delivery_recovery_invocation(
+        pending["obligation_id"],
+        pending["created_at"],
+    )
+    db._conn.execute(
+        "UPDATE delivery_obligations SET content = ? WHERE obligation_id = ?",
+        ("changed-private-content", obligation_ids["pending"]),
+    )
+    db._conn.commit()
+    changed_delivery = _delivery_rows(db)
+    assert db.recover_task_fence_state(
+        expected_runtime_epoch=2,
+        expected_mode_generation=0,
+        tested_artifact_identity=_artifact_identity(),
+        shadow_session_key=_SHADOW_SESSION_KEY,
+    ).runtime_epoch == 3
+    assert _delivery_rows(db) == changed_delivery
+    changed_decisions = db._conn.execute(
+        "SELECT decision_id, invocation_fingerprint "
+        "FROM task_fence_policy_decisions WHERE operation_invocation_id = ?",
+        (pending_invocation,),
+    ).fetchall()
+    assert len(changed_decisions) == 2
+    assert len({row["decision_id"] for row in changed_decisions}) == 2
+    assert len({row["invocation_fingerprint"] for row in changed_decisions}) == 2
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        None,
+        "case-variant",
+        "wrong-object",
+        "missing-column",
+        "value",
+        "collation",
+    ),
+)
+def test_delivery_observation_handles_optional_or_incompatible_ledger(
+    tmp_path,
+    corruption,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    if corruption == "wrong-object":
+        db._conn.execute(
+            "CREATE VIEW delivery_obligations AS SELECT 1 AS obligation_id"
+        )
+    elif corruption == "missing-column":
+        db._conn.execute(
+            "CREATE TABLE delivery_obligations (obligation_id TEXT PRIMARY KEY)"
+        )
+    elif corruption == "value":
+        from gateway.delivery_ledger import _initialize_schema
+
+        _initialize_schema(db._conn)
+        db._conn.execute(
+            "INSERT INTO delivery_obligations ("
+            "obligation_id, session_key, platform, chat_id, content, state, "
+            "attempts, created_at, updated_at, owner_pid"
+            ") VALUES ('cafe00000000000000000003', ?, 'slack', 'chat', "
+            "'content', 'pending', 0, 1.0, 1.0, ?)",
+            (_SHADOW_SESSION_KEY, b"invalid-owner"),
+        )
+    elif corruption == "collation":
+        db._conn.execute(
+            "CREATE TABLE delivery_obligations ("
+            "obligation_id TEXT PRIMARY KEY, session_key TEXT COLLATE NOCASE, "
+            "platform TEXT, chat_id TEXT, thread_id TEXT, content TEXT, "
+            "state TEXT, attempts INTEGER, created_at REAL, owner_pid INTEGER, "
+            "owner_started_at INTEGER)"
+        )
+        db._conn.execute(
+            "INSERT INTO delivery_obligations VALUES ("
+            "'cafe00000000000000000004', ?, 'slack', 'chat', NULL, 'content', "
+            "'pending', 0, 1.0, NULL, NULL)",
+            (_SHADOW_SESSION_KEY.upper(),),
+        )
+    elif corruption == "case-variant":
+        db._conn.execute(
+            "CREATE TABLE DELIVERY_OBLIGATIONS ("
+            "obligation_id TEXT PRIMARY KEY, session_key TEXT, platform TEXT, "
+            "chat_id TEXT, thread_id TEXT, content TEXT, state TEXT, "
+            "attempts INTEGER, created_at REAL, owner_pid INTEGER, "
+            "owner_started_at INTEGER)"
+        )
+        db._conn.execute(
+            "INSERT INTO DELIVERY_OBLIGATIONS VALUES ("
+            "'cafe00000000000000000005', ?, 'slack', 'chat', NULL, 'content', "
+            "'pending', 0, 1.0, NULL, NULL)",
+            (_SHADOW_SESSION_KEY,),
+        )
+    db._conn.commit()
+    before_task_fence = _task_fence_rows(db)
+
+    if corruption in {None, "case-variant"}:
+        assert db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SHADOW_SESSION_KEY,
+        ).runtime_epoch == 1
+        if corruption is None:
+            assert db._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'delivery_obligations'"
+            ).fetchone() is None
+        else:
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_policy_decisions "
+                "WHERE adapter = 'runtime:delivery_obligation_recovery_pending'"
+            ).fetchone()[0] == 1
+    else:
+        with pytest.raises(
+            TaskFenceRecoveryUnavailable,
+            match="incompatible_recovery_projection",
+        ) as exc:
+            db.recover_task_fence_state(
+                expected_runtime_epoch=0,
+                expected_mode_generation=0,
+                tested_artifact_identity=_artifact_identity(),
+                shadow_session_key=_SHADOW_SESSION_KEY,
+            )
+        assert exc.value.reason == "incompatible_recovery_projection"
+        assert exc.value.__cause__ is None
+        assert _task_fence_rows(db) == before_task_fence
+    db.close()
+
+
 def test_materialized_finalizing_event_keeps_restore_ready_observation(
     tmp_path,
 ) -> None:
@@ -2567,18 +2880,20 @@ def test_async_restore_corrupt_historical_parent_is_missing_provenance(
 
 
 @pytest.mark.parametrize("fault_target", ("decision", "control"))
-@pytest.mark.parametrize("candidate_state", ("completed", "running"))
-def test_async_restore_observation_rolls_back_with_startup_recovery(
+@pytest.mark.parametrize("candidate_state", ("completed", "running", "delivery"))
+def test_queued_recovery_observation_rolls_back_with_startup_recovery(
     tmp_path,
     monkeypatch,
     _clean_async_registry,
     fault_target,
     candidate_state,
 ):
+    from gateway import delivery_ledger
     from tools import async_delegation
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = tmp_path / "state.db"
+    monkeypatch.setattr(delivery_ledger, "_db_path", lambda: path)
     db, _acceptance, generation = _live_lane(
         path,
         conversation_id=_SHADOW_SESSION_KEY,
@@ -2586,7 +2901,16 @@ def test_async_restore_observation_rolls_back_with_startup_recovery(
     delegation_id = (
         f"fade{int(candidate_state == 'running')}00{int(fault_target == 'control')}"
     )
-    if candidate_state == "completed":
+    if candidate_state == "delivery":
+        delivery_ledger.record_obligation(
+            obligation_id="fade00000000000000000001",
+            session_key=_SHADOW_SESSION_KEY,
+            platform="slack",
+            chat_id="private-chat",
+            thread_id=None,
+            content="private-content",
+        )
+    elif candidate_state == "completed":
         _dispatch_completed_batch(
             async_delegation,
             delegation_id=delegation_id,
@@ -2612,7 +2936,7 @@ def test_async_restore_observation_rolls_back_with_startup_recovery(
     trigger = {
         "decision": (
             "BEFORE INSERT ON main.task_fence_policy_decisions",
-            "private async observation fault",
+            "private queued observation fault",
         ),
         "control": (
             "BEFORE UPDATE OF runtime_epoch ON main.task_fence_control "
@@ -2621,11 +2945,14 @@ def test_async_restore_observation_rolls_back_with_startup_recovery(
         ),
     }[fault_target]
     db._conn.execute(
-        "CREATE TEMP TRIGGER fail_async_restore_recovery "
+        "CREATE TEMP TRIGGER fail_queued_recovery_observation "
         f"{trigger[0]} BEGIN SELECT RAISE(ABORT, '{trigger[1]}'); END"
     )
     before_task_fence = _task_fence_rows(db)
     before_async = _async_rows(db)
+    before_delivery = (
+        _delivery_rows(db) if candidate_state == "delivery" else None
+    )
 
     with pytest.raises(
         TaskFenceRecoveryUnavailable,
@@ -2643,31 +2970,47 @@ def test_async_restore_observation_rolls_back_with_startup_recovery(
     assert "private" not in str(exc.value)
     assert _task_fence_rows(db) == before_task_fence
     assert _async_rows(db) == before_async
+    if before_delivery is not None:
+        assert _delivery_rows(db) == before_delivery
     db.close()
 
     reopened = SessionDB(path)
     try:
         assert _task_fence_rows(reopened) == before_task_fence
         assert _async_rows(reopened) == before_async
+        if before_delivery is not None:
+            assert _delivery_rows(reopened) == before_delivery
     finally:
         reopened.close()
 
 
-@pytest.mark.parametrize("candidate_state", ("completed", "running"))
-def test_async_restore_observation_shares_recovery_authority_bound(
+@pytest.mark.parametrize("candidate_state", ("completed", "running", "delivery"))
+def test_queued_recovery_observation_shares_recovery_authority_bound(
     tmp_path,
     monkeypatch,
     candidate_state,
 ) -> None:
     import hermes_state
+    from gateway import delivery_ledger
 
-    db = SessionDB(tmp_path / "state.db")
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(delivery_ledger, "_db_path", lambda: path)
+    db = SessionDB(path)
     event = json.dumps({
         "type": "async_delegation",
         "delegation_id": "face0001",
         "status": "completed",
     })
-    if candidate_state == "completed":
+    if candidate_state == "delivery":
+        delivery_ledger.record_obligation(
+            obligation_id="face00000000000000000001",
+            session_key=_SHADOW_SESSION_KEY,
+            platform="slack",
+            chat_id="private-chat",
+            thread_id=None,
+            content="private-content",
+        )
+    elif candidate_state == "completed":
         db._conn.execute(
             "INSERT INTO async_delegations ("
             "delegation_id, origin_session, state, dispatched_at, completed_at, "
@@ -2686,6 +3029,9 @@ def test_async_restore_observation_shares_recovery_authority_bound(
     db._conn.commit()
     before_task_fence = _task_fence_rows(db)
     before_async = _async_rows(db)
+    before_delivery = (
+        _delivery_rows(db) if candidate_state == "delivery" else None
+    )
     monkeypatch.setattr(hermes_state, "_TASK_FENCE_MAX_RECOVERY_AUTHORITIES", 0)
 
     with pytest.raises(
@@ -2701,6 +3047,8 @@ def test_async_restore_observation_shares_recovery_authority_bound(
 
     assert _task_fence_rows(db) == before_task_fence
     assert _async_rows(db) == before_async
+    if before_delivery is not None:
+        assert _delivery_rows(db) == before_delivery
     db.close()
 
 

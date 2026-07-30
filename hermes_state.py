@@ -348,6 +348,9 @@ _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
 _TASK_FENCE_MAX_RUNTIME_EPOCH = 2**63 - 1
 _TASK_FENCE_ASYNC_RESTORE_ADAPTER = "runtime:async_delegation_restore_ready"
 _TASK_FENCE_ASYNC_RECOVERY_PENDING_ADAPTER = "runtime:async_delegation_recovery_pending"
+_TASK_FENCE_DELIVERY_RECOVERY_PENDING_ADAPTER = (
+    "runtime:delivery_obligation_recovery_pending"
+)
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
 _TASK_FENCE_POLICY_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 _TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
@@ -6172,7 +6175,7 @@ class SessionDB:
         tested_artifact_identity: Optional[TaskFenceArtifactIdentity] = None,
         shadow_session_key: Optional[str] = None,
     ) -> TaskFenceRecovery:
-        """Recover shadow state and observe durable async recovery candidates."""
+        """Recover shadow state and observe durable queued recovery candidates."""
 
         if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
             raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
@@ -7070,7 +7073,7 @@ class SessionDB:
                     "incompatible_recovery_projection"
                 )
 
-            async_restore_observations: List[
+            recovery_observations: List[
                 Tuple[
                     Optional[CausalEnvelope],
                     OperationDescriptor,
@@ -7289,7 +7292,7 @@ class SessionDB:
                         if envelope is not None
                         else DecisionReason.MISSING_PROVENANCE
                     )
-                    async_restore_observations.append((
+                    recovery_observations.append((
                         envelope,
                         operation,
                         DispatchDecision(
@@ -7298,9 +7301,136 @@ class SessionDB:
                         ),
                     ))
 
+            if shadow_session_key is not None:
+                delivery_objects = conn.execute(
+                    "SELECT type, name FROM main.sqlite_master "
+                    "WHERE name = 'delivery_obligations' COLLATE NOCASE "
+                    "ORDER BY type, name"
+                ).fetchall()
+                if delivery_objects and (
+                    len(delivery_objects) != 1
+                    or delivery_objects[0]["type"] != "table"
+                ):
+                    raise TaskFenceRecoveryUnavailable(
+                        "incompatible_recovery_projection"
+                    )
+                if delivery_objects:
+                    delivery_columns = {
+                        row["name"]
+                        for row in conn.execute(
+                            "PRAGMA main.table_info('delivery_obligations')"
+                        )
+                    }
+                    if not {
+                        "obligation_id",
+                        "session_key",
+                        "platform",
+                        "chat_id",
+                        "thread_id",
+                        "content",
+                        "state",
+                        "attempts",
+                        "created_at",
+                        "owner_pid",
+                        "owner_started_at",
+                    }.issubset(delivery_columns):
+                        raise TaskFenceRecoveryUnavailable(
+                            "incompatible_recovery_projection"
+                        )
+                    delivery_rows = bounded_authority_rows(
+                        "SELECT obligation_id, session_key, platform, chat_id, "
+                        "thread_id, content, state, attempts, created_at, "
+                        "owner_pid, owner_started_at "
+                        "FROM main.delivery_obligations WHERE session_key = ? "
+                        "AND state IN ('pending', 'attempting', 'failed') "
+                        "ORDER BY created_at, obligation_id LIMIT ?",
+                        (shadow_session_key,),
+                    )
+                    for row in delivery_rows:
+                        obligation_id = row["obligation_id"]
+                        created_at = row["created_at"]
+                        attempts = row["attempts"]
+                        if (
+                            not _task_fence_v2_identifier_compatible(obligation_id)
+                            or not isinstance(row["session_key"], str)
+                            or row["session_key"] != shadow_session_key
+                            or not isinstance(row["platform"], str)
+                            or not isinstance(row["chat_id"], str)
+                            or (
+                                row["thread_id"] is not None
+                                and not isinstance(row["thread_id"], str)
+                            )
+                            or not isinstance(row["content"], str)
+                            or row["state"]
+                            not in {"pending", "attempting", "failed"}
+                            or type(attempts) is not int
+                            or attempts < 0
+                            or type(created_at) not in {int, float}
+                            or not math.isfinite(float(created_at))
+                            or created_at < 0
+                            or (
+                                row["owner_pid"] is not None
+                                and type(row["owner_pid"]) is not int
+                            )
+                            or (
+                                row["owner_started_at"] is not None
+                                and type(row["owner_started_at"]) is not int
+                            )
+                        ):
+                            raise TaskFenceRecoveryUnavailable(
+                                "incompatible_recovery_projection"
+                            )
+                        try:
+                            observation_bytes = json.dumps(
+                                (
+                                    row["session_key"],
+                                    row["platform"],
+                                    row["chat_id"],
+                                    row["thread_id"],
+                                    row["content"],
+                                    row["state"],
+                                    attempts,
+                                    row["owner_pid"],
+                                    row["owner_started_at"],
+                                ),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ).encode("utf-8")
+                            invocation_identity = json.dumps(
+                                (obligation_id, float(created_at)),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ).encode("utf-8")
+                        except (TypeError, ValueError, UnicodeEncodeError):
+                            raise TaskFenceRecoveryUnavailable(
+                                "incompatible_recovery_projection"
+                            ) from None
+                        invocation_digest = hashlib.sha256(
+                            invocation_identity
+                        ).hexdigest()
+                        operation = OperationDescriptor(
+                            invocation_id=f"tfqo_{invocation_digest}",
+                            kind=OperationKind.DELIVERY,
+                            adapter=_TASK_FENCE_DELIVERY_RECOVERY_PENDING_ADAPTER,
+                            invocation_fingerprint=hashlib.sha256(
+                                observation_bytes
+                            ).hexdigest(),
+                        )
+                        # The delivery ledger has no causal Task Fence columns.
+                        recovery_observations.append((
+                            None,
+                            operation,
+                            DispatchDecision(
+                                DecisionOutcome.WOULD_BLOCK,
+                                DecisionReason.MISSING_PROVENANCE,
+                            ),
+                        ))
+
             now = time.time()
             next_runtime_epoch = expected_runtime_epoch + 1
-            for envelope, operation, decision in async_restore_observations:
+            for envelope, operation, decision in recovery_observations:
                 self._record_task_fence_policy_decision_unlocked(
                     conn,
                     decision_point="admission",

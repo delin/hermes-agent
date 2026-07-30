@@ -281,6 +281,31 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     )
     seed._conn.commit()
     seed.close()
+    from gateway import delivery_ledger
+
+    monkeypatch.setattr(
+        delivery_ledger,
+        "_db_path",
+        lambda: tmp_path / "state.db",
+    )
+    delivery_ledger.record_obligation(
+        obligation_id="cafe00000000000000000001",
+        session_key=_SHADOW_SESSION_KEY,
+        platform="slack",
+        chat_id="private-chat",
+        thread_id="private-thread",
+        content="private pending final response",
+    )
+    delivery_seed = SessionDB(tmp_path / "state.db")
+    try:
+        delivery_before = tuple(
+            tuple(row)
+            for row in delivery_seed._conn.execute(
+                "SELECT * FROM delivery_obligations ORDER BY obligation_id"
+            )
+        )
+    finally:
+        delivery_seed.close()
 
     class ReopeningRunner:
         def __init__(self, config: GatewayConfig):
@@ -321,6 +346,12 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
                         "ORDER BY delegation_id"
                     )
                 )
+                delivery_after = tuple(
+                    tuple(row)
+                    for row in database._conn.execute(
+                        "SELECT * FROM delivery_obligations ORDER BY obligation_id"
+                    )
+                )
             finally:
                 database.close()
             assert decisions == {
@@ -338,11 +369,19 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
                     "delivery",
                     "runtime:async_delegation_restore_ready",
                 ),
+                "runtime:delivery_obligation_recovery_pending": (
+                    "would_block",
+                    "missing_provenance",
+                    "admission",
+                    "delivery",
+                    "runtime:delivery_obligation_recovery_pending",
+                ),
             }
             assert queued == (
                 ("deadbee0", "running", "pending", None),
                 ("deadbeef", "completed", "pending", queued_event),
             )
+            assert delivery_after == delivery_before
 
         async def start(self) -> bool:
             events.append("start")

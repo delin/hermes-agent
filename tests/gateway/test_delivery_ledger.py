@@ -232,6 +232,52 @@ class TestGatewayRedeliverySweep:
         )
 
     @pytest.mark.asyncio
+    async def test_task_fence_observation_precedes_unchanged_redelivery(self):
+        from hermes_state import SessionDB
+        from task_fence import TaskFenceArtifactIdentity
+
+        session_key = "agent:main:slack:channel:C1"
+        _record(session_key=session_key)
+        _orphan("ob-1")
+        before = _row("ob-1")
+        database = SessionDB(dl._db_path())
+        try:
+            recovery = database.recover_task_fence_state(
+                expected_runtime_epoch=0,
+                expected_mode_generation=0,
+                tested_artifact_identity=TaskFenceArtifactIdentity(
+                    tested_artifact_commit="a" * 40,
+                    tested_artifact_checksum="sha256:" + "b" * 64,
+                    dependency_lock_fingerprint="sha256:" + "c" * 64,
+                ),
+                shadow_session_key=session_key,
+            )
+            assert recovery.runtime_epoch == 1
+            assert tuple(
+                database._conn.execute(
+                    "SELECT outcome, reason_code, operation_kind, adapter "
+                    "FROM task_fence_policy_decisions"
+                ).fetchone()
+            ) == (
+                "would_block",
+                "missing_provenance",
+                "delivery",
+                "runtime:delivery_obligation_recovery_pending",
+            )
+            assert _row("ob-1") == before
+        finally:
+            database.close()
+
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+        assert await runner._redeliver_pending_obligations() == 1
+        assert adapter.send.await_count == 1
+        assert _row("ob-1")["state"] == "delivered"
+        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+            session_key
+        )
+
+    @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):
         _record()
         dl.mark_attempting("ob-1")
