@@ -448,6 +448,22 @@ def test_recovery_turns_started_effect_into_one_durable_incident(tmp_path) -> No
         assert task is not None
         assert task.status == "incident"
         assert task.current_runtime_epoch == 2
+        frontier = reopened.inspect_task_fence_conversation(
+            "recovery-conversation"
+        )
+        assert frontier.compatible is True
+        assert frontier.reason == "compatible"
+        assert frontier.task is not None
+        assert frontier.task.task_id == accepted.task_id
+        assert frontier.active_run is None
+        assert frontier.pending_input_ids == ()
+        assert frontier.pending_inputs_truncated is False
+        assert frontier.started_attempts == ()
+        assert frontier.started_attempts_truncated is False
+        assert frontier.open_incident is not None
+        assert frontier.open_incident.source_run_id == accepted.opened_run_id
+        assert frontier.open_incident.reason_code == "outcome_unknown"
+        assert frontier.open_incident.attempt_ids == (started.attempt_id,)
         assert (
             reopened._conn.execute(
                 "SELECT state FROM task_fence_attempts WHERE attempt_id = ?",
@@ -502,8 +518,85 @@ def test_recovery_turns_started_effect_into_one_durable_incident(tmp_path) -> No
             _operation("tfiv-stale-after-recovery"),
         )
         assert blocked.outcome is DecisionOutcome.WOULD_BLOCK
+
+        reopened._conn.execute(
+            "UPDATE task_fence_attempts "
+            "SET recovery_classification = 'known_read' "
+            "WHERE attempt_id = ?",
+            (started.attempt_id,),
+        )
+        reopened._conn.commit()
+        assert reopened.inspect_task_fence_store().compatible is True
+        corrupt = reopened.inspect_task_fence_conversation(
+            "recovery-conversation"
+        )
+        assert corrupt.compatible is False
+        assert corrupt.reason == "incompatible_open_incident_projection"
+        assert corrupt.task is None
+        assert corrupt.open_incident is None
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("attempt_count", (64, 65))
+def test_conversation_inspection_requires_exact_bounded_incident_links(
+    tmp_path,
+    monkeypatch,
+    attempt_count,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    accepted = db.accept_task_fence_ingress(
+        _ingress("initial_submit", f"incident-bound-{attempt_count}")
+    )
+    generation = db.reserve_task_fence_generation(accepted)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    policy = TaskFencePolicy(db)
+    started_ids = []
+    for index in range(attempt_count):
+        invocation_id = f"tfiv-incident-bound-{attempt_count}-{index}"
+        invocation = generation.for_invocation(invocation_id)
+        operation = _operation(invocation_id)
+        admitted = policy.admit_operation(invocation, operation)
+        started = policy.authorize_and_start(
+            invocation,
+            operation,
+            admitted.permit_id,
+        )
+        assert started.attempt_id is not None
+        started_ids.append(started.attempt_id)
+    db.close()
+
+    reopened = SessionDB(path)
+    inspection_limit = hermes_state._TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS",
+        attempt_count,
+    )
+    _recover(reopened)
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS",
+        inspection_limit,
+    )
+    try:
+        inspected = reopened.inspect_task_fence_conversation(
+            "recovery-conversation"
+        )
+    finally:
+        reopened.close()
+
+    if attempt_count == inspection_limit:
+        assert inspected.compatible is True
+        assert inspected.open_incident is not None
+        assert inspected.open_incident.attempt_ids == tuple(sorted(started_ids))
+        assert inspected.started_attempts == ()
+    else:
+        assert inspected.compatible is False
+        assert inspected.reason == "open_incident_attempt_limit_exceeded"
+        assert inspected.task is None
+        assert inspected.open_incident is None
 
 
 @pytest.mark.parametrize(
@@ -650,6 +743,12 @@ def test_recovery_adopts_preexisting_unknowns_into_one_durable_incident(
         resolved_task = reopened.inspect_task_fence_task(accepted.task_id).task
         assert resolved_task is not None
         assert resolved_task.status == "paused"
+        resolved_frontier = reopened.inspect_task_fence_conversation(
+            "recovery-conversation"
+        )
+        assert resolved_frontier.compatible is True
+        assert resolved_frontier.task is not None
+        assert resolved_frontier.open_incident is None
 
         resolution = reopened._conn.execute(
             "SELECT resolution_id FROM task_fence_resolutions "
@@ -1150,6 +1249,13 @@ def test_recovery_preserves_terminal_task_and_records_unknown_started_effect(
         ).fetchone()[0]
         == started.attempt_id
     )
+    terminal_frontier = db.inspect_task_fence_conversation(
+        "recovery-conversation"
+    )
+    assert terminal_frontier.compatible is True
+    assert terminal_frontier.reason == "no_active_task"
+    assert terminal_frontier.task is None
+    assert terminal_frontier.open_incident is None
 
     second = _recover(db)
     assert (second.previous_runtime_epoch, second.runtime_epoch) == (1, 2)

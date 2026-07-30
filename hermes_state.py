@@ -347,6 +347,8 @@ _TASK_FENCE_MAX_RECOVERY_AUTHORITIES = 8_192
 _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS = 64
 _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
 _TASK_FENCE_MAX_PROCESS_CHECKPOINT_OPERATIONS = 64
+_TASK_FENCE_MAX_INSPECTION_ITEMS = 64
+_TASK_FENCE_MAX_INSPECTION_WORK = 8_192
 _TASK_FENCE_MAX_RUNTIME_EPOCH = 2**63 - 1
 _TASK_FENCE_ASYNC_RESTORE_ADAPTER = "runtime:async_delegation_restore_ready"
 _TASK_FENCE_ASYNC_RECOVERY_PENDING_ADAPTER = "runtime:async_delegation_recovery_pending"
@@ -368,6 +370,26 @@ _TASK_FENCE_TASK_SELECT_COLUMNS = (
     "active_authority_event_id, active_execution_run_id, "
     "current_generation_id, current_runtime_epoch, last_accepted_order, "
     "last_transition_event_id"
+)
+_TASK_FENCE_INSPECTION_ATTEMPT_SELECT_COLUMNS = (
+    "attempt.attempt_id AS selected_attempt_id, "
+    "attempt.recovery_classification AS selected_recovery_classification, "
+    "attempt.state AS selected_attempt_state, "
+    "attempt.disposition AS selected_disposition, "
+    "attempt.handoff_ref AS selected_handoff_ref, "
+    "attempt.acknowledgement_ref AS selected_acknowledgement_ref, "
+    "attempt.prepared_at AS selected_prepared_at, "
+    "attempt.started_at AS selected_started_at, "
+    "attempt.terminal_at AS selected_terminal_at, "
+    "permit.permit_id AS selected_permit_id, "
+    "permit.task_id AS selected_task_id, "
+    "permit.run_id AS selected_run_id, "
+    "permit.generation_id AS selected_generation_id, "
+    "permit.state AS selected_permit_state, "
+    "permit.consumed_at AS selected_consumed_at, "
+    "run.task_id AS selected_run_task_id, "
+    "generation.task_id AS selected_generation_task_id, "
+    "generation.run_id AS selected_generation_run_id"
 )
 _TASK_FENCE_POLICY_DECISION_SELECT_COLUMNS = (
     "decision_order, decided_at, decision_id, decision_point, outcome, "
@@ -503,8 +525,34 @@ class TaskFenceConversationTaskProjection:
 
 
 @dataclass(frozen=True)
+class TaskFenceActiveRunProjection:
+    """Current open run identity without duplicating task counters."""
+
+    run_id: str
+    authority_event_id: str
+
+
+@dataclass(frozen=True)
+class TaskFenceStartedAttemptProjection:
+    """Current effect-bearing attempt without arguments or evidence."""
+
+    attempt_id: str
+    run_id: str
+
+
+@dataclass(frozen=True)
+class TaskFenceOpenIncidentProjection:
+    """One unresolved incident and its exact bounded attempt set."""
+
+    incident_id: str
+    source_run_id: Optional[str]
+    reason_code: str
+    attempt_ids: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class TaskFenceConversationInspection:
-    """SELECT-only store/task/cohort selection for one conversation."""
+    """SELECT-only current authority for one exact conversation."""
 
     store: TaskFenceStoreInspection
     compatible: bool
@@ -512,6 +560,12 @@ class TaskFenceConversationInspection:
     conversation_fingerprint: Optional[str]
     cohort: Optional[TaskFenceCohortProjection]
     task: Optional[TaskFenceConversationTaskProjection]
+    active_run: Optional[TaskFenceActiveRunProjection]
+    pending_input_ids: Tuple[str, ...]
+    pending_inputs_truncated: bool
+    started_attempts: Tuple[TaskFenceStartedAttemptProjection, ...]
+    started_attempts_truncated: bool
+    open_incident: Optional[TaskFenceOpenIncidentProjection]
 
 
 @dataclass(frozen=True)
@@ -8154,6 +8208,306 @@ class SessionDB:
             )
         )
 
+    def _task_fence_active_run_projection_unlocked(
+        self,
+        task: sqlite3.Row,
+    ) -> Tuple[Optional[TaskFenceActiveRunProjection], Optional[str]]:
+        rows = self._conn.execute(
+            "SELECT run.run_id, run.task_id, run.authority_event_id, "
+            "run.intent_epoch, run.control_revision, run.runtime_epoch, "
+            "run.state, run.open_event_id, run.close_event_id, "
+            "run.close_reason, run.opened_at, run.closed_at, "
+            "authority.task_id AS authority_task_id "
+            "FROM main.task_fence_execution_runs AS run "
+            "LEFT JOIN main.task_fence_ingress AS authority "
+            "ON authority.event_id = run.authority_event_id "
+            "WHERE run.task_id = ? AND run.state = 'open' "
+            "ORDER BY run_id LIMIT 2",
+            (task["task_id"],),
+        ).fetchall()
+        run_id = task["active_execution_run_id"]
+        if run_id is None:
+            if (
+                rows
+                or task["status"] == "running"
+                or task["current_generation_id"] is not None
+            ):
+                return None, "incompatible_active_run_projection"
+            return None, None
+        if (
+            task["status"] != "running"
+            or len(rows) != 1
+            or not _task_fence_v2_identifier_compatible(run_id)
+            or not _task_fence_v2_identifier_compatible(
+                task["active_authority_event_id"]
+            )
+        ):
+            return None, "incompatible_active_run_projection"
+
+        row = rows[0]
+        if (
+            row["run_id"] != run_id
+            or row["task_id"] != task["task_id"]
+            or row["authority_event_id"] != task["active_authority_event_id"]
+            or row["authority_task_id"] != task["task_id"]
+            or row["open_event_id"] != row["authority_event_id"]
+            or row["intent_epoch"] != task["intent_epoch"]
+            or row["control_revision"] != task["control_revision"]
+            or row["runtime_epoch"] != task["current_runtime_epoch"]
+            or row["state"] != "open"
+            or row["close_event_id"] is not None
+            or row["close_reason"] is not None
+            or row["closed_at"] is not None
+            or type(row["opened_at"]) not in {int, float}
+            or not math.isfinite(float(row["opened_at"]))
+            or row["opened_at"] < 0
+            or any(
+                type(row[field]) is not int or row[field] < 0
+                for field in (
+                    "intent_epoch",
+                    "control_revision",
+                    "runtime_epoch",
+                )
+            )
+        ):
+            return None, "incompatible_active_run_projection"
+        return (
+            TaskFenceActiveRunProjection(
+                run_id=run_id,
+                authority_event_id=row["authority_event_id"],
+            ),
+            None,
+        )
+
+    def _task_fence_pending_projection_unlocked(
+        self,
+        task_id: str,
+    ) -> Tuple[Tuple[str, ...], bool, Optional[str]]:
+        rows = self._conn.execute(
+            "SELECT input.event_id, input.task_id AS input_task_id, "
+            "input.state, input.bound_run_id, "
+            "ingress.task_id AS ingress_task_id, ingress.accepted_order "
+            "FROM main.task_fence_task_inputs AS input "
+            "INDEXED BY idx_task_fence_inputs_task_state "
+            "LEFT JOIN main.task_fence_ingress AS ingress "
+            "ON ingress.event_id = input.event_id "
+            "WHERE input.task_id = ? AND input.state = 'pending' "
+            "LIMIT ?",
+            (task_id, _TASK_FENCE_MAX_INSPECTION_WORK + 1),
+        ).fetchall()
+        if len(rows) > _TASK_FENCE_MAX_INSPECTION_WORK:
+            return (), False, "pending_input_limit_exceeded"
+        if any(
+            not _task_fence_v2_identifier_compatible(row["event_id"])
+            or row["input_task_id"] != task_id
+            or row["state"] != "pending"
+            or row["bound_run_id"] is not None
+            or row["ingress_task_id"] != task_id
+            or type(row["accepted_order"]) is not int
+            or row["accepted_order"] < 1
+            for row in rows
+        ):
+            return (), False, "incompatible_pending_input_projection"
+        rows.sort(key=lambda row: row["accepted_order"])
+        if any(
+            previous["accepted_order"] >= current["accepted_order"]
+            for previous, current in zip(rows, rows[1:])
+        ):
+            return (), False, "incompatible_pending_input_projection"
+        pending = tuple(row["event_id"] for row in rows)
+        return (
+            pending[:_TASK_FENCE_MAX_INSPECTION_ITEMS],
+            len(pending) > _TASK_FENCE_MAX_INSPECTION_ITEMS,
+            None,
+        )
+
+    @staticmethod
+    def _task_fence_inspection_attempt_compatible(
+        row: sqlite3.Row,
+        *,
+        task_id: str,
+        state: str,
+    ) -> bool:
+        def finite_number(value: object) -> bool:
+            return type(value) in {int, float} and math.isfinite(float(value))
+
+        if (
+            any(
+                not _task_fence_v2_identifier_compatible(row[field])
+                for field in (
+                    "selected_attempt_id",
+                    "selected_permit_id",
+                    "selected_run_id",
+                    "selected_generation_id",
+                )
+            )
+            or row["selected_task_id"] != task_id
+            or row["selected_run_task_id"] != task_id
+            or row["selected_generation_task_id"] != task_id
+            or row["selected_generation_run_id"] != row["selected_run_id"]
+            or row["selected_recovery_classification"] != "may_effect"
+            or row["selected_attempt_state"] != state
+            or row["selected_permit_state"] != "consumed"
+            or row["selected_handoff_ref"] is not None
+            or not finite_number(row["selected_prepared_at"])
+            or not finite_number(row["selected_started_at"])
+            or row["selected_prepared_at"] < 0
+            or row["selected_started_at"] < 0
+            or row["selected_prepared_at"] != row["selected_started_at"]
+            or row["selected_consumed_at"] != row["selected_started_at"]
+        ):
+            return False
+        if state == "STARTED":
+            return (
+                row["selected_disposition"] is None
+                and row["selected_acknowledgement_ref"] is None
+                and row["selected_terminal_at"] is None
+            )
+        return (
+            state == "OUTCOME_UNKNOWN"
+            and row["selected_disposition"] == state
+            and _task_fence_policy_evidence_compatible(
+                row["selected_acknowledgement_ref"],
+                optional=True,
+            )
+            and finite_number(row["selected_terminal_at"])
+            and row["selected_terminal_at"] >= row["selected_started_at"]
+        )
+
+    def _task_fence_started_attempt_projection_unlocked(
+        self,
+        task_id: str,
+    ) -> Tuple[Tuple[TaskFenceStartedAttemptProjection, ...], bool, Optional[str]]:
+        rows = self._conn.execute(
+            f"SELECT {_TASK_FENCE_INSPECTION_ATTEMPT_SELECT_COLUMNS} "
+            "FROM main.task_fence_attempts AS attempt "
+            "INDEXED BY idx_task_fence_attempts_state "
+            "LEFT JOIN main.task_fence_dispatch_permits AS permit "
+            "ON permit.permit_id = attempt.permit_id "
+            "LEFT JOIN main.task_fence_execution_runs AS run "
+            "ON run.run_id = permit.run_id "
+            "LEFT JOIN main.task_fence_model_generations AS generation "
+            "ON generation.generation_id = permit.generation_id "
+            "WHERE attempt.state = 'STARTED' LIMIT ?",
+            (_TASK_FENCE_MAX_INSPECTION_WORK + 1,),
+        ).fetchall()
+        if len(rows) > _TASK_FENCE_MAX_INSPECTION_WORK:
+            return (), False, "started_attempt_work_limit_exceeded"
+        selected = [row for row in rows if row["selected_task_id"] == task_id]
+        if any(
+            not self._task_fence_inspection_attempt_compatible(
+                row,
+                task_id=task_id,
+                state="STARTED",
+            )
+            for row in selected
+        ):
+            return (), False, "incompatible_started_attempt_projection"
+        projected: List[TaskFenceStartedAttemptProjection] = []
+        for row in sorted(
+            selected,
+            key=lambda item: (
+                item["selected_started_at"],
+                item["selected_attempt_id"],
+            ),
+        ):
+            projected.append(
+                TaskFenceStartedAttemptProjection(
+                    attempt_id=row["selected_attempt_id"],
+                    run_id=row["selected_run_id"],
+                )
+            )
+        return (
+            tuple(projected[:_TASK_FENCE_MAX_INSPECTION_ITEMS]),
+            len(projected) > _TASK_FENCE_MAX_INSPECTION_ITEMS,
+            None,
+        )
+
+    def _task_fence_open_incident_projection_unlocked(
+        self,
+        task: sqlite3.Row,
+    ) -> Tuple[Optional[TaskFenceOpenIncidentProjection], Optional[str]]:
+        rows = self._conn.execute(
+            "SELECT incident.incident_id, incident.source_run_id, "
+            "incident.reason_code, incident.opened_at, incident.resolved_at, "
+            "resolution.resolution_id "
+            "FROM main.task_fence_incidents AS incident "
+            "LEFT JOIN main.task_fence_resolutions AS resolution "
+            "ON resolution.incident_id = incident.incident_id "
+            "WHERE incident.task_id = ? AND incident.state = 'open' "
+            "ORDER BY incident.incident_id LIMIT 2",
+            (task["task_id"],),
+        ).fetchall()
+        if not rows:
+            if task["status"] == "incident":
+                return None, "incompatible_open_incident_projection"
+            return None, None
+        if task["status"] != "incident" or len(rows) != 1:
+            return None, "incompatible_open_incident_projection"
+
+        row = rows[0]
+        if (
+            not _task_fence_v2_identifier_compatible(row["incident_id"])
+            or not _task_fence_v2_identifier_compatible(
+                row["source_run_id"],
+                optional=True,
+            )
+            or row["reason_code"] != "outcome_unknown"
+            or type(row["opened_at"]) not in {int, float}
+            or not math.isfinite(float(row["opened_at"]))
+            or row["opened_at"] < 0
+            or row["resolved_at"] is not None
+            or row["resolution_id"] is not None
+        ):
+            return None, "incompatible_open_incident_projection"
+        if row["source_run_id"] is not None:
+            source_run = self._conn.execute(
+                "SELECT task_id FROM main.task_fence_execution_runs "
+                "WHERE run_id = ?",
+                (row["source_run_id"],),
+            ).fetchone()
+            if source_run is None or source_run["task_id"] != task["task_id"]:
+                return None, "incompatible_open_incident_projection"
+
+        links = self._conn.execute(
+            "SELECT link.attempt_id AS linked_attempt_id, "
+            f"{_TASK_FENCE_INSPECTION_ATTEMPT_SELECT_COLUMNS} "
+            "FROM main.task_fence_incident_attempts AS link "
+            "LEFT JOIN main.task_fence_attempts AS attempt "
+            "ON attempt.attempt_id = link.attempt_id "
+            "LEFT JOIN main.task_fence_dispatch_permits AS permit "
+            "ON permit.permit_id = attempt.permit_id "
+            "LEFT JOIN main.task_fence_execution_runs AS run "
+            "ON run.run_id = permit.run_id "
+            "LEFT JOIN main.task_fence_model_generations AS generation "
+            "ON generation.generation_id = permit.generation_id "
+            "WHERE link.incident_id = ? "
+            "ORDER BY link.attempt_id LIMIT ?",
+            (row["incident_id"], _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS + 1),
+        ).fetchall()
+        if len(links) > _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS:
+            return None, "open_incident_attempt_limit_exceeded"
+        if not links or any(
+            not _task_fence_v2_identifier_compatible(link["linked_attempt_id"])
+            or link["selected_attempt_id"] != link["linked_attempt_id"]
+            or not self._task_fence_inspection_attempt_compatible(
+                link,
+                task_id=task["task_id"],
+                state="OUTCOME_UNKNOWN",
+            )
+            for link in links
+        ):
+            return None, "incompatible_open_incident_projection"
+        return (
+            TaskFenceOpenIncidentProjection(
+                incident_id=row["incident_id"],
+                source_run_id=row["source_run_id"],
+                reason_code=row["reason_code"],
+                attempt_ids=tuple(link["linked_attempt_id"] for link in links),
+            ),
+            None,
+        )
+
     def _inspect_task_fence_conversation(
         self,
         conversation_id: str,
@@ -8174,6 +8528,16 @@ class SessionDB:
                     reason: str,
                     cohort: Optional[TaskFenceCohortProjection] = None,
                     task: Optional[TaskFenceConversationTaskProjection] = None,
+                    active_run: Optional[TaskFenceActiveRunProjection] = None,
+                    pending_input_ids: Tuple[str, ...] = (),
+                    pending_inputs_truncated: bool = False,
+                    started_attempts: Tuple[
+                        TaskFenceStartedAttemptProjection, ...
+                    ] = (),
+                    started_attempts_truncated: bool = False,
+                    open_incident: Optional[
+                        TaskFenceOpenIncidentProjection
+                    ] = None,
                 ) -> TaskFenceConversationInspection:
                     return TaskFenceConversationInspection(
                         store=store,
@@ -8182,6 +8546,12 @@ class SessionDB:
                         conversation_fingerprint=conversation_fingerprint,
                         cohort=cohort,
                         task=task,
+                        active_run=active_run,
+                        pending_input_ids=pending_input_ids,
+                        pending_inputs_truncated=pending_inputs_truncated,
+                        started_attempts=started_attempts,
+                        started_attempts_truncated=started_attempts_truncated,
+                        open_incident=open_incident,
                     )
 
                 if not store.compatible:
@@ -8261,6 +8631,8 @@ class SessionDB:
                     "ORDER BY cohort_key LIMIT 2",
                     (cohort_key,),
                 ).fetchall()
+                cohort: Optional[TaskFenceCohortProjection] = None
+                projection_reason = "compatible"
                 if len(cohort_rows) > 1:
                     return result(
                         compatible=False,
@@ -8272,60 +8644,89 @@ class SessionDB:
                             compatible=False,
                             reason="cohort_not_found",
                         )
-                    return result(
-                        compatible=True,
-                        reason="cohort_not_materialized",
-                        task=task,
+                    projection_reason = "cohort_not_materialized"
+                else:
+                    cohort_row = cohort_rows[0]
+                    if (
+                        not _task_fence_v2_identifier_compatible(
+                            cohort_row["cohort_key"]
+                        )
+                        or cohort_row["cohort_key"] != cohort_key
+                        or cohort_row["mode"]
+                        not in {"audit", "enforce", "halt_dispatch"}
+                        or type(cohort_row["mode_generation"]) is not int
+                        or cohort_row["mode_generation"] < 0
+                        or cohort_row["activation_state"]
+                        not in {"inactive", "active", "halted"}
+                        or type(cohort_row["audit_degraded"]) is not int
+                        or cohort_row["audit_degraded"] not in (0, 1)
+                    ):
+                        return result(
+                            compatible=False,
+                            reason="malformed_cohort_projection",
+                        )
+                    if cohort_row["mode_generation"] != store.mode_generation:
+                        return result(
+                            compatible=False,
+                            reason="cohort_generation_mismatch",
+                        )
+                    if implicit_binding and (
+                        cohort_row["mode"] != "audit"
+                        or cohort_row["activation_state"] != "inactive"
+                    ):
+                        return result(
+                            compatible=False,
+                            reason="implicit_cohort_mismatch",
+                        )
+                    cohort = TaskFenceCohortProjection(
+                        cohort_fingerprint=hashlib.sha256(
+                            b"hermes.task_fence.cohort.v1\0"
+                            + cohort_key.encode("utf-8")
+                        ).hexdigest(),
+                        binding=(
+                            "implicit" if implicit_binding else "explicit"
+                        ),
+                        mode=cohort_row["mode"],
+                        mode_generation=cohort_row["mode_generation"],
+                        activation_state=cohort_row["activation_state"],
+                        audit_degraded=bool(cohort_row["audit_degraded"]),
                     )
 
-                cohort_row = cohort_rows[0]
-                if (
-                    not _task_fence_v2_identifier_compatible(
-                        cohort_row["cohort_key"]
-                    )
-                    or cohort_row["cohort_key"] != cohort_key
-                    or cohort_row["mode"]
-                    not in {"audit", "enforce", "halt_dispatch"}
-                    or type(cohort_row["mode_generation"]) is not int
-                    or cohort_row["mode_generation"] < 0
-                    or cohort_row["activation_state"]
-                    not in {"inactive", "active", "halted"}
-                    or type(cohort_row["audit_degraded"]) is not int
-                    or cohort_row["audit_degraded"] not in (0, 1)
-                ):
-                    return result(
-                        compatible=False,
-                        reason="malformed_cohort_projection",
-                    )
-                if cohort_row["mode_generation"] != store.mode_generation:
-                    return result(
-                        compatible=False,
-                        reason="cohort_generation_mismatch",
-                    )
-                if implicit_binding and (
-                    cohort_row["mode"] != "audit"
-                    or cohort_row["activation_state"] != "inactive"
-                ):
-                    return result(
-                        compatible=False,
-                        reason="implicit_cohort_mismatch",
-                    )
-                cohort = TaskFenceCohortProjection(
-                    cohort_fingerprint=hashlib.sha256(
-                        b"hermes.task_fence.cohort.v1\0"
-                        + cohort_key.encode("utf-8")
-                    ).hexdigest(),
-                    binding="implicit" if implicit_binding else "explicit",
-                    mode=cohort_row["mode"],
-                    mode_generation=cohort_row["mode_generation"],
-                    activation_state=cohort_row["activation_state"],
-                    audit_degraded=bool(cohort_row["audit_degraded"]),
+                active_run, failure = (
+                    self._task_fence_active_run_projection_unlocked(task_row)
                 )
+                if failure is not None:
+                    return result(compatible=False, reason=failure)
+                pending_input_ids, pending_truncated, failure = (
+                    self._task_fence_pending_projection_unlocked(
+                        task_row["task_id"]
+                    )
+                )
+                if failure is not None:
+                    return result(compatible=False, reason=failure)
+                started_attempts, started_truncated, failure = (
+                    self._task_fence_started_attempt_projection_unlocked(
+                        task_row["task_id"]
+                    )
+                )
+                if failure is not None:
+                    return result(compatible=False, reason=failure)
+                open_incident, failure = (
+                    self._task_fence_open_incident_projection_unlocked(task_row)
+                )
+                if failure is not None:
+                    return result(compatible=False, reason=failure)
                 return result(
                     compatible=True,
-                    reason="compatible",
+                    reason=projection_reason,
                     cohort=cohort,
                     task=task,
+                    active_run=active_run,
+                    pending_input_ids=pending_input_ids,
+                    pending_inputs_truncated=pending_truncated,
+                    started_attempts=started_attempts,
+                    started_attempts_truncated=started_truncated,
+                    open_incident=open_incident,
                 )
             finally:
                 self._end_task_fence_read_snapshot_unlocked(owned_snapshot)
@@ -8334,7 +8735,7 @@ class SessionDB:
         self,
         conversation_id: str,
     ) -> TaskFenceConversationInspection:
-        """Select one active task and its cohort through one read snapshot."""
+        """Select one active task's current authority in one read snapshot."""
 
         try:
             return self._inspect_task_fence_conversation(conversation_id)
@@ -8348,6 +8749,12 @@ class SessionDB:
                 conversation_fingerprint=None,
                 cohort=None,
                 task=None,
+                active_run=None,
+                pending_input_ids=(),
+                pending_inputs_truncated=False,
+                started_attempts=(),
+                started_attempts_truncated=False,
+                open_incident=None,
             )
 
     @staticmethod

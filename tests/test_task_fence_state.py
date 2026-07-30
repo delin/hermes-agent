@@ -13,6 +13,7 @@ from hermes_state import (
     TASK_FENCE_STORE_SCHEMA_VERSION,
     SessionDB,
 )
+from task_fence import IngressEnvelope, TASK_FENCE_ACTIONS
 
 
 EXPECTED_TASK_FENCE_TABLES = {
@@ -2331,6 +2332,241 @@ def test_conversation_inspection_is_exact_secret_free_and_active_only(tmp_path):
     finally:
         conn.close()
     assert implicit_rows == 0
+
+
+def test_real_ingress_conversation_inspection_tracks_run_then_pending(tmp_path):
+    path = tmp_path / "state.db"
+    conversation_id = "workspace:secret-real-ingress"
+
+    def ingress(action, source_event_id, *, task_id=None):
+        return IngressEnvelope(
+            source="gateway:test:inspection",
+            source_event_id=source_event_id,
+            conversation_id=conversation_id,
+            action=TASK_FENCE_ACTIONS[action],
+            payload_hash=hashlib.sha256(
+                source_event_id.encode("utf-8")
+            ).hexdigest(),
+            task_id=task_id,
+        )
+
+    db = SessionDB(path)
+    accepted = db.accept_task_fence_ingress(
+        ingress("initial_submit", "inspection-initial")
+    )
+    db.close()
+
+    read_only = SessionDB(path, read_only=True)
+    try:
+        running = read_only.inspect_task_fence_conversation(conversation_id)
+        assert read_only._conn.total_changes == 0
+    finally:
+        read_only.close()
+
+    assert running.compatible is True
+    assert running.reason == "cohort_not_materialized"
+    assert running.cohort is None
+    assert running.task is not None
+    assert running.task.status == "running"
+    assert running.active_run is not None
+    assert running.active_run.run_id == accepted.opened_run_id
+    assert running.active_run.authority_event_id == accepted.event_id
+    assert running.pending_input_ids == ()
+    assert running.pending_inputs_truncated is False
+    assert running.started_attempts == ()
+    assert running.open_incident is None
+    with pytest.raises(FrozenInstanceError):
+        running.active_run.run_id = "changed"
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE task_fence_execution_runs SET close_reason = 'forged' "
+            "WHERE run_id = ?",
+            (accepted.opened_run_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    read_only = SessionDB(path, read_only=True)
+    try:
+        malformed_open_run = read_only.inspect_task_fence_conversation(
+            conversation_id
+        )
+    finally:
+        read_only.close()
+    assert malformed_open_run.compatible is False
+    assert malformed_open_run.reason == "incompatible_active_run_projection"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE task_fence_execution_runs SET close_reason = NULL "
+            "WHERE run_id = ?",
+            (accepted.opened_run_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = SessionDB(path)
+    held = db.accept_task_fence_ingress(
+        ingress(
+            "comment_hold",
+            "inspection-held",
+            task_id=accepted.task_id,
+        )
+    )
+    db.close()
+
+    read_only = SessionDB(path, read_only=True)
+    try:
+        paused = read_only.inspect_task_fence_conversation(conversation_id)
+    finally:
+        read_only.close()
+
+    assert paused.compatible is True
+    assert paused.reason == "cohort_not_materialized"
+    assert paused.task is not None
+    assert paused.task.status == "paused"
+    assert paused.active_run is None
+    assert paused.pending_input_ids == (accepted.event_id, held.event_id)
+    assert paused.pending_inputs_truncated is False
+    assert conversation_id not in repr(running)
+    assert conversation_id not in repr(paused)
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE task_fence_tasks SET status = 'running' WHERE task_id = ?",
+            (accepted.task_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    read_only = SessionDB(path, read_only=True)
+    try:
+        malformed_run = read_only.inspect_task_fence_conversation(
+            conversation_id
+        )
+    finally:
+        read_only.close()
+    assert malformed_run.compatible is False
+    assert malformed_run.reason == "incompatible_active_run_projection"
+    assert malformed_run.task is None
+    assert malformed_run.active_run is None
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE task_fence_tasks SET status = 'paused' WHERE task_id = ?",
+            (accepted.task_id,),
+        )
+        conn.execute(
+            "UPDATE task_fence_task_inputs SET bound_run_id = ? "
+            "WHERE event_id = ?",
+            (accepted.opened_run_id, held.event_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    read_only = SessionDB(path, read_only=True)
+    try:
+        malformed_pending = read_only.inspect_task_fence_conversation(
+            conversation_id
+        )
+    finally:
+        read_only.close()
+    assert malformed_pending.compatible is False
+    assert malformed_pending.reason == "incompatible_pending_input_projection"
+    assert malformed_pending.task is None
+    assert malformed_pending.pending_input_ids == ()
+
+
+def test_conversation_frontier_inspection_uses_one_snapshot(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    conversation_id = "conversation-frontier-snapshot"
+
+    def ingress(action, source_event_id, *, task_id=None):
+        return IngressEnvelope(
+            source="gateway:test:inspection-snapshot",
+            source_event_id=source_event_id,
+            conversation_id=conversation_id,
+            action=TASK_FENCE_ACTIONS[action],
+            payload_hash=hashlib.sha256(
+                source_event_id.encode("utf-8")
+            ).hexdigest(),
+            task_id=task_id,
+        )
+
+    db = SessionDB(path)
+    accepted = db.accept_task_fence_ingress(
+        ingress("initial_submit", "snapshot-initial")
+    )
+    db.close()
+
+    reader = SessionDB(path, read_only=True)
+    store_read = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    held_results = []
+    original_inspect = reader._inspect_task_fence_store_unlocked
+
+    def pause_after_store(*, include_counts):
+        inspected = original_inspect(include_counts=include_counts)
+        store_read.set()
+        if not writer_done.wait(timeout=5):
+            raise RuntimeError("concurrent frontier update timed out")
+        return inspected
+
+    def update_frontier():
+        try:
+            if not store_read.wait(timeout=5):
+                raise RuntimeError("inspection did not establish its snapshot")
+            writer = SessionDB(path)
+            try:
+                held_results.append(
+                    writer.accept_task_fence_ingress(
+                        ingress(
+                            "comment_hold",
+                            "snapshot-held",
+                            task_id=accepted.task_id,
+                        )
+                    )
+                )
+            finally:
+                writer.close()
+        except Exception as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    monkeypatch.setattr(
+        reader,
+        "_inspect_task_fence_store_unlocked",
+        pause_after_store,
+    )
+    writer_thread = threading.Thread(target=update_frontier)
+    writer_thread.start()
+    try:
+        before = reader.inspect_task_fence_conversation(conversation_id)
+        writer_thread.join(timeout=5)
+        after = reader.inspect_task_fence_conversation(conversation_id)
+    finally:
+        reader.close()
+
+    assert writer_thread.is_alive() is False
+    assert writer_errors == []
+    assert len(held_results) == 1
+    assert before.compatible is True
+    assert before.active_run is not None
+    assert before.active_run.run_id == accepted.opened_run_id
+    assert before.pending_input_ids == ()
+    assert after.compatible is True
+    assert after.active_run is None
+    assert after.pending_input_ids == (
+        accepted.event_id,
+        held_results[0].event_id,
+    )
 
 
 def test_conversation_inspection_rejects_non_audit_implicit_cohort(tmp_path):

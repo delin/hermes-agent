@@ -193,8 +193,16 @@ def test_real_policy_lane_conversation_inspection_is_read_only(tmp_path):
     path = tmp_path / "state.db"
     db, acceptance, envelope, operation = _live_lane(path)
     try:
-        admitted = TaskFencePolicy(db).admit_operation(envelope, operation)
+        policy = TaskFencePolicy(db)
+        admitted = policy.admit_operation(envelope, operation)
         assert admitted.outcome is DecisionOutcome.WOULD_RESERVE
+        started = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+        assert started.outcome is DecisionOutcome.WOULD_ALLOW
+        assert started.attempt_id is not None
     finally:
         db.close()
 
@@ -223,6 +231,16 @@ def test_real_policy_lane_conversation_inspection_is_read_only(tmp_path):
     assert inspection.task.status == "running"
     assert inspection.task.intent_epoch == 1
     assert inspection.task.control_revision == 1
+    assert inspection.active_run is not None
+    assert inspection.active_run.run_id == acceptance.opened_run_id
+    assert inspection.active_run.authority_event_id == acceptance.event_id
+    assert inspection.pending_input_ids == ()
+    assert inspection.pending_inputs_truncated is False
+    assert len(inspection.started_attempts) == 1
+    assert inspection.started_attempts[0].attempt_id == started.attempt_id
+    assert inspection.started_attempts[0].run_id == acceptance.opened_run_id
+    assert inspection.started_attempts_truncated is False
+    assert inspection.open_incident is None
     assert inspection.cohort is not None
     assert inspection.cohort.binding == "implicit"
     assert len(inspection.cohort.cohort_fingerprint) == 64
@@ -236,6 +254,12 @@ def test_real_policy_lane_conversation_inspection_is_read_only(tmp_path):
     assert unknown.reason == "no_active_task"
     assert unknown.task is None
     assert unknown.cohort is None
+    assert unknown.active_run is None
+    assert unknown.pending_input_ids == ()
+    assert unknown.pending_inputs_truncated is False
+    assert unknown.started_attempts == ()
+    assert unknown.started_attempts_truncated is False
+    assert unknown.open_incident is None
     assert path.read_bytes() == before_bytes
     assert (
         after_stat.st_dev,
@@ -248,6 +272,108 @@ def test_real_policy_lane_conversation_inspection_is_read_only(tmp_path):
         before_stat.st_size,
         before_stat.st_mtime_ns,
     )
+
+
+def test_conversation_inspection_bounds_pending_and_started_frontiers(
+    tmp_path,
+    monkeypatch,
+):
+    db, acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    started_ids = []
+    pending_ids = []
+    try:
+        for index in range(hermes_state._TASK_FENCE_MAX_INSPECTION_ITEMS + 1):
+            invocation_id = f"tfiv-inspection-bound-{index}"
+            invocation = envelope.for_invocation(invocation_id)
+            bounded_operation = replace(
+                operation,
+                invocation_id=invocation_id,
+                invocation_fingerprint=_hash(invocation_id),
+            )
+            admitted = policy.admit_operation(invocation, bounded_operation)
+            started = policy.authorize_and_start(
+                invocation,
+                bounded_operation,
+                admitted.permit_id,
+            )
+            assert started.attempt_id is not None
+            started_ids.append(started.attempt_id)
+
+        inspection_work_limit = hermes_state._TASK_FENCE_MAX_INSPECTION_WORK
+        monkeypatch.setattr(
+            hermes_state,
+            "_TASK_FENCE_MAX_INSPECTION_WORK",
+            hermes_state._TASK_FENCE_MAX_INSPECTION_ITEMS,
+        )
+        started_work_limited = db.inspect_task_fence_conversation(
+            "policy-conversation"
+        )
+        monkeypatch.setattr(
+            hermes_state,
+            "_TASK_FENCE_MAX_INSPECTION_WORK",
+            inspection_work_limit,
+        )
+        for index in range(hermes_state._TASK_FENCE_MAX_INSPECTION_ITEMS + 1):
+            held = db.accept_task_fence_ingress(
+                _ingress(
+                    "comment_hold",
+                    f"inspection-pending-secret-{index}",
+                    task_id=acceptance.task_id,
+                )
+            )
+            pending_ids.append(held.event_id)
+
+        expected_started = tuple(
+            row[0]
+            for row in db._conn.execute(
+                "SELECT attempt.attempt_id "
+                "FROM task_fence_attempts AS attempt "
+                "JOIN task_fence_dispatch_permits AS permit "
+                "ON permit.permit_id = attempt.permit_id "
+                "WHERE attempt.state = 'STARTED' AND permit.task_id = ? "
+                "ORDER BY attempt.started_at, attempt.attempt_id LIMIT ?",
+                (
+                    acceptance.task_id,
+                    hermes_state._TASK_FENCE_MAX_INSPECTION_ITEMS,
+                ),
+            )
+        )
+        inspected = db.inspect_task_fence_conversation("policy-conversation")
+        monkeypatch.setattr(
+            hermes_state,
+            "_TASK_FENCE_MAX_INSPECTION_WORK",
+            hermes_state._TASK_FENCE_MAX_INSPECTION_ITEMS,
+        )
+        pending_work_limited = db.inspect_task_fence_conversation(
+            "policy-conversation"
+        )
+    finally:
+        db.close()
+
+    assert inspected.compatible is True
+    assert inspected.task is not None
+    assert inspected.task.status == "paused"
+    assert inspected.active_run is None
+    assert inspected.pending_input_ids == tuple(
+        pending_ids[: hermes_state._TASK_FENCE_MAX_INSPECTION_ITEMS]
+    )
+    assert inspected.pending_inputs_truncated is True
+    assert tuple(
+        attempt.attempt_id for attempt in inspected.started_attempts
+    ) == expected_started
+    assert len(set(started_ids)) == len(started_ids)
+    assert inspected.started_attempts_truncated is True
+    assert inspected.open_incident is None
+    assert "inspection-pending-secret" not in repr(inspected)
+    assert started_work_limited.compatible is False
+    assert started_work_limited.reason == "started_attempt_work_limit_exceeded"
+    assert started_work_limited.task is None
+    assert started_work_limited.started_attempts == ()
+    assert pending_work_limited.compatible is False
+    assert pending_work_limited.reason == "pending_input_limit_exceeded"
+    assert pending_work_limited.task is None
+    assert pending_work_limited.pending_input_ids == ()
 
 
 def test_admission_reserves_without_consuming_then_authorization_starts(tmp_path):
@@ -1285,6 +1411,20 @@ def test_authorization_first_preserves_started_attempt_then_blocks_old_run(
             "SELECT state FROM task_fence_dispatch_permits WHERE permit_id = ?",
             (admitted.permit_id,),
         ).fetchone()[0] == "consumed"
+        frontier = dispatch_db.inspect_task_fence_conversation(
+            "policy-conversation"
+        )
+        assert frontier.compatible is True
+        assert frontier.task is not None
+        assert frontier.task.status == "paused"
+        assert frontier.active_run is None
+        assert frontier.pending_input_ids == (held.event_id,)
+        assert frontier.pending_inputs_truncated is False
+        assert len(frontier.started_attempts) == 1
+        assert frontier.started_attempts[0].attempt_id == started.attempt_id
+        assert frontier.started_attempts[0].run_id == acceptance.opened_run_id
+        assert frontier.started_attempts_truncated is False
+        assert frontier.open_incident is None
 
         later = TaskFencePolicy(dispatch_db).admit_operation(
             envelope.for_invocation("tfiv_old_retry"),
