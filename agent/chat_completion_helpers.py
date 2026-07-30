@@ -228,6 +228,7 @@ def _create_openai_chat_completion(
     api_kwargs: dict,
     *,
     task_fence_model_policy=None,
+    task_fence_attempt_holder=None,
 ):
     """Call one exact OpenAI-compatible or prepared-MoA handoff."""
 
@@ -261,7 +262,9 @@ def _create_openai_chat_completion(
         request=api_kwargs,
         route=route,
         policy=task_fence_model_policy,
-    ):
+    ) as attempt_id:
+        if type(task_fence_attempt_holder) is dict:
+            task_fence_attempt_holder["attempt_id"] = attempt_id
         return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -597,6 +600,7 @@ def _dispatch_nonstreaming_api_request(
     *,
     make_client,
     task_fence_model_policy=None,
+    task_fence_attempt_holder=None,
 ):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -691,6 +695,7 @@ def _dispatch_nonstreaming_api_request(
         request_client,
         api_kwargs,
         task_fence_model_policy=task_fence_model_policy,
+        task_fence_attempt_holder=task_fence_attempt_holder,
     )
 
 
@@ -738,7 +743,13 @@ def should_use_direct_api_call(agent) -> bool:
     return getattr(agent, "platform", None) == "subagent"
 
 
-def direct_api_call(agent, api_kwargs: dict, *, task_fence_model_policy=None):
+def direct_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    task_fence_model_policy=None,
+    task_fence_attempt_holder=None,
+):
     """Run a non-streaming LLM call inline on the conversation thread.
 
     Used when ``should_use_direct_api_call`` is True (cron turns and
@@ -778,6 +789,7 @@ def direct_api_call(agent, api_kwargs: dict, *, task_fence_model_policy=None):
             api_kwargs,
             make_client=_make_client,
             task_fence_model_policy=task_fence_model_policy,
+            task_fence_attempt_holder=task_fence_attempt_holder,
         )
     except Exception:
         if getattr(agent, "_interrupt_requested", False):
@@ -817,15 +829,35 @@ def interruptible_api_call(
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    task_fence_attempt_holder = None
+    if (
+        task_fence_model_policy is not None
+        and _is_task_fence_openai_chat_wire(agent)
+        and api_kwargs.get("stream", False) is False
+    ):
+        task_fence_attempt_holder = {"attempt_id": None}
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(
+        response = direct_api_call(
             agent,
             api_kwargs,
             task_fence_model_policy=task_fence_model_policy,
+            task_fence_attempt_holder=task_fence_attempt_holder,
         )
+        if task_fence_attempt_holder is not None:
+            from agent.task_fence_provider import (
+                _finish_task_fence_openai_chat_completion,
+            )
+
+            _finish_task_fence_openai_chat_completion(
+                policy=task_fence_model_policy,
+                attempt_holder=task_fence_attempt_holder,
+                response=response,
+            )
+        return response
 
     result = {"response": None, "error": None}
 
@@ -918,6 +950,7 @@ def interruptible_api_call(
                     kind=kind,
                 ),
                 task_fence_model_policy=task_fence_model_policy,
+                task_fence_attempt_holder=task_fence_attempt_holder,
             )
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
@@ -1282,6 +1315,16 @@ def interruptible_api_call(
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+    if task_fence_attempt_holder is not None:
+        from agent.task_fence_provider import (
+            _finish_task_fence_openai_chat_completion,
+        )
+
+        _finish_task_fence_openai_chat_completion(
+            policy=task_fence_model_policy,
+            attempt_holder=task_fence_attempt_holder,
+            response=result["response"],
+        )
     return result["response"]
 
 

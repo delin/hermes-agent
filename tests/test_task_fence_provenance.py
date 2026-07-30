@@ -39,6 +39,13 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _openai_response_evidence(response_id: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"task-fence-openai-chat-completion-response-id-v1\0")
+    digest.update(response_id.encode("utf-8"))
+    return "openai:chat_completions:response:v1:sha256:" + digest.hexdigest()
+
+
 def _task_fence_relational_snapshot(db: SessionDB) -> tuple:
     tables = tuple(
         row[0]
@@ -128,11 +135,15 @@ def _tool_call(
     )
 
 
+_MISSING_RESPONSE_ID = object()
+
+
 def _model_response(
     *,
     content: str | None,
     tool_calls: list[SimpleNamespace] | None,
     finish_reason: str,
+    response_id: object = _MISSING_RESPONSE_ID,
 ) -> SimpleNamespace:
     message = SimpleNamespace(
         content=content,
@@ -141,7 +152,14 @@ def _model_response(
         tool_calls=tool_calls,
     )
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+    response = SimpleNamespace(
+        choices=[choice],
+        model="test/model",
+        usage=None,
+    )
+    if response_id is not _MISSING_RESPONSE_ID:
+        response.id = response_id
+    return response
 
 
 def _stream_chunk(
@@ -149,6 +167,7 @@ def _stream_chunk(
     content: str | None,
     finish_reason: str | None,
     model: str = "test/model",
+    response_id: object = _MISSING_RESPONSE_ID,
 ) -> SimpleNamespace:
     delta = SimpleNamespace(
         content=content,
@@ -161,7 +180,14 @@ def _stream_chunk(
         delta=delta,
         finish_reason=finish_reason,
     )
-    return SimpleNamespace(choices=[choice], model=model, usage=None)
+    chunk = SimpleNamespace(
+        choices=[choice],
+        model=model,
+        usage=None,
+    )
+    if response_id is not _MISSING_RESPONSE_ID:
+        chunk.id = response_id
+    return chunk
 
 
 def test_causal_envelope_is_frozen_canonical_and_context_scoped():
@@ -918,6 +944,48 @@ def _prepare_real_conversation(
         return next(response_iter)
 
     agent.client.chat.completions.create.side_effect = _create
+
+
+def _run_real_openai_nonstream(
+    agent,
+    generation,
+    policy,
+    create,
+    *,
+    platform="cli",
+    messages=(),
+    close_client=None,
+):
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        )
+    )
+    agent.platform = platform
+    if close_client is None:
+        def close_client(_client, *, reason):
+            return None
+    with (
+        patch.object(
+            agent,
+            "_create_request_openai_client",
+            return_value=client,
+        ),
+        patch.object(
+            agent,
+            "_close_request_openai_client",
+            side_effect=close_client,
+        ),
+        bind_causal_envelope(generation),
+    ):
+        return agent._interruptible_api_call(
+            {
+                "model": "test/model",
+                "messages": list(messages),
+                "stream": False,
+            },
+            _task_fence_model_policy=policy,
+        )
 
 
 def _prepare_bedrock_conversation(agent, *, streaming: bool) -> None:
@@ -1957,6 +2025,405 @@ def test_persistent_moa_fallback_starts_fresh_child(
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("platform", "newer_ingress"),
+    (("cli", True), ("cron", False)),
+    ids=("worker", "direct"),
+)
+def test_real_openai_nonstream_success_finishes_after_client_close(
+    provenance_agent,
+    tmp_path,
+    platform,
+    newer_ingress,
+):
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", f"event-openai-{platform}-success")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    policy = TaskFencePolicy(db)
+    response_id = f"raw-openai-{platform}-response-id-must-not-be-durable"
+    request_secret = f"raw-openai-{platform}-prompt-must-not-be-durable"
+    response = _model_response(
+        content="exact response",
+        tool_calls=None,
+        finish_reason="stop",
+        response_id=response_id,
+    )
+    caller_thread = threading.get_ident()
+    events = []
+
+    def create(**_kwargs):
+        attempt_state = db._conn.execute(
+            "SELECT state FROM task_fence_attempts"
+        ).fetchone()[0]
+        events.append(("sdk", threading.get_ident(), attempt_state))
+        if newer_ingress:
+            db.accept_task_fence_ingress(
+                _ingress(
+                    "comment_hold",
+                    "event-openai-worker-newer-input",
+                    task_id=acceptance.task_id,
+                )
+            )
+        return response
+
+    def close_client(_client, *, reason):
+        events.append(("close", threading.get_ident(), reason))
+
+    original_finish = policy.finish_attempt
+
+    def finish_attempt(*args, **kwargs):
+        events.append(("finish", threading.get_ident(), None))
+        return original_finish(*args, **kwargs)
+
+    try:
+        with patch.object(
+            policy,
+            "finish_attempt",
+            side_effect=finish_attempt,
+        ):
+            result = _run_real_openai_nonstream(
+                provenance_agent,
+                generation,
+                policy,
+                create,
+                platform=platform,
+                messages=[{"role": "user", "content": request_secret}],
+                close_client=close_client,
+            )
+
+        assert result is response
+        assert [event[0] for event in events] == ["sdk", "close", "finish"]
+        assert events[0][2] == "STARTED"
+        assert events[1][2] == "request_complete"
+        if platform == "cli":
+            assert events[0][1] == events[1][1] != caller_thread
+            assert events[2][1] == caller_thread
+        else:
+            assert {event[1] for event in events} == {caller_thread}
+        attempt = db._conn.execute(
+            "SELECT attempt_id, state, acknowledgement_ref, "
+            "terminal_at IS NOT NULL "
+            "FROM task_fence_attempts"
+        ).fetchone()
+        evidence = _openai_response_evidence(response_id)
+        assert tuple(attempt[1:]) == (
+            "SUCCEEDED",
+            evidence,
+            1,
+        )
+        transitions = [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref "
+                "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                "ORDER BY transition_order",
+                (attempt["attempt_id"],),
+            )
+        ]
+        assert len(transitions) == 2
+        assert transitions[0][:3] == (None, "STARTED", "would_allow")
+        assert transitions[1] == (
+            "STARTED",
+            "SUCCEEDED",
+            "SUCCEEDED",
+            evidence,
+        )
+        if newer_ingress:
+            task = db.inspect_task_fence_task(acceptance.task_id).task
+            assert task is not None
+            assert task.current_generation_id is None
+        durable_dump = repr(_task_fence_relational_snapshot(db))
+        assert request_secret not in durable_dump
+        assert response_id not in durable_dump
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "response_id",
+    (_MISSING_RESPONSE_ID, "   ", True),
+    ids=("missing", "blank", "non-string"),
+)
+def test_real_openai_nonstream_invalid_acknowledgement_stays_started(
+    provenance_agent,
+    tmp_path,
+    response_id,
+):
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", f"event-openai-invalid-{response_id!r}")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    policy = TaskFencePolicy(db)
+    response = _model_response(
+        content="legacy invalid acknowledgement response",
+        tool_calls=None,
+        finish_reason="stop",
+        response_id=response_id,
+    )
+    try:
+        result = _run_real_openai_nonstream(
+            provenance_agent,
+            generation,
+            policy,
+            lambda **_kwargs: response,
+        )
+
+        assert result is response
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts"
+            ).fetchone()
+        ) == ("STARTED", None, None)
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempt_transitions"
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_real_openai_nonstream_terminal_fault_is_secret_free_and_fail_open(
+    provenance_agent,
+    tmp_path,
+    caplog,
+):
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-openai-terminal-fault")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    policy = TaskFencePolicy(db)
+    request_secret = "raw-openai-terminal-fault-prompt"
+    response_id = "raw-openai-terminal-fault-response-id"
+    response_secret = "raw-openai-terminal-fault-response-content"
+    sqlite_secret = "raw-openai-terminal-sqlite-fault"
+    response = _model_response(
+        content=response_secret,
+        tool_calls=None,
+        finish_reason="stop",
+        response_id=response_id,
+    )
+    events = []
+
+    def create(**_kwargs):
+        events.append("sdk")
+        return response
+
+    def close_client(_client, *, reason):
+        assert reason == "request_complete"
+        events.append("close")
+
+    original_finish = policy.finish_attempt
+
+    def finish_attempt(*args, **kwargs):
+        events.append("finish")
+        return original_finish(*args, **kwargs)
+
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_openai_terminal_transition "
+        "BEFORE INSERT ON task_fence_attempt_transitions "
+        "WHEN NEW.from_state = 'STARTED' BEGIN "
+        f"SELECT RAISE(ABORT, '{sqlite_secret}'); END"
+    )
+    try:
+        caplog.set_level("WARNING", logger="agent.task_fence_provider")
+        with patch.object(
+            policy,
+            "finish_attempt",
+            side_effect=finish_attempt,
+        ):
+            result = _run_real_openai_nonstream(
+                provenance_agent,
+                generation,
+                policy,
+                create,
+                messages=[{"role": "user", "content": request_secret}],
+                close_client=close_client,
+            )
+
+        assert result is response
+        assert events == ["sdk", "close", "finish"]
+        assert tuple(
+            db._conn.execute(
+                "SELECT state, acknowledgement_ref, terminal_at "
+                "FROM task_fence_attempts"
+            ).fetchone()
+        ) == ("STARTED", None, None)
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempt_transitions"
+        ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_cohorts WHERE audit_degraded = 1"
+        ).fetchone()[0] == 1
+        assert "TaskFencePolicyUnavailable" in caplog.text
+        durable_dump = repr(_task_fence_relational_snapshot(db))
+        for secret in (
+            request_secret,
+            response_id,
+            response_secret,
+            sqlite_secret,
+        ):
+            assert secret not in caplog.text
+            assert secret not in durable_dump
+    finally:
+        db.close()
+
+
+def test_recovery_first_rejects_late_openai_nonstream_success(
+    provenance_agent,
+    tmp_path,
+    caplog,
+):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-openai-recovery-first")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    policy = TaskFencePolicy(db)
+    entered = threading.Event()
+    release = threading.Event()
+    request_secret = "raw-openai-recovery-first-prompt"
+    response_id = "raw-openai-recovery-first-response-id"
+    response_secret = "raw-openai-recovery-first-response-content"
+    response = _model_response(
+        content=response_secret,
+        tool_calls=None,
+        finish_reason="stop",
+        response_id=response_id,
+    )
+    events = []
+    results = []
+    errors = []
+    reopened = None
+
+    def create(**_kwargs):
+        events.append(("sdk_enter", threading.get_ident()))
+        entered.set()
+        assert release.wait(timeout=10.0)
+        events.append(("sdk_return", threading.get_ident()))
+        return response
+
+    def close_client(_client, *, reason):
+        assert reason == "request_complete"
+        events.append(("close", threading.get_ident()))
+
+    original_finish = policy.finish_attempt
+
+    def finish_attempt(*args, **kwargs):
+        events.append(("finish", threading.get_ident()))
+        return original_finish(*args, **kwargs)
+
+    def run_call():
+        try:
+            results.append(
+                _run_real_openai_nonstream(
+                    provenance_agent,
+                    generation,
+                    policy,
+                    create,
+                    messages=[{"role": "user", "content": request_secret}],
+                    close_client=close_client,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_call)
+    try:
+        caplog.set_level("WARNING", logger="agent.task_fence_provider")
+        with patch.object(
+            policy,
+            "finish_attempt",
+            side_effect=finish_attempt,
+        ):
+            runner.start()
+            assert entered.wait(timeout=10.0)
+            attempt = db._conn.execute(
+                "SELECT attempt_id, state FROM task_fence_attempts"
+            ).fetchone()
+            assert tuple(attempt) == (attempt["attempt_id"], "STARTED")
+
+            reopened = SessionDB(path)
+            inspection = reopened.inspect_task_fence_store()
+            recovery = reopened.recover_task_fence_state(
+                expected_runtime_epoch=inspection.runtime_epoch,
+                expected_mode_generation=inspection.mode_generation,
+            )
+            assert recovery.runtime_epoch == generation.runtime_epoch + 1
+            recovered_attempt = tuple(
+                reopened._conn.execute(
+                    "SELECT state, disposition, recovery_classification, "
+                    "acknowledgement_ref, terminal_at IS NOT NULL "
+                    "FROM task_fence_attempts WHERE attempt_id = ?",
+                    (attempt["attempt_id"],),
+                ).fetchone()
+            )
+            assert recovered_attempt == (
+                "OUTCOME_UNKNOWN",
+                "OUTCOME_UNKNOWN",
+                "may_effect",
+                None,
+                1,
+            )
+            assert [
+                row["to_state"]
+                for row in reopened._conn.execute(
+                    "SELECT to_state "
+                    "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                    "ORDER BY transition_order",
+                    (attempt["attempt_id"],),
+                )
+            ] == [
+                "STARTED",
+                "OUTCOME_UNKNOWN",
+            ]
+            incident = reopened._conn.execute(
+                "SELECT incident_id, reason_code, state "
+                "FROM task_fence_incidents WHERE task_id = ?",
+                (acceptance.task_id,),
+            ).fetchone()
+            assert tuple(incident[1:]) == ("outcome_unknown", "open")
+            assert tuple(
+                reopened._conn.execute(
+                    "SELECT incident_id, attempt_id "
+                    "FROM task_fence_incident_attempts"
+                ).fetchone()
+            ) == (incident["incident_id"], attempt["attempt_id"])
+            recovered_snapshot = _task_fence_relational_snapshot(reopened)
+
+            release.set()
+            runner.join(timeout=10.0)
+
+        assert not runner.is_alive()
+        assert errors == []
+        assert len(results) == 1
+        assert results[0] is response
+        assert [event[0] for event in events] == [
+            "sdk_enter",
+            "sdk_return",
+            "close",
+            "finish",
+        ]
+        assert events[1][1] == events[2][1]
+        assert events[2][1] != events[3][1]
+        assert _task_fence_relational_snapshot(reopened) == recovered_snapshot
+        assert "TaskFencePolicyRejected" in caplog.text
+        durable_dump = repr(_task_fence_relational_snapshot(reopened))
+        for secret in (request_secret, response_id, response_secret):
+            assert secret not in caplog.text
+            assert secret not in durable_dump
+    finally:
+        release.set()
+        runner.join(timeout=10.0)
+        if reopened is not None:
+            reopened.close()
+        db.close()
+
+
 def test_real_conversation_records_generation_and_binds_emitted_tool(
     provenance_agent,
     registered_probe_tools,
@@ -2318,6 +2785,7 @@ def test_real_openai_stream_worker_keeps_policy_out_of_sdk_lifecycle(
                         _stream_chunk(
                             content="isolated stream",
                             finish_reason="stop",
+                            response_id="stream-response-id-is-not-an-ack",
                         )
                     ]
                 )
@@ -2424,6 +2892,9 @@ def test_real_openai_stream_worker_keeps_policy_out_of_sdk_lifecycle(
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 1
+        assert db._conn.execute(
+            "SELECT state FROM task_fence_attempts"
+        ).fetchone()[0] == "STARTED"
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_dispatch_permits"
         ).fetchone()[0] == 1
@@ -3127,11 +3598,13 @@ def test_real_iteration_summary_empty_retry_owns_fresh_generations(
                     content="",
                     tool_calls=None,
                     finish_reason="stop",
+                    response_id="summary-empty-response-id-is-not-an-ack",
                 ),
                 _model_response(
                     content="summary after empty retry",
                     tool_calls=None,
                     finish_reason="stop",
+                    response_id="summary-response-id-is-not-an-ack",
                 ),
             ],
             provider_observed=provider_observed,
@@ -3255,6 +3728,10 @@ def test_real_iteration_summary_empty_retry_owns_fresh_generations(
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 4
+        assert {
+            row["state"]
+            for row in db._conn.execute("SELECT state FROM task_fence_attempts")
+        } == {"STARTED"}
 
         audit_dump = repr(
             [
@@ -3269,6 +3746,8 @@ def test_real_iteration_summary_empty_retry_owns_fresh_generations(
         )
         assert request_secret not in audit_dump
         assert api_key_secret not in audit_dump
+        assert "summary-empty-response-id-is-not-an-ack" not in audit_dump
+        assert "summary-response-id-is-not-an-ack" not in audit_dump
         assert current_causal_envelope() is None
         assert current_task_fence_policy() is None
     finally:
@@ -4859,6 +5338,7 @@ def test_invalid_provider_response_fails_generation_before_retry(
             provider_states.append(tuple(row))
 
         invalid = SimpleNamespace(
+            id="response-id-without-choices",
             choices=[],
             model="test/model",
             usage=None,
@@ -4871,6 +5351,7 @@ def test_invalid_provider_response_fails_generation_before_retry(
                     content="retry succeeded",
                     tool_calls=None,
                     finish_reason="stop",
+                    response_id="valid-retry-response-id",
                 ),
             ],
             provider_observed=provider_observed,
@@ -4908,6 +5389,19 @@ def test_invalid_provider_response_fails_generation_before_retry(
         task = db.inspect_task_fence_task(acceptance.task_id).task
         assert task is not None
         assert task.current_generation_id == rows[1]["generation_id"]
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT state, acknowledgement_ref FROM task_fence_attempts "
+                "ORDER BY started_at, attempt_id"
+            )
+        ] == [
+            ("STARTED", None),
+            (
+                "SUCCEEDED",
+                _openai_response_evidence("valid-retry-response-id"),
+            ),
+        ]
     finally:
         db.close()
 
@@ -4933,6 +5427,7 @@ def test_provider_exception_records_one_failure_without_missing_provenance_warni
                     content="retry succeeded",
                     tool_calls=None,
                     finish_reason="stop",
+                    response_id="valid-after-exception-response-id",
                 ),
             ]
         )
@@ -4973,6 +5468,19 @@ def test_provider_exception_records_one_failure_without_missing_provenance_warni
         assert rows[0]["closed_at"] is not None
         assert rows[1]["state"] == "committed"
         assert rows[1]["closed_at"] is None
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT state, acknowledgement_ref FROM task_fence_attempts "
+                "ORDER BY started_at, attempt_id"
+            )
+        ] == [
+            ("STARTED", None),
+            (
+                "SUCCEEDED",
+                _openai_response_evidence("valid-after-exception-response-id"),
+            ),
+        ]
         assert not any(
             "Task Fence shadow provenance missing" in record.getMessage()
             for record in caplog.records

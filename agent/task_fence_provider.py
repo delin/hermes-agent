@@ -119,7 +119,7 @@ def _audit_model_start(
     route: Mapping[str, Any],
     policy: Any,
     envelope: Any | None,
-) -> None:
+) -> str | None:
     from task_fence import DecisionOutcome, OperationDescriptor, OperationKind
 
     invocation_id = (
@@ -142,11 +142,13 @@ def _audit_model_start(
         admitted.outcome is DecisionOutcome.WOULD_RESERVE
         and admitted.permit_id is not None
     ):
-        policy.authorize_and_start(
+        started = policy.authorize_and_start(
             envelope,
             operation,
             admitted.permit_id,
         )
+        return started.attempt_id
+    return None
 
 
 @contextmanager
@@ -156,7 +158,7 @@ def task_fence_model_handoff(
     request: Mapping[str, Any],
     route: Mapping[str, Any],
     policy: Any | None,
-) -> Iterator[None]:
+) -> Iterator[str | None]:
     """Observe one physical provider handoff without gating legacy dispatch."""
 
     from task_fence import (
@@ -175,17 +177,18 @@ def task_fence_model_handoff(
             type(exc).__name__,
         )
         with _without_task_fence_model_authority():
-            yield
+            yield None
         return
 
     if policy is None:
         with _without_task_fence_model_authority():
-            yield
+            yield None
         return
 
     with bind_causal_envelope(envelope):
+        attempt_id = None
         try:
-            _audit_model_start(
+            attempt_id = _audit_model_start(
                 adapter=adapter,
                 request=request,
                 route=route,
@@ -202,7 +205,56 @@ def task_fence_model_handoff(
         # the immutable child envelope for causal diagnostics, but never lend
         # the live policy/store facade to code beyond the audit boundary.
         with _without_task_fence_model_authority():
-            yield
+            yield attempt_id
+
+
+def _finish_task_fence_openai_chat_completion(
+    *,
+    policy: Any | None,
+    attempt_holder: Any,
+    response: Any,
+) -> None:
+    """Record a bounded acknowledgement for one ordinary non-stream return."""
+
+    if policy is None or type(attempt_holder) is not dict:
+        return
+    attempt_id = attempt_holder.get("attempt_id")
+    if type(attempt_id) is not str or not attempt_id:
+        return
+
+    try:
+        choices = getattr(response, "choices", None)
+        if type(choices) is not list or not choices:
+            return
+        if getattr(response, "error", None):
+            return
+        response_id = getattr(response, "id", None)
+        if (
+            type(response_id) is not str
+            or len(response_id) > 512
+            or not response_id.strip()
+            or "\0" in response_id
+        ):
+            return
+        encoded_id = response_id.encode("utf-8")
+        if len(encoded_id) > 512:
+            return
+
+        from task_fence import AttemptTerminal
+
+        digest = hashlib.sha256()
+        digest.update(b"task-fence-openai-chat-completion-response-id-v1\0")
+        digest.update(encoded_id)
+        policy.finish_attempt(
+            attempt_id,
+            AttemptTerminal.SUCCEEDED,
+            "openai:chat_completions:response:v1:sha256:" + digest.hexdigest(),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow model terminal observation failed: %s",
+            type(exc).__name__,
+        )
 
 
 @contextmanager
