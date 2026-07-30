@@ -6167,13 +6167,19 @@ class SessionDB:
         *,
         expected_runtime_epoch: int,
         expected_mode_generation: int,
+        tested_artifact_identity: Optional[TaskFenceArtifactIdentity] = None,
     ) -> TaskFenceRecovery:
-        """Invalidate stale shadow authority in one explicit transaction."""
+        """Recover shadow state, optionally atomically pinning one artifact."""
 
         if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
             raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
         if type(expected_mode_generation) is not int or expected_mode_generation < 0:
             raise TaskFenceProtocolRejected("invalid_expected_mode_generation")
+        if tested_artifact_identity is not None and not isinstance(
+            tested_artifact_identity,
+            TaskFenceArtifactIdentity,
+        ):
+            raise TaskFenceProtocolRejected("invalid_artifact_identity")
         if self.read_only or self._conn is None:
             raise TaskFenceRecoveryUnavailable("store_unavailable")
 
@@ -6194,13 +6200,36 @@ class SessionDB:
                 raise TaskFenceRecoveryUnavailable("mode_generation_changed")
             if expected_runtime_epoch >= _TASK_FENCE_MAX_RUNTIME_EPOCH:
                 raise TaskFenceRecoveryUnavailable("runtime_epoch_exhausted")
-            if (
-                store.ever_enforced is not False
-                or store.tested_artifact_commit is not None
-                or store.tested_artifact_checksum is not None
-                or store.dependency_lock_fingerprint is not None
-            ):
-                raise TaskFenceRecoveryUnavailable("shadow_recovery_precondition")
+            if tested_artifact_identity is None:
+                if (
+                    store.ever_enforced is not False
+                    or store.tested_artifact_commit is not None
+                    or store.tested_artifact_checksum is not None
+                    or store.dependency_lock_fingerprint is not None
+                ):
+                    raise TaskFenceRecoveryUnavailable(
+                        "shadow_recovery_precondition"
+                    )
+            else:
+                if store.ever_enforced is not False:
+                    raise TaskFenceRecoveryUnavailable(
+                        "shadow_recovery_precondition"
+                    )
+                try:
+                    stored_identity = self._task_fence_artifact_identity_from_store(
+                        store
+                    )
+                except TaskFenceProtocolRejected:
+                    raise TaskFenceRecoveryUnavailable(
+                        "malformed_artifact_identity"
+                    ) from None
+                if (
+                    stored_identity is not None
+                    and stored_identity != tested_artifact_identity
+                ):
+                    raise TaskFenceRecoveryUnavailable(
+                        "artifact_identity_conflict"
+                    )
 
             authority_rows_remaining = _TASK_FENCE_MAX_RECOVERY_AUTHORITIES
 
@@ -7183,24 +7212,54 @@ class SessionDB:
                         "Task Fence recovery task authority changed"
                     )
 
-            updated_control = conn.execute(
-                "UPDATE main.task_fence_control SET runtime_epoch = ?, "
-                "updated_at = ? WHERE singleton = 1 "
-                "AND store_schema_version = ? "
-                "AND control_protocol_version = ? AND runtime_epoch = ? "
-                "AND mode_generation = ? AND ever_enforced = 0 "
-                "AND tested_artifact_commit IS NULL "
-                "AND tested_artifact_checksum IS NULL "
-                "AND dependency_lock_fingerprint IS NULL",
-                (
-                    next_runtime_epoch,
-                    now,
-                    TASK_FENCE_STORE_SCHEMA_VERSION,
-                    TASK_FENCE_CONTROL_PROTOCOL_VERSION,
-                    expected_runtime_epoch,
-                    expected_mode_generation,
-                ),
-            )
+            if tested_artifact_identity is None:
+                updated_control = conn.execute(
+                    "UPDATE main.task_fence_control SET runtime_epoch = ?, "
+                    "updated_at = ? WHERE singleton = 1 "
+                    "AND store_schema_version = ? "
+                    "AND control_protocol_version = ? AND runtime_epoch = ? "
+                    "AND mode_generation = ? AND ever_enforced = 0 "
+                    "AND tested_artifact_commit IS NULL "
+                    "AND tested_artifact_checksum IS NULL "
+                    "AND dependency_lock_fingerprint IS NULL",
+                    (
+                        next_runtime_epoch,
+                        now,
+                        TASK_FENCE_STORE_SCHEMA_VERSION,
+                        TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+                        expected_runtime_epoch,
+                        expected_mode_generation,
+                    ),
+                )
+            else:
+                updated_control = conn.execute(
+                    "UPDATE main.task_fence_control SET runtime_epoch = ?, "
+                    "tested_artifact_commit = ?, tested_artifact_checksum = ?, "
+                    "dependency_lock_fingerprint = ?, updated_at = ? "
+                    "WHERE singleton = 1 AND store_schema_version = ? "
+                    "AND control_protocol_version = ? AND runtime_epoch = ? "
+                    "AND mode_generation = ? AND ever_enforced = 0 "
+                    "AND ((tested_artifact_commit IS NULL "
+                    "AND tested_artifact_checksum IS NULL "
+                    "AND dependency_lock_fingerprint IS NULL) OR "
+                    "(tested_artifact_commit = ? "
+                    "AND tested_artifact_checksum = ? "
+                    "AND dependency_lock_fingerprint = ?))",
+                    (
+                        next_runtime_epoch,
+                        tested_artifact_identity.tested_artifact_commit,
+                        tested_artifact_identity.tested_artifact_checksum,
+                        tested_artifact_identity.dependency_lock_fingerprint,
+                        now,
+                        TASK_FENCE_STORE_SCHEMA_VERSION,
+                        TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+                        expected_runtime_epoch,
+                        expected_mode_generation,
+                        tested_artifact_identity.tested_artifact_commit,
+                        tested_artifact_identity.tested_artifact_checksum,
+                        tested_artifact_identity.dependency_lock_fingerprint,
+                    ),
+                )
             if updated_control.rowcount != 1:
                 raise sqlite3.IntegrityError(
                     "Task Fence recovery control authority changed"

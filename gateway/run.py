@@ -24725,7 +24725,73 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(config)
+    # Claim this profile before any consumer opens state.db. The selected
+    # Task Fence cohort performs its receipt-bound recovery under this claim,
+    # and GatewayRunner only opens consumer state after that commit.
+    import atexit
+    from gateway.status import write_pid_file
+    from gateway.task_fence_startup import (
+        TaskFenceStartupUnavailable,
+        prepare_task_fence_shadow_startup,
+    )
+
+    _current_pid = get_running_pid()
+    if _current_pid is not None and _current_pid != os.getpid():
+        logger.error(
+            "Another gateway instance (PID %d) started during our startup. "
+            "Exiting to avoid double-running.", _current_pid
+        )
+        return False
+    if not acquire_gateway_runtime_lock():
+        logger.error(
+            "Gateway runtime lock is already held by another instance. Exiting."
+        )
+        return False
+
+    def _release_startup_claim() -> None:
+        try:
+            remove_pid_file()
+        except Exception:
+            logger.debug("Could not remove failed-startup PID file", exc_info=True)
+        try:
+            release_gateway_runtime_lock()
+        except Exception:
+            logger.debug("Could not release failed-startup runtime lock", exc_info=True)
+
+    try:
+        write_pid_file()
+    except FileExistsError:
+        _release_startup_claim()
+        logger.error(
+            "PID file race lost to another gateway instance. Exiting."
+        )
+        return False
+    except BaseException:
+        _release_startup_claim()
+        raise
+    atexit.register(remove_pid_file)
+    atexit.register(release_gateway_runtime_lock)
+
+    try:
+        resolved_config = (
+            config if config is not None else load_gateway_config_for_runner()
+        )
+        recovery = prepare_task_fence_shadow_startup(resolved_config)
+        if recovery is not None:
+            logger.info(
+                "Task Fence shadow startup recovered runtime epoch %d -> %d",
+                recovery.previous_runtime_epoch,
+                recovery.runtime_epoch,
+            )
+        runner = GatewayRunner(resolved_config)
+    except TaskFenceStartupUnavailable as exc:
+        _release_startup_claim()
+        logger.error("Task Fence shadow startup refused: %s", exc.reason)
+        return False
+    except BaseException:
+        _release_startup_claim()
+        raise
+
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.
@@ -24886,37 +24952,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="planned-stop-watcher",
     )
     _planned_stop_watcher_thread.start()
-
-    # Claim the PID file BEFORE bringing up any platform adapters.
-    # This closes the --replace race window: two concurrent `gateway run
-    # --replace` invocations both pass the termination-wait above, but
-    # only the winner of the O_CREAT|O_EXCL race below will ever open
-    # Telegram polling, Discord gateway sockets, etc. The loser exits
-    # cleanly before touching any external service.
-    import atexit
-    from gateway.status import write_pid_file, remove_pid_file, get_running_pid
-    _current_pid = get_running_pid()
-    if _current_pid is not None and _current_pid != os.getpid():
-        logger.error(
-            "Another gateway instance (PID %d) started during our startup. "
-            "Exiting to avoid double-running.", _current_pid
-        )
-        return False
-    if not acquire_gateway_runtime_lock():
-        logger.error(
-            "Gateway runtime lock is already held by another instance. Exiting."
-        )
-        return False
-    try:
-        write_pid_file()
-    except FileExistsError:
-        release_gateway_runtime_lock()
-        logger.error(
-            "PID file race lost to another gateway instance. Exiting."
-        )
-        return False
-    atexit.register(remove_pid_file)
-    atexit.register(release_gateway_runtime_lock)
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
