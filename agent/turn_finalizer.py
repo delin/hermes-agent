@@ -84,6 +84,7 @@ def finalize_turn(
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
     _task_fence_acceptance=None,
+    _task_fence_final_generation=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -142,11 +143,20 @@ def finalize_turn(
         if _task_fence_acceptance is None:
             final_response = agent._handle_max_iterations(messages, api_call_count)
         else:
+            _task_fence_summary_generations = []
+            _task_fence_final_generation = None
             final_response = agent._handle_max_iterations(
                 messages,
                 api_call_count,
                 _task_fence_acceptance=_task_fence_acceptance,
+                _task_fence_generation_out=(
+                    _task_fence_summary_generations
+                ),
             )
+            if _task_fence_summary_generations:
+                _task_fence_final_generation = (
+                    _task_fence_summary_generations[-1]
+                )
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -613,6 +623,14 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _task_fence_acceptance is not None:
+        from task_fence import TASK_FENCE_FINAL_GENERATION_KEY
+
+        result[TASK_FENCE_FINAL_GENERATION_KEY] = (
+            _task_fence_final_generation
+            if final_response and not interrupted and not failed
+            else None
+        )
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

@@ -20,7 +20,9 @@ from task_fence import (
     DecisionReason,
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
+    TASK_FENCE_FINAL_GENERATION_KEY,
     TASK_FENCE_STORE_SCHEMA_VERSION,
+    TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
     TaskFencePolicy,
     TaskFenceProtocolRejected,
@@ -3151,6 +3153,11 @@ def test_real_iteration_summary_empty_retry_owns_fresh_generations(
         assert all(item.invocation_id is not None for item in provider_observed)
         assert len({item.invocation_id for item in provider_observed}) == 3
         assert len({item.generation_id for item in provider_observed}) == 3
+        assert result[TASK_FENCE_FINAL_GENERATION_KEY] == replace(
+            provider_observed[2],
+            invocation_id=None,
+            parent_invocation_id=None,
+        )
         assert provider_states == [
             (
                 "started",
@@ -4352,6 +4359,229 @@ def test_transcript_and_todo_text_cannot_reconstruct_current_authority(
         assert task is not None
         assert task.intent_epoch == projection.intent_epoch
         assert task.control_revision == projection.control_revision
+    finally:
+        db.close()
+
+
+def test_goal_continuation_records_exact_parent_before_descendant_generation(
+    provenance_agent,
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    provider_observed = []
+    continuation_prompt = (
+        "[Continuing toward your standing goal]\n"
+        "Goal: durable-continuation-prompt-must-not-be-journaled"
+    )
+    try:
+        human_acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-goal-parent")
+        )
+        provenance_agent._session_db = db
+        _prepare_real_conversation(
+            provenance_agent,
+            [
+                _model_response(
+                    content="parent turn complete",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+                _model_response(
+                    content="continuation turn complete",
+                    tool_calls=None,
+                    finish_reason="stop",
+                ),
+            ],
+            provider_observed=provider_observed,
+        )
+
+        with (
+            patch.object(provenance_agent, "_persist_session"),
+            patch.object(provenance_agent, "_save_trajectory"),
+            patch.object(provenance_agent, "_cleanup_task_resources"),
+        ):
+            parent = provenance_agent.run_conversation(
+                "start the standing goal",
+                task_fence_acceptance=human_acceptance,
+            )
+            parent_generation = parent[TASK_FENCE_FINAL_GENERATION_KEY]
+            source_event_id = "tfgc_" + _hash(
+                parent_generation.generation_id
+            )
+            continuation_args = {
+                "source_event_id": source_event_id,
+                "conversation_id": "conversation-1",
+                "parent_generation_id": parent_generation.generation_id,
+                "parent_runtime_epoch": parent_generation.runtime_epoch,
+                "payload_hash": _hash(continuation_prompt),
+                "opaque_payload_ref": (
+                    f"goal-continuation:{source_event_id}"
+                ),
+            }
+            continuation_acceptance = (
+                db.accept_task_fence_goal_continuation(
+                    **continuation_args
+                )
+            )
+            replay = db.accept_task_fence_goal_continuation(
+                **continuation_args
+            )
+            with pytest.raises(
+                TaskFenceIngressRejected,
+                match="source_event_id_collision",
+            ):
+                db.accept_task_fence_goal_continuation(
+                    **{
+                        **continuation_args,
+                        "payload_hash": _hash("changed continuation"),
+                    }
+                )
+            continuation = provenance_agent.run_conversation(
+                continuation_prompt,
+                conversation_history=parent["messages"],
+                task_fence_acceptance=continuation_acceptance,
+            )
+
+        assert parent["final_response"] == "parent turn complete"
+        assert continuation["final_response"] == "continuation turn complete"
+        assert replay.event_id == continuation_acceptance.event_id
+        assert replay.replayed is True
+        assert len(provider_observed) == 2
+        first, second = provider_observed
+        assert replace(
+            first,
+            invocation_id=None,
+            parent_invocation_id=None,
+        ) == parent_generation
+        assert replace(
+            second,
+            invocation_id=None,
+            parent_invocation_id=None,
+        ) == continuation[TASK_FENCE_FINAL_GENERATION_KEY]
+        assert first.generation_id != second.generation_id
+        assert (
+            first.task_id,
+            first.run_id,
+            first.authority_event_id,
+            first.input_manifest_hash,
+            first.intent_epoch,
+            first.control_revision,
+            first.runtime_epoch,
+        ) == (
+            second.task_id,
+            second.run_id,
+            second.authority_event_id,
+            second.input_manifest_hash,
+            second.intent_epoch,
+            second.control_revision,
+            second.runtime_epoch,
+        )
+        assert second.snapshot_event_id == continuation_acceptance.event_id
+        assert second.accepted_order == continuation_acceptance.accepted_order
+
+        synthetic = db._conn.execute(
+            "SELECT source, causal_parent_generation_id, payload_hash, "
+            "opaque_payload_ref FROM task_fence_ingress "
+            "WHERE event_id = ?",
+            (continuation_acceptance.event_id,),
+        ).fetchone()
+        assert tuple(synthetic) == (
+            "runtime:goal_continuation",
+            first.generation_id,
+            _hash(continuation_prompt),
+            f"goal-continuation:{source_event_id}",
+        )
+
+        generations = db._conn.execute(
+            "SELECT generation_id, state, closed_at "
+            "FROM task_fence_model_generations ORDER BY opened_at"
+        ).fetchall()
+        assert len(generations) == 2
+        assert generations[0]["generation_id"] == first.generation_id
+        assert generations[0]["state"] == "committed"
+        assert generations[0]["closed_at"] is not None
+        assert tuple(generations[1]) == (
+            second.generation_id,
+            "committed",
+            None,
+        )
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0] == 2
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_acceptance_snapshots"
+        ).fetchone()[0] == 2
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress_collisions"
+        ).fetchone()[0] == 1
+
+        audit_dump = repr(
+            [
+                tuple(row)
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_acceptance_snapshots",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+                for row in db._conn.execute(f"SELECT * FROM {table}")
+            ]
+        )
+        assert (
+            "durable-continuation-prompt-must-not-be-journaled"
+            not in audit_dump
+        )
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+def test_goal_continuation_rejects_a_noncurrent_parent_without_rebase(
+    tmp_path,
+):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        acceptance = db.accept_task_fence_ingress(
+            _ingress("initial_submit", "event-goal-stale-parent")
+        )
+        stale_parent = db.reserve_task_fence_generation(acceptance)
+        assert db.finish_task_fence_generation(
+            stale_parent,
+            state="committed",
+        )
+        current = db.reserve_task_fence_generation(acceptance)
+        assert db.finish_task_fence_generation(
+            current,
+            state="committed",
+        )
+        before_ingress = db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0]
+
+        with pytest.raises(
+            TaskFenceIngressRejected,
+            match="stale_causal_parent",
+        ):
+            db.accept_task_fence_goal_continuation(
+                source_event_id="tfgc_" + _hash(
+                    stale_parent.generation_id
+                ),
+                conversation_id="conversation-1",
+                parent_generation_id=stale_parent.generation_id,
+                parent_runtime_epoch=stale_parent.runtime_epoch,
+                payload_hash=_hash("stale continuation"),
+                opaque_payload_ref="goal-continuation:stale",
+            )
+
+        task = db.inspect_task_fence_task(acceptance.task_id).task
+        assert task is not None
+        assert task.current_generation_id == current.generation_id
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress"
+        ).fetchone()[0] == before_ingress
     finally:
         db.close()
 

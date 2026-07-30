@@ -1235,6 +1235,7 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
     _task_fence_acceptance = _ctx.task_fence_acceptance
+    _task_fence_final_generation = None
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -2042,6 +2043,7 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
         _task_fence_generation_envelope = None
+        _task_fence_final_generation = None
 
         while retry_count < max_retries:
             _task_fence_generation_envelope = None
@@ -2707,6 +2709,9 @@ def run_conversation(
                     _task_fence_generation_envelope,
                     state="committed",
                     required=_task_fence_acceptance is not None,
+                )
+                _task_fence_final_generation = (
+                    _task_fence_generation_envelope
                 )
                 agent._turn_received_provider_response = True
 
@@ -7152,6 +7157,7 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
         _task_fence_acceptance=_task_fence_acceptance,
+        _task_fence_final_generation=_task_fence_final_generation,
     )
 
 

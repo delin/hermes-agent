@@ -100,9 +100,12 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
     src = _slack_thread_source()
     key = build_session_key(src)
     handled: list[str] = []
+    handled_acceptances: list[object | None] = []
+    continuation_acceptance = object()
 
     async def handler(event):
         handled.append(event.text)
+        handled_acceptances.append(event.task_fence_acceptance)
         if len(handled) == 1:
             # Mirror the runner's goal hook: enqueue the synthetic
             # continuation into the adapter FIFO while this frame is live.
@@ -110,6 +113,7 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
                 text=CONTINUATION_TEXT,
                 message_type=MessageType.TEXT,
                 source=src,
+                task_fence_acceptance=continuation_acceptance,
             )
             adapter._pending_messages[key] = cont
         return f"reply-{len(handled)}"
@@ -128,6 +132,7 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
         "goal continuation was enqueued but never drained — "
         "a user nudge would be required (#47699)"
     )
+    assert handled_acceptances == [None, continuation_acceptance]
     assert adapter.sent == ["reply-1", "reply-2"]
     # The drain task must have released the session guard when the chain ended.
     for _ in range(40):
@@ -145,11 +150,14 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     key nobody drains (the silent-stall shape from #47699)."""
     from unittest.mock import MagicMock, patch
     from datetime import datetime
+    import hashlib
     import uuid
 
     from gateway.run import GatewayRunner
     from gateway.session import SessionEntry
+    from hermes_state import AsyncSessionDB, SessionDB
     from hermes_cli.goals import GoalManager
+    from task_fence import IngressEnvelope, TASK_FENCE_ACTIONS
 
     src = _slack_thread_source()
     adapter_key = build_session_key(src)
@@ -175,24 +183,60 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
 
     adapter = _DrainProbeAdapter()
     runner.adapters = {Platform.SLACK: adapter}
-
-    GoalManager(session_entry.session_id).set("ship it")
-    with patch(
-        "hermes_cli.goals.judge_goal",
-        return_value=("continue", "still needs work", False, None, False),
-    ):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="partial progress",
+    db = SessionDB(hermes_home / "state.db")
+    runner._session_db = AsyncSessionDB(db)
+    acceptance = db.accept_task_fence_ingress(
+        IngressEnvelope(
+            source="gateway:slack",
+            source_event_id="goal-parent-event",
+            conversation_id=adapter_key,
+            action=TASK_FENCE_ACTIONS["initial_submit"],
+            payload_hash=hashlib.sha256(b"parent input").hexdigest(),
+            opaque_payload_ref="slack:goal-parent-event",
         )
-        await asyncio.sleep(0.05)
+    )
+    parent_generation = db.reserve_task_fence_generation(acceptance)
+    assert db.finish_task_fence_generation(
+        parent_generation,
+        state="committed",
+    )
 
-    assert adapter_key in adapter._pending_messages, (
-        "continuation enqueued under a different key than the adapter "
-        f"drains: pending keys={list(adapter._pending_messages)} "
-        f"expected={adapter_key}"
-    )
-    assert adapter._pending_messages[adapter_key].text.startswith(
-        "[Continuing toward your standing goal]"
-    )
+    try:
+        GoalManager(session_entry.session_id).set("ship it")
+        with patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("continue", "still needs work", False, None, False),
+        ):
+            await runner._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=src,
+                final_response="partial progress",
+                task_fence_parent_generation=parent_generation,
+            )
+            await asyncio.sleep(0.05)
+
+        assert adapter_key in adapter._pending_messages, (
+            "continuation enqueued under a different key than the adapter "
+            f"drains: pending keys={list(adapter._pending_messages)} "
+            f"expected={adapter_key}"
+        )
+        continuation = adapter._pending_messages[adapter_key]
+        assert continuation.text.startswith(
+            "[Continuing toward your standing goal]"
+        )
+        continuation_acceptance = continuation.task_fence_acceptance
+        assert continuation_acceptance is not None
+        assert continuation_acceptance.event_id != acceptance.event_id
+        assert continuation.task_fence_ingress is None
+        assert continuation.internal is False
+        recorded = db._conn.execute(
+            "SELECT source, causal_parent_generation_id "
+            "FROM task_fence_ingress WHERE event_id = ?",
+            (continuation_acceptance.event_id,),
+        ).fetchone()
+        assert tuple(recorded) == (
+            "runtime:goal_continuation",
+            parent_generation.generation_id,
+        )
+    finally:
+        db.close()

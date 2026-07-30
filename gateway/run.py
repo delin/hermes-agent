@@ -69,6 +69,10 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from task_fence import (
+    CausalEnvelope,
+    TASK_FENCE_FINAL_GENERATION_KEY,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -2258,6 +2262,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+_TASK_FENCE_FINAL_TURN_GENERATION_KEY = TASK_FENCE_FINAL_GENERATION_KEY
 
 # Conversation-scoped per-session state registry.  Every GatewayRunner dict
 # keyed by session_key whose entries must NOT survive a conversation boundary
@@ -3244,6 +3249,20 @@ def _preserve_queued_followup_history_offset(
     merged = dict(followup_result)
     merged["history_offset"] = current_offset
     return merged
+
+
+def _move_task_fence_final_turn_generation(
+    event: Any,
+    agent_result: Any,
+) -> None:
+    """Move the private local-generation carrier off an agent result."""
+
+    generation = (
+        agent_result.pop(_TASK_FENCE_FINAL_TURN_GENERATION_KEY, None)
+        if isinstance(agent_result, dict)
+        else None
+    )
+    setattr(event, _TASK_FENCE_FINAL_TURN_GENERATION_KEY, generation)
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
@@ -12627,7 +12646,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            # _run_agent may consume a newer queued turn before returning.
+            # The inner handler replaces this with that terminal turn's value.
+            setattr(event, _TASK_FENCE_FINAL_TURN_GENERATION_KEY, None)
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            _task_fence_final_generation = getattr(
+                event,
+                _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
+                None,
+            )
+            try:
+                delattr(event, _TASK_FENCE_FINAL_TURN_GENERATION_KEY)
+            except AttributeError:
+                pass
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -12653,6 +12684,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            task_fence_parent_generation=(
+                                _task_fence_final_generation
+                            ),
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -14332,6 +14366,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     None,
                 ),
             )
+            # Keep the private carrier out of hooks, persistence, and adapter
+            # results; the original event bridges it only to the outer goal hook.
+            _move_task_fence_final_turn_generation(
+                event,
+                agent_result,
+            )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -15551,12 +15591,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await _deliver()
 
+    async def _accept_task_fence_goal_continuation(
+        self,
+        *,
+        conversation_id: str,
+        prompt: str,
+        parent_generation: Any,
+    ) -> Optional[Any]:
+        """Bind one synthetic Goal turn to its exact committed parent."""
+
+        if (
+            not isinstance(parent_generation, CausalEnvelope)
+            or parent_generation.invocation_id is not None
+        ):
+            return None
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            logger.warning(
+                "Task Fence shadow Goal continuation unavailable: no SessionDB"
+            )
+            return None
+
+        import hashlib
+
+        source_event_id = "tfgc_" + hashlib.sha256(
+            parent_generation.generation_id.encode("utf-8")
+        ).hexdigest()
+        try:
+            return await session_db.accept_task_fence_goal_continuation(
+                source_event_id=source_event_id,
+                conversation_id=conversation_id,
+                parent_generation_id=parent_generation.generation_id,
+                parent_runtime_epoch=parent_generation.runtime_epoch,
+                payload_hash=hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
+                opaque_payload_ref=f"goal-continuation:{source_event_id}",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Task Fence shadow Goal continuation rejected: %s",
+                getattr(exc, "reason", type(exc).__name__),
+            )
+            return None
+
     async def _post_turn_goal_continuation(
         self,
         *,
         session_entry: Any,
         source: Any,
         final_response: str,
+        task_fence_parent_generation: Optional[Any] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -15619,12 +15704,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
+                continuation_acceptance = (
+                    await self._accept_task_fence_goal_continuation(
+                        conversation_id=_quick_key,
+                        prompt=prompt,
+                        parent_generation=task_fence_parent_generation,
+                    )
+                    if task_fence_parent_generation is not None
+                    else None
+                )
                 cont_event = MessageEvent(
                     text=prompt,
                     message_type=MessageType.TEXT,
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    task_fence_acceptance=continuation_acceptance,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -20411,7 +20506,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         change for single-profile gateways.
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
+            result = await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
@@ -20420,18 +20515,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 task_fence_acceptance=task_fence_acceptance,
             )
+        else:
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                result = await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    task_fence_acceptance=task_fence_acceptance,
+                )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                task_fence_acceptance=task_fence_acceptance,
+        if isinstance(result, dict):
+            # Recursive queued turns cross this wrapper too. The deepest
+            # turn writes first, so an outer turn cannot overwrite it.
+            result.setdefault(
+                _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
+                None,
             )
+        return result
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -20568,7 +20672,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
                 history=history,
@@ -20578,6 +20682,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            if isinstance(result, dict):
+                # The selected proxy route is outside the local Task Fence
+                # cohort; scrub any untrusted carrier before returning.
+                result[_TASK_FENCE_FINAL_TURN_GENERATION_KEY] = None
+            return result
 
         from run_agent import AIAgent
         import queue
@@ -22952,6 +23061,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # self-persisted (it didn't — see codex_runtime.py).  Default
                 # True preserves the skip-db behaviour for the standard runtime.
                 "agent_persisted": (result_holder[0].get("agent_persisted", True) if result_holder[0] else True),
+                _TASK_FENCE_FINAL_TURN_GENERATION_KEY: (
+                    result_holder[0].get(
+                        _TASK_FENCE_FINAL_TURN_GENERATION_KEY
+                    )
+                    if result_holder[0]
+                    else None
+                ),
             }
         
         # Start progress message sender if enabled. Gate on needs_progress_queue

@@ -174,7 +174,11 @@ def _task_fence_iteration_summary_attempt(agent, acceptance):
             yield None
         return
 
-    attempt = {"policy": policy, "state": "failed"}
+    attempt = {
+        "policy": policy,
+        "state": "failed",
+        "generation": generation,
+    }
     if generation is None:
         with (
             bind_causal_envelope(None),
@@ -2237,8 +2241,12 @@ def handle_max_iterations(
     api_call_count: int,
     *,
     task_fence_acceptance=None,
+    task_fence_generation_out=None,
 ) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    if task_fence_generation_out is not None:
+        task_fence_generation_out.clear()
+
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_request = (
@@ -2481,6 +2489,13 @@ def handle_max_iterations(
             if "<think>" in final_response:
                 final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
             if final_response:
+                if (
+                    summary_attempt is not None
+                    and task_fence_generation_out is not None
+                ):
+                    task_fence_generation_out.append(
+                        summary_attempt["generation"]
+                    )
                 messages.append({"role": "assistant", "content": final_response})
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
@@ -2549,6 +2564,13 @@ def handle_max_iterations(
                 if "<think>" in final_response:
                     final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
                 if final_response:
+                    if (
+                        retry_attempt is not None
+                        and task_fence_generation_out is not None
+                    ):
+                        task_fence_generation_out.append(
+                            retry_attempt["generation"]
+                        )
                     messages.append({"role": "assistant", "content": final_response})
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."

@@ -22,7 +22,10 @@ from gateway.platforms.base import (
     SendResult,
     task_fence_sidecar_for_human_message,
 )
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
+)
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import (
     reset_hermes_home_override,
@@ -52,7 +55,7 @@ class _ShadowSlackAdapter(BasePlatformAdapter):
     async def disconnect(self):
         return None
 
-    async def send(self, chat_id, text, **kwargs):
+    async def send(self, chat_id, text=None, content=None, **kwargs):
         return SendResult(success=True, message_id="reply")
 
     async def get_chat_info(self, chat_id):
@@ -133,6 +136,24 @@ def _event(
     return event
 
 
+def _text_response(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=content,
+                    reasoning_content=None,
+                    reasoning=None,
+                    tool_calls=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model="test/model",
+        usage=None,
+    )
+
+
 def _runner(
     db,
     *,
@@ -154,19 +175,7 @@ def _runner(
     return runner
 
 
-def _count(db: SessionDB, table: str) -> int:
-    with db._lock:
-        return db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-
-
-@pytest.mark.asyncio
-async def test_gateway_passes_exact_acceptance_per_turn_without_cached_leak(
-    task_fence_db,
-    monkeypatch,
-    tmp_path,
-):
-    runner = _runner(AsyncSessionDB(task_fence_db))
-    adapter = _ShadowSlackAdapter(task_fence_db)
+def _configure_agent_run(runner, adapter) -> None:
     runner.adapters = {Platform.SLACK: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -183,14 +192,46 @@ async def test_gateway_passes_exact_acceptance_per_turn_without_cached_leak(
     runner._init_cached_agent_for_turn = lambda *_args: None
     runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
     runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner._queued_events = {}
 
-    event = _event("start", "1700000000.000000")
-    await runner._accept_task_fence_gateway_ingress(event, _session_key())
-    acceptance = event.task_fence_acceptance
-    assert acceptance is not None
+
+def _count(db: SessionDB, table: str) -> int:
+    with db._lock:
+        return db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_gateway_queued_turn_returns_latest_generation_without_cached_leak(
+    task_fence_db,
+    monkeypatch,
+    tmp_path,
+):
+    runner = _runner(AsyncSessionDB(task_fence_db))
+    adapter = _ShadowSlackAdapter(task_fence_db)
+    _configure_agent_run(runner, adapter)
+
+    first_event = _event("first", "1700000000.000000")
+    await runner._accept_task_fence_gateway_ingress(
+        first_event,
+        _session_key(),
+    )
+    first_acceptance = first_event.task_fence_acceptance
+    assert first_acceptance is not None
+
+    queued_event = _event("queued", "1700000000.000001")
+    await runner._accept_task_fence_gateway_ingress(
+        queued_event,
+        _session_key(),
+    )
+    queued_acceptance = queued_event.task_fence_acceptance
+    assert queued_acceptance is not None
 
     observed = []
     created = []
+    generations = {
+        "first": object(),
+        "queued": object(),
+    }
 
     class FakeAgent:
         tools = []
@@ -206,13 +247,19 @@ async def test_gateway_passes_exact_acceptance_per_turn_without_cached_leak(
             task_id=None,
             **kwargs,
         ):
-            observed.append(kwargs.get("task_fence_acceptance"))
-            return {
-                "final_response": "done",
+            turn_acceptance = kwargs.get("task_fence_acceptance")
+            observed.append((message, turn_acceptance))
+            result = {
+                "final_response": f"done:{message}",
                 "messages": [],
                 "api_calls": 1,
                 "completed": True,
             }
+            if turn_acceptance is not None:
+                result[_TASK_FENCE_FINAL_TURN_GENERATION_KEY] = (
+                    generations[message]
+                )
+            return result
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = FakeAgent
@@ -234,17 +281,238 @@ async def test_gateway_passes_exact_acceptance_per_turn_without_cached_leak(
         "session_id": "task-fence-session",
         "session_key": _session_key(),
     }
-    first = await runner._run_agent(
+    adapter._pending_messages[_session_key()] = queued_event
+    terminal = await runner._run_agent(
         message="first",
-        task_fence_acceptance=acceptance,
+        task_fence_acceptance=first_acceptance,
         **kwargs,
     )
-    second = await runner._run_agent(message="second", **kwargs)
+    untyped = await runner._run_agent(message="untyped", **kwargs)
 
-    assert first["final_response"] == "done"
-    assert second["final_response"] == "done"
+    assert terminal["final_response"] == "done:queued"
+    assert (
+        terminal[_TASK_FENCE_FINAL_TURN_GENERATION_KEY]
+        is generations["queued"]
+    )
+    assert untyped["final_response"] == "done:untyped"
+    assert untyped[_TASK_FENCE_FINAL_TURN_GENERATION_KEY] is None
     assert len(created) == 1
-    assert observed == [acceptance, None]
+    assert observed == [
+        ("first", first_acceptance),
+        ("queued", queued_acceptance),
+        ("untyped", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "supersede_before_drain",
+    [False, True],
+    ids=["exact-descendant", "stale-before-drain"],
+)
+async def test_goal_continuation_drains_into_real_descendant_or_fails_open(
+    task_fence_db,
+    monkeypatch,
+    tmp_path,
+    supersede_before_drain,
+):
+    import hashlib
+    from unittest.mock import patch
+
+    import run_agent
+    from gateway.run import _move_task_fence_final_turn_generation
+    from task_fence import (
+        IngressEnvelope,
+        TASK_FENCE_FINAL_GENERATION_KEY,
+        current_causal_envelope,
+    )
+
+    runner = _runner(AsyncSessionDB(task_fence_db))
+    adapter = _ShadowSlackAdapter(task_fence_db)
+    _configure_agent_run(runner, adapter)
+    adapter.set_task_fence_ingress_handler(
+        runner._accept_task_fence_gateway_ingress
+    )
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    session_id = "goal-task-fence-session"
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = run_agent.AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id=session_id,
+            session_db=task_fence_db,
+        )
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent._disable_streaming = True
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+
+    provider_envelopes = []
+    responses = iter(
+        [
+            _text_response("parent complete"),
+            _text_response("child complete"),
+        ]
+    )
+
+    def provider_create(**_kwargs):
+        provider_envelopes.append(current_causal_envelope())
+        return next(responses)
+
+    agent.client.chat.completions.create.side_effect = provider_create
+    real_agent_type = run_agent.AIAgent
+
+    # Runtime helpers read class-level AIAgent constants during the turn.
+    class ExistingAgentFactory(real_agent_type):
+        def __new__(cls, **_kwargs):
+            return agent
+
+    monkeypatch.setattr(run_agent, "AIAgent", ExistingAgentFactory)
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"default": "test/model"}},
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake"},
+    )
+
+    session_entry = SimpleNamespace(session_id=session_id)
+    goal_manager = MagicMock()
+    goal_manager.is_active.return_value = True
+    goal_manager.evaluate_after_turn.return_value = {
+        "should_continue": True,
+        "continuation_prompt": (
+            "[Continuing toward your standing goal]\nGoal: ship it"
+        ),
+        "message": "",
+    }
+    history = []
+    turn_generations = []
+    turn_acceptances = []
+    turn_responses = []
+    race_projection = None
+    child_done = asyncio.Event()
+
+    async def handler(event):
+        nonlocal history, race_projection
+        result = await runner._run_agent(
+            message=event.text,
+            context_prompt="",
+            history=history,
+            source=_source(),
+            session_id=session_id,
+            session_key=_session_key(),
+            task_fence_acceptance=event.task_fence_acceptance,
+        )
+        _move_task_fence_final_turn_generation(event, result)
+        generation = getattr(event, TASK_FENCE_FINAL_GENERATION_KEY)
+        turn_generations.append(generation)
+        turn_acceptances.append(event.task_fence_acceptance)
+        turn_responses.append(result["final_response"])
+        history = result["messages"]
+        if len(turn_generations) == 1:
+            await runner._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=_source(),
+                final_response=result["final_response"],
+                task_fence_parent_generation=generation,
+            )
+            if supersede_before_drain:
+                task_fence_db.accept_task_fence_ingress(
+                    IngressEnvelope(
+                        source="gateway:slack",
+                        source_event_id="event:T123:D123:race",
+                        conversation_id=_session_key(),
+                        action=TASK_FENCE_ACTIONS["comment_hold"],
+                        payload_hash=hashlib.sha256(
+                            b"newer human input"
+                        ).hexdigest(),
+                        task_id=generation.task_id,
+                    )
+                )
+                race_projection = task_fence_db.inspect_task_fence_task(
+                    generation.task_id
+                ).task
+        else:
+            child_done.set()
+        return result["final_response"]
+
+    adapter.set_message_handler(handler)
+    initial = _event("start the goal", "1700000000.000010")
+
+    try:
+        with (
+            patch("hermes_cli.goals.GoalManager", return_value=goal_manager),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            await adapter.handle_message(initial)
+            await asyncio.wait_for(child_done.wait(), timeout=5)
+
+        assert turn_responses == ["parent complete", "child complete"]
+        assert len(turn_acceptances) == 2
+        assert turn_acceptances[0] is not None
+        synthetic_acceptance = turn_acceptances[1]
+        assert synthetic_acceptance is not None
+        assert provider_envelopes[0] is not None
+
+        parent_generation = turn_generations[0]
+        synthetic_row = task_fence_db._conn.execute(
+            "SELECT source, causal_parent_generation_id "
+            "FROM task_fence_ingress WHERE event_id = ?",
+            (synthetic_acceptance.event_id,),
+        ).fetchone()
+        assert tuple(synthetic_row) == (
+            "runtime:goal_continuation",
+            parent_generation.generation_id,
+        )
+
+        generation_count = task_fence_db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_model_generations"
+        ).fetchone()[0]
+        if not supersede_before_drain:
+            assert generation_count == 2
+            child_generation = turn_generations[1]
+            assert child_generation is not None
+            assert provider_envelopes[1] is not None
+            child_snapshot = task_fence_db._conn.execute(
+                "SELECT snapshot_event_id "
+                "FROM task_fence_model_generations "
+                "WHERE generation_id = ?",
+                (child_generation.generation_id,),
+            ).fetchone()
+            assert child_snapshot[0] == synthetic_acceptance.event_id
+        else:
+            assert generation_count == 1
+            assert turn_generations[1] is None
+            assert provider_envelopes[1] is None
+            assert race_projection is not None
+            assert task_fence_db.inspect_task_fence_task(
+                parent_generation.task_id
+            ).task == race_projection
+            assert task_fence_db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_dispatch_permits"
+            ).fetchone()[0] == 1
+            assert task_fence_db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_attempts"
+            ).fetchone()[0] == 1
+    finally:
+        await adapter.cancel_background_tasks()
 
 
 @pytest.mark.asyncio

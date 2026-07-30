@@ -6855,6 +6855,7 @@ class AIAgent:
         api_call_count: int,
         *,
         _task_fence_acceptance=None,
+        _task_fence_generation_out=None,
     ) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
         from agent.chat_completion_helpers import handle_max_iterations
@@ -6863,6 +6864,7 @@ class AIAgent:
             messages,
             api_call_count,
             task_fence_acceptance=_task_fence_acceptance,
+            task_fence_generation_out=_task_fence_generation_out,
         )
 
     def _conversation_root_id(self) -> Optional[str]:

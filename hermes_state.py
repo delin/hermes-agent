@@ -9460,6 +9460,29 @@ class SessionDB:
             opaque_payload_ref=opaque_payload_ref,
         )
 
+    def accept_task_fence_goal_continuation(
+        self,
+        *,
+        source_event_id: str,
+        conversation_id: str,
+        parent_generation_id: str,
+        parent_runtime_epoch: int,
+        payload_hash: str,
+        opaque_payload_ref: str,
+    ) -> IngressAcceptance:
+        """Accept one Goal continuation only from its exact current parent."""
+
+        return self._accept_task_fence_synthetic_evidence(
+            source="runtime:goal_continuation",
+            source_event_id=source_event_id,
+            parent_generation_id=parent_generation_id,
+            parent_runtime_epoch=parent_runtime_epoch,
+            payload_hash=payload_hash,
+            opaque_payload_ref=opaque_payload_ref,
+            expected_conversation_id=conversation_id,
+            require_current_parent=True,
+        )
+
     def _accept_task_fence_synthetic_evidence(
         self,
         *,
@@ -9469,11 +9492,20 @@ class SessionDB:
         parent_runtime_epoch: int,
         payload_hash: str,
         opaque_payload_ref: str,
+        expected_conversation_id: Optional[str] = None,
+        require_current_parent: bool = False,
     ) -> IngressAcceptance:
         """Accept one trusted-core synthetic source against an exact parent."""
 
         if not _task_fence_v2_identifier_compatible(parent_generation_id):
             raise TaskFenceProtocolRejected("invalid_parent_generation_id")
+        if (
+            expected_conversation_id is not None
+            and not _task_fence_v2_identifier_compatible(
+                expected_conversation_id
+            )
+        ):
+            raise TaskFenceProtocolRejected("invalid_conversation_id")
         if type(parent_runtime_epoch) is not int or parent_runtime_epoch < 0:
             raise TaskFenceProtocolRejected("invalid_parent_runtime_epoch")
         if self.read_only:
@@ -9494,6 +9526,14 @@ class SessionDB:
                 (source, source_event_id),
             ).fetchone()
             if existing is not None:
+                if (
+                    expected_conversation_id is not None
+                    and existing["conversation_id"]
+                    != expected_conversation_id
+                ):
+                    return _TaskFenceIngressFailure(
+                        "causal_parent_mismatch"
+                    )
                 envelope = IngressEnvelope(
                     source=source,
                     source_event_id=source_event_id,
@@ -9520,7 +9560,8 @@ class SessionDB:
                     unavailable=True,
                 )
             parent = conn.execute(
-                "SELECT g.task_id, g.runtime_epoch, t.conversation_id "
+                "SELECT g.task_id, g.runtime_epoch, g.state, g.closed_at, "
+                "t.conversation_id, t.current_generation_id "
                 "FROM main.task_fence_model_generations AS g "
                 "JOIN main.task_fence_tasks AS t ON t.task_id = g.task_id "
                 "WHERE g.generation_id = ?",
@@ -9537,6 +9578,18 @@ class SessionDB:
                 return _TaskFenceIngressFailure(
                     "causal_parent_runtime_epoch_mismatch"
                 )
+            if (
+                expected_conversation_id is not None
+                and parent["conversation_id"] != expected_conversation_id
+            ):
+                return _TaskFenceIngressFailure("causal_parent_mismatch")
+            if require_current_parent and (
+                parent["state"] != "committed"
+                or parent["closed_at"] is not None
+                or parent["current_generation_id"]
+                != parent_generation_id
+            ):
+                return _TaskFenceIngressFailure("stale_causal_parent")
             if control["runtime_epoch"] != parent_runtime_epoch:
                 return _TaskFenceIngressFailure(
                     "runtime_epoch_mismatch",

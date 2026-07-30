@@ -13,7 +13,10 @@ to ``_run_agent``'s return dict and uses it for the slice.
 """
 
 
-from gateway.run import _preserve_queued_followup_history_offset
+from gateway.run import (
+    _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
+    _preserve_queued_followup_history_offset,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -323,3 +326,44 @@ class TestTranscriptHistoryOffset:
         )
 
         assert merged["history_offset"] == 3
+
+    def test_recursive_queued_followup_keeps_latest_task_fence_generation(self):
+        generation_a = object()
+        generation_b = object()
+        current_result = {
+            "history_offset": 2,
+            _TASK_FENCE_FINAL_TURN_GENERATION_KEY: generation_a,
+        }
+        followup_result = {
+            "history_offset": 4,
+            _TASK_FENCE_FINAL_TURN_GENERATION_KEY: generation_b,
+        }
+
+        merged = _preserve_queued_followup_history_offset(
+            current_result,
+            followup_result,
+        )
+
+        assert merged["history_offset"] == 2
+        assert (
+            merged[_TASK_FENCE_FINAL_TURN_GENERATION_KEY]
+            is generation_b
+        )
+
+    def test_untyped_queued_followup_does_not_inherit_outer_generation(self):
+        current_result = {
+            "history_offset": 2,
+            _TASK_FENCE_FINAL_TURN_GENERATION_KEY: object(),
+        }
+        followup_result = {
+            "history_offset": 4,
+            _TASK_FENCE_FINAL_TURN_GENERATION_KEY: None,
+        }
+
+        merged = _preserve_queued_followup_history_offset(
+            current_result,
+            followup_result,
+        )
+
+        assert merged["history_offset"] == 2
+        assert merged[_TASK_FENCE_FINAL_TURN_GENERATION_KEY] is None

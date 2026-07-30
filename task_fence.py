@@ -34,6 +34,7 @@ _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 
 TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
+TASK_FENCE_FINAL_GENERATION_KEY = "_task_fence_final_generation"
 
 
 class Origin(str, Enum):

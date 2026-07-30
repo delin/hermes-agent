@@ -146,3 +146,46 @@ async def test_idle_queue_without_payload_returns_usage():
     assert result == "Usage: /queue <prompt>"
     assert called is False
     assert runner._running_agents == {}
+
+
+@pytest.mark.asyncio
+async def test_goal_hook_receives_final_generation_without_result_leak():
+    from gateway.run import (
+        _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
+        _move_task_fence_final_turn_generation,
+    )
+
+    runner, _adapter = _make_runner()
+    session_entry = runner.session_store.get_or_create_session.return_value
+    runner._post_turn_goal_continuation = AsyncMock()
+    generation = object()
+
+    async def fake_handle_message_with_agent(
+        event,
+        _source,
+        _key,
+        _generation,
+    ):
+        agent_result = {
+            "final_response": "done",
+            _TASK_FENCE_FINAL_TURN_GENERATION_KEY: generation,
+        }
+        _move_task_fence_final_turn_generation(
+            event,
+            agent_result,
+        )
+        return agent_result
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+    event = _make_event("continue the goal")
+
+    result = await runner._handle_message(event)
+
+    assert result == {"final_response": "done"}
+    assert not hasattr(event, _TASK_FENCE_FINAL_TURN_GENERATION_KEY)
+    runner._post_turn_goal_continuation.assert_awaited_once_with(
+        session_entry=session_entry,
+        source=_make_source(),
+        final_response="done",
+        task_fence_parent_generation=generation,
+    )

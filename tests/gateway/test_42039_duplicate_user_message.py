@@ -290,3 +290,58 @@ async def test_normal_path_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_result_moves_final_generation_at_the_real_call_site(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway.run import _TASK_FENCE_FINAL_TURN_GENERATION_KEY
+    from task_fence import (
+        CONTROL_PROTOCOL_VERSION,
+        TASK_FENCE_STORE_SCHEMA_VERSION,
+        CausalEnvelope,
+    )
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    generation = CausalEnvelope(
+        task_id="tsk_00000000000000000000000000000001",
+        authority_event_id="evt_00000000000000000000000000000001",
+        run_id="run_00000000000000000000000000000001",
+        generation_id="gen_00000000000000000000000000000001",
+        snapshot_event_id="evt_00000000000000000000000000000002",
+        input_manifest_hash="0" * 64,
+        store_schema_version=TASK_FENCE_STORE_SCHEMA_VERSION,
+        control_protocol_version=CONTROL_PROTOCOL_VERSION,
+        intent_epoch=1,
+        control_revision=1,
+        runtime_epoch=1,
+        accepted_order=1,
+    )
+    agent_result = {
+        "final_response": "Hello!",
+        "messages": [
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "Hello!"},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        _TASK_FENCE_FINAL_TURN_GENERATION_KEY: generation,
+    }
+    runner._run_agent = AsyncMock(return_value=agent_result)
+    event = _event()
+
+    await runner._handle_message_with_agent(
+        event,
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert getattr(
+        event,
+        _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
+    ) == generation
+    assert _TASK_FENCE_FINAL_TURN_GENERATION_KEY not in agent_result

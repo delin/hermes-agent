@@ -6,7 +6,10 @@ import pytest
 
 from gateway.config import Platform, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
+)
 from gateway.session import SessionSource
 
 
@@ -184,6 +187,7 @@ class TestRunAgentProxyDispatch:
             ],
             "api_calls": 1,
             "tools": [],
+            _TASK_FENCE_FINAL_TURN_GENERATION_KEY: object(),
         }
 
         runner._run_agent_via_proxy = AsyncMock(return_value=expected_result)
@@ -199,8 +203,37 @@ class TestRunAgentProxyDispatch:
         )
 
         assert result["final_response"] == "Hello from remote!"
+        assert result[_TASK_FENCE_FINAL_TURN_GENERATION_KEY] is None
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+
+    @pytest.mark.asyncio
+    async def test_carrier_uses_the_selected_proxy_route(self):
+        runner = _make_runner()
+        runner._run_agent_via_proxy = AsyncMock(
+            return_value={
+                "final_response": "remote",
+                _TASK_FENCE_FINAL_TURN_GENERATION_KEY: object(),
+            }
+        )
+
+        with patch.object(
+            runner,
+            "_get_proxy_url",
+            side_effect=["http://host:8642", None],
+        ) as get_proxy_url:
+            result = await runner._run_agent(
+                message="hi",
+                context_prompt="",
+                history=[],
+                source=_make_source(),
+                session_id="test-session",
+                task_fence_acceptance=object(),
+            )
+
+        assert get_proxy_url.call_count == 1
+        assert result[_TASK_FENCE_FINAL_TURN_GENERATION_KEY] is None
+        runner._run_agent_via_proxy.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_run_agent_skips_proxy_when_not_configured(self, monkeypatch):
