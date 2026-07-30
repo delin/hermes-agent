@@ -21,7 +21,7 @@ from typing import Iterator, Mapping, Protocol
 
 
 CONTROL_PROTOCOL_VERSION = 1
-TASK_FENCE_STORE_SCHEMA_VERSION = 5
+TASK_FENCE_STORE_SCHEMA_VERSION = 6
 
 _MAX_SOURCE_BYTES = 256
 _MAX_IDENTIFIER_BYTES = 512
@@ -302,6 +302,14 @@ class TaskFencePolicyRejected(TaskFenceProtocolRejected):
 
 class TaskFencePolicyUnavailable(RuntimeError):
     """A terminal policy write could not use the durable control store."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class TaskFenceRecoveryUnavailable(RuntimeError):
+    """Shadow recovery could not mutate one compatible audit control store."""
 
     def __init__(self, reason: str):
         self.reason = reason
@@ -599,6 +607,15 @@ class IngressAcceptance:
     opened_run_id: str | None
     closed_run_id: str | None
     accepted_at: float
+
+
+@dataclass(frozen=True)
+class TaskFenceRecovery:
+    """One committed shadow recovery epoch transition."""
+
+    previous_runtime_epoch: int
+    runtime_epoch: int
+    recovered_at: float
 
 
 _CAUSAL_ENVELOPE_FIELDS = frozenset(

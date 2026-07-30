@@ -167,6 +167,7 @@ def _downgrade_current_store_to_exact_v2(
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DROP TABLE main.task_fence_recovery_requeues")
         conn.execute("DROP TABLE main.task_fence_policy_decisions")
         conn.execute(
             "DROP INDEX main.idx_task_fence_ingress_task_run_order"
@@ -262,6 +263,7 @@ def _downgrade_current_store_to_exact_v3(path) -> None:
     assert isinstance(snapshot_trigger[0], str)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DROP TABLE main.task_fence_recovery_requeues")
         conn.execute("DROP TABLE main.task_fence_policy_decisions")
         conn.execute(
             "DROP TRIGGER main.task_fence_acceptance_snapshots_no_update"
@@ -299,6 +301,58 @@ def _downgrade_current_store_to_exact_v3(path) -> None:
             check,
             "SELECT store_schema_version FROM task_fence_control",
         ) == 3
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        check.close()
+
+
+def _downgrade_current_store_to_exact_v5(path) -> None:
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA foreign_keys=ON")
+    snapshot_trigger = conn.execute(
+        "SELECT sql FROM main.sqlite_master WHERE type = 'trigger' "
+        "AND name = 'task_fence_acceptance_snapshots_no_update'"
+    ).fetchone()
+    assert snapshot_trigger is not None and isinstance(snapshot_trigger[0], str)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DROP TABLE main.task_fence_recovery_requeues")
+        conn.execute(
+            "DROP TRIGGER main.task_fence_acceptance_snapshots_no_update"
+        )
+        conn.execute(
+            "UPDATE main.task_fence_acceptance_snapshots "
+            "SET task_store_schema_version = 5 "
+            "WHERE task_store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE main.task_fence_tasks SET store_schema_version = 5 "
+            "WHERE store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE main.task_fence_control SET store_schema_version = 5 "
+            "WHERE singleton = 1 AND store_schema_version = ?",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        conn.execute(snapshot_trigger[0])
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    check = sqlite3.connect(path)
+    try:
+        assert hermes_state._read_task_fence_schema_objects(
+            check
+        ) == hermes_state._expected_task_fence_v5_schema_objects()
+        assert _scalar(
+            check,
+            "SELECT store_schema_version FROM task_fence_control",
+        ) == 5
         assert check.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         check.close()
@@ -1072,6 +1126,92 @@ def test_post_mutation_pending_failure_rolls_back_exact_state(
     assert call_count == 2
     assert _task_fence_table_state(conn) == state_before
     db.close()
+
+
+def test_populated_v5_migrates_with_exact_historical_replay(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    history: list[tuple[IngressEnvelope, IngressAcceptance]] = []
+
+    initial_envelope = _envelope("initial_submit", "v5-initial")
+    initial = db.accept_task_fence_ingress(initial_envelope)
+    history.append((initial_envelope, initial))
+    held_envelope = _envelope(
+        "comment_hold",
+        "v5-held",
+        task_id=initial.task_id,
+    )
+    held = db.accept_task_fence_ingress(held_envelope)
+    history.append((held_envelope, held))
+    run_envelope = _envelope(
+        "change_and_run",
+        "v5-run",
+        task_id=initial.task_id,
+    )
+    resumed = db.accept_task_fence_ingress(run_envelope)
+    history.append((run_envelope, resumed))
+    assert resumed.opened_run_id is not None
+    db.close()
+
+    _downgrade_current_store_to_exact_v5(path)
+    migrated = SessionDB(path)
+    try:
+        assert migrated.inspect_task_fence_store().compatible is True
+        assert hermes_state._read_task_fence_schema_objects(
+            _connection(migrated)
+        ) == hermes_state._expected_task_fence_schema_objects()
+        assert _scalar(
+            _connection(migrated),
+            "SELECT COUNT(*) FROM task_fence_recovery_requeues",
+        ) == 0
+        expected_replays = []
+        for envelope, acceptance in history:
+            projection = acceptance.task_projection
+            assert projection is not None
+            expected = replace(
+                acceptance,
+                task_projection=replace(projection, store_schema_version=5),
+                replayed=True,
+            )
+            expected_replays.append((envelope, expected))
+            assert migrated.accept_task_fence_ingress(envelope) == expected
+
+        recovered = migrated.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+        )
+        assert (recovered.previous_runtime_epoch, recovered.runtime_epoch) == (0, 1)
+        task = migrated.inspect_task_fence_task(initial.task_id).task
+        assert task is not None
+        assert task.status == "paused"
+        assert task.current_runtime_epoch == 1
+        assert task.active_execution_run_id is None
+        assert task.current_generation_id is None
+        assert tuple(
+            row[0]
+            for row in _connection(migrated).execute(
+                "SELECT input.event_id FROM task_fence_task_inputs AS input "
+                "JOIN task_fence_ingress AS ingress "
+                "ON ingress.event_id = input.event_id "
+                "WHERE input.task_id = ? AND input.state = 'pending' "
+                "ORDER BY ingress.accepted_order",
+                (initial.task_id,),
+            )
+        ) == tuple(acceptance.event_id for _envelope, acceptance in history)
+        assert tuple(
+            _connection(migrated).execute(
+                "SELECT state, close_reason FROM task_fence_execution_runs "
+                "WHERE run_id = ?",
+                (resumed.opened_run_id,),
+            ).fetchone()
+        ) == ("closed", "runtime_recovery_unpresented")
+        for envelope, expected in expected_replays:
+            assert migrated.accept_task_fence_ingress(envelope) == expected
+        assert _connection(migrated).execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall() == []
+    finally:
+        migrated.close()
 
 
 def test_populated_v2_migrates_with_byte_equivalent_historical_replay(

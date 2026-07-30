@@ -33,6 +33,7 @@ EXPECTED_TASK_FENCE_TABLES = {
     "task_fence_model_generations",
     "task_fence_policy_decisions",
     "task_fence_questions",
+    "task_fence_recovery_requeues",
     "task_fence_resolution_evidence",
     "task_fence_resolutions",
     "task_fence_task_inputs",
@@ -129,6 +130,42 @@ def _install_task_fence_v4_schema(path, **control_overrides):
             "tested_artifact_commit, tested_artifact_checksum, "
             "dependency_lock_fingerprint, created_at, updated_at"
             ") VALUES (1, 4, ?, ?, ?, ?, ?, ?, ?, 1.0, 1.0)",
+            (
+                TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+                control["runtime_epoch"],
+                control["mode_generation"],
+                control["ever_enforced"],
+                control["tested_artifact_commit"],
+                control["tested_artifact_checksum"],
+                control["dependency_lock_fingerprint"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _install_task_fence_v5_schema(path, **control_overrides):
+    _drop_task_fence_schema(path)
+    control = {
+        "runtime_epoch": 0,
+        "mode_generation": 0,
+        "ever_enforced": 0,
+        "tested_artifact_commit": None,
+        "tested_artifact_checksum": None,
+        "dependency_lock_fingerprint": None,
+    }
+    control.update(control_overrides)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(hermes_state.TASK_FENCE_SCHEMA_V5_SQL)
+        conn.execute(
+            "INSERT INTO task_fence_control ("
+            "singleton, store_schema_version, control_protocol_version, "
+            "runtime_epoch, mode_generation, ever_enforced, "
+            "tested_artifact_commit, tested_artifact_checksum, "
+            "dependency_lock_fingerprint, created_at, updated_at"
+            ") VALUES (1, 5, ?, ?, ?, ?, ?, ?, ?, 1.0, 1.0)",
             (
                 TASK_FENCE_CONTROL_PROTOCOL_VERSION,
                 control["runtime_epoch"],
@@ -490,10 +527,13 @@ def test_exact_populated_v4_store_migrates_atomically_to_current(tmp_path):
         ).fetchone()[0]
 
         assert inspection.compatible is True
-        assert inspection.observed_store_schema_version == 5
+        assert (
+            inspection.observed_store_schema_version
+            == TASK_FENCE_STORE_SCHEMA_VERSION
+        )
         assert task.compatible is True
         assert task.task is not None
-        assert task.task.store_schema_version == 5
+        assert task.task.store_schema_version == TASK_FENCE_STORE_SCHEMA_VERSION
         assert decision.compatible is True
         assert decision.decision is not None
         assert decision.decision.decision_order == 7
@@ -542,6 +582,181 @@ def test_read_only_open_does_not_migrate_exact_v4(tmp_path):
     assert inspection.compatible is False
     assert inspection.observed_store_schema_version == 4
     assert _task_fence_schema_objects(path) == objects_before
+
+
+def test_exact_populated_v5_store_migrates_atomically_to_current(tmp_path):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v5_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        _insert_task(
+            conn,
+            task_id="task-v5",
+            conversation_id="conversation-v5",
+            store_schema_version=5,
+        )
+        decision_id = _insert_v4_policy_decision(
+            conn,
+            invocation_id="tfiv-v5-preserved",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert _task_fence_schema_objects(path) == (
+        hermes_state._expected_task_fence_v5_schema_objects()
+    )
+
+    migrated = SessionDB(path)
+    try:
+        inspection = migrated.inspect_task_fence_store()
+        task = migrated.inspect_task_fence_task("task-v5")
+        decision = migrated.inspect_task_fence_policy_decision(decision_id)
+
+        assert inspection.compatible is True
+        assert (
+            inspection.observed_store_schema_version
+            == TASK_FENCE_STORE_SCHEMA_VERSION
+        )
+        assert task.compatible is True
+        assert task.task is not None
+        assert task.task.store_schema_version == TASK_FENCE_STORE_SCHEMA_VERSION
+        assert decision.compatible is True
+        assert decision.decision is not None
+        assert migrated._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_recovery_requeues"
+        ).fetchone()[0] == 0
+        assert migrated._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        migrated.close()
+
+    assert _task_fence_schema_objects(path) == (
+        hermes_state._expected_task_fence_schema_objects()
+    )
+
+
+def test_read_only_open_does_not_migrate_exact_v5(tmp_path):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v5_schema(path)
+    objects_before = _task_fence_schema_objects(path)
+
+    read_only = SessionDB(path, read_only=True)
+    try:
+        inspection = read_only.inspect_task_fence_store()
+    finally:
+        read_only.close()
+
+    assert inspection.compatible is False
+    assert inspection.observed_store_schema_version == 5
+    assert _task_fence_schema_objects(path) == objects_before
+
+
+@pytest.mark.parametrize(
+    "control_overrides",
+    (
+        {"runtime_epoch": 1},
+        {"ever_enforced": 1},
+        {"tested_artifact_commit": "artifact"},
+    ),
+)
+def test_nonpristine_v5_control_metadata_refuses_automatic_migration(
+    tmp_path,
+    control_overrides,
+):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v5_schema(path, **control_overrides)
+    objects_before = _task_fence_schema_objects(path)
+
+    reopened = SessionDB(path)
+    try:
+        inspection = reopened.inspect_task_fence_store()
+    finally:
+        reopened.close()
+
+    assert inspection.compatible is False
+    assert inspection.observed_store_schema_version == 5
+    assert _task_fence_schema_objects(path) == objects_before
+
+
+@pytest.mark.parametrize("failure_stage", ("ddl", "task_version", "control_version"))
+def test_v5_migration_failure_rolls_back_exact_state(
+    tmp_path,
+    monkeypatch,
+    failure_stage,
+):
+    path = tmp_path / "state.db"
+    SessionDB(path).close()
+    _install_task_fence_v5_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        _insert_task(
+            conn,
+            task_id="task-v5-fault",
+            conversation_id="conversation-v5-fault",
+            store_schema_version=5,
+        )
+        decision_id = _insert_v4_policy_decision(
+            conn,
+            invocation_id="tfiv-v5-fault",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    objects_before = _task_fence_schema_objects(path)
+
+    if failure_stage == "ddl":
+        monkeypatch.setattr(
+            hermes_state,
+            "TASK_FENCE_SCHEMA_V6_EXTENSION_SQL",
+            hermes_state.TASK_FENCE_SCHEMA_V6_EXTENSION_SQL
+            + "CREATE TABLE task_fence_v6_partial (value INTEGER);"
+            + "INVALID TASK FENCE V6;",
+        )
+        failed = SessionDB(path)
+        try:
+            assert failed._task_fence_schema_init_failed is True
+        finally:
+            failed.close()
+    else:
+        target = {
+            "task_version": "task_fence_tasks",
+            "control_version": "task_fence_control",
+        }[failure_stage]
+        probe = SessionDB.__new__(SessionDB)
+        probe._conn = sqlite3.connect(path, isolation_level=None)
+        probe._conn.row_factory = sqlite3.Row
+        probe._conn.execute("PRAGMA foreign_keys=ON")
+        probe._task_fence_schema_init_failed = False
+        probe._conn.execute(
+            "CREATE TEMP TRIGGER fail_task_fence_v5_migration "
+            f"BEFORE UPDATE ON main.{target} BEGIN "
+            "SELECT RAISE(ABORT, 'injected v5 migration failure'); END"
+        )
+        try:
+            probe._init_task_fence_schema()
+            assert probe._task_fence_schema_init_failed is True
+        finally:
+            probe._conn.close()
+
+    assert _task_fence_schema_objects(path) == objects_before
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute(
+            "SELECT store_schema_version FROM task_fence_control"
+        ).fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT store_schema_version FROM task_fence_tasks "
+            "WHERE task_id = 'task-v5-fault'"
+        ).fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT decision_order FROM task_fence_policy_decisions "
+            "WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()[0] == 7
+    finally:
+        conn.close()
 
 
 def test_v4_delivery_permit_is_not_reclassified_by_migration(tmp_path):
