@@ -42,6 +42,11 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from agent.secret_scope import UnscopedSecretError, get_secret
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.task_fence_delivery import (
+    TaskFenceDeliveryCapability,
+    isolate_task_fence_delivery_capability,
+    task_fence_slack_post_message_handoff,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -60,6 +65,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
     coerce_plaintext_gateway_command,
 )
+from task_fence import bind_task_fence_policy
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
@@ -2445,6 +2451,29 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        """Send while keeping Task Fence authority outside Slack SDK code."""
+
+        with (
+            isolate_task_fence_delivery_capability() as delivery_capability,
+            bind_task_fence_policy(None),
+        ):
+            return await self._send_with_task_fence_delivery(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+                delivery_capability=delivery_capability,
+            )
+
+    async def _send_with_task_fence_delivery(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        delivery_capability: TaskFenceDeliveryCapability | None,
+    ) -> SendResult:
         """Send a message to a Slack channel or DM."""
         if self._is_ignored_channel(chat_id):
             logger.warning(
@@ -2555,9 +2584,15 @@ class SlackAdapter(BasePlatformAdapter):
                         kwargs["reply_broadcast"] = True
 
                 try:
-                    last_result = await self._get_client(
-                        chat_id, team_id=team_id
-                    ).chat_postMessage(**kwargs)
+                    client = self._get_client(chat_id, team_id=team_id)
+                    post_message = client.chat_postMessage
+                    async with task_fence_slack_post_message_handoff(
+                        capability=delivery_capability,
+                        runner=getattr(self, "gateway_runner", None),
+                        team_id=team_id,
+                        request=kwargs,
+                    ):
+                        last_result = await post_message(**kwargs)
                 except Exception as e:
                     if kwargs.get("blocks") and self._is_block_payload_rejection(e):
                         retry_kwargs = dict(kwargs)
@@ -2566,9 +2601,15 @@ class SlackAdapter(BasePlatformAdapter):
                             "[Slack] Block Kit payload rejected; retrying send without blocks: %s",
                             e,
                         )
-                        last_result = await self._get_client(
-                            chat_id, team_id=team_id
-                        ).chat_postMessage(**retry_kwargs)
+                        retry_client = self._get_client(chat_id, team_id=team_id)
+                        retry_post_message = retry_client.chat_postMessage
+                        async with task_fence_slack_post_message_handoff(
+                            capability=delivery_capability,
+                            runner=getattr(self, "gateway_runner", None),
+                            team_id=team_id,
+                            request=retry_kwargs,
+                        ):
+                            last_result = await retry_post_message(**retry_kwargs)
                     else:
                         raise
 

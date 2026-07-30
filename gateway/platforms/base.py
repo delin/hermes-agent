@@ -20,6 +20,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -4758,6 +4759,9 @@ class BasePlatformAdapter(ABC):
         network errors, sends the user a brief delivery-failure notice so they
         know to retry rather than waiting indefinitely.
         """
+        from gateway.task_fence_delivery import (
+            suspend_task_fence_delivery_capability,
+        )
 
         result = await self.send(
             chat_id=chat_id,
@@ -4815,19 +4819,21 @@ class BasePlatformAdapter(ABC):
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    with suspend_task_fence_delivery_capability():
+                        await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self.send(
-            chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
-            reply_to=reply_to,
-            metadata=metadata,
-        )
+        with suspend_task_fence_delivery_capability():
+            fallback_result = await self.send(
+                chat_id=chat_id,
+                content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+                reply_to=reply_to,
+                metadata=metadata,
+            )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -5546,6 +5552,14 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            from gateway.task_fence_delivery import (
+                bind_task_fence_delivery_capability,
+                take_task_fence_delivery_capability,
+            )
+
+            _task_fence_delivery_capability = (
+                take_task_fence_delivery_capability(event)
+            )
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5756,12 +5770,29 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    _task_fence_delivery_scope = nullcontext()
+                    if (
+                        _task_fence_delivery_capability is not None
+                        and delivery_adapter.platform is Platform.SLACK
+                        and not is_ephemeral_response
+                        and not force_document_attachments
+                        and not images
+                        and not local_files
+                        and not media_files
+                        and _tts_path is None
+                    ):
+                        _task_fence_delivery_scope = (
+                            bind_task_fence_delivery_capability(
+                                _task_fence_delivery_capability
+                            )
+                        )
+                    with _task_fence_delivery_scope:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:

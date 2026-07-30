@@ -42,7 +42,7 @@ import threading
 import time
 import sqlite3
 from collections import OrderedDict
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Union, cast
@@ -2263,6 +2263,22 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 _TASK_FENCE_FINAL_TURN_GENERATION_KEY = TASK_FENCE_FINAL_GENERATION_KEY
+_TASK_FENCE_FINAL_TURN_FOOTER_KEY = "_task_fence_final_turn_runtime_footer"
+_TASK_FENCE_DELIVERY_EXCLUDE_QUEUED = 1
+_TASK_FENCE_DELIVERY_EXCLUDE_PROXY = 2
+_TASK_FENCE_DELIVERY_EXCLUDE_STREAMING = 4
+_TASK_FENCE_DELIVERY_EXCLUSIONS: ContextVar[int | None] = ContextVar(
+    "task_fence_delivery_exclusions",
+    default=None,
+)
+
+
+def _mark_task_fence_delivery_exclusion(flag: int) -> None:
+    """Mark one excluded route inside the current final-delivery scope."""
+
+    current = _TASK_FENCE_DELIVERY_EXCLUSIONS.get()
+    if current is not None:
+        _TASK_FENCE_DELIVERY_EXCLUSIONS.set(current | flag)
 
 # Conversation-scoped per-session state registry.  Every GatewayRunner dict
 # keyed by session_key whose entries must NOT survive a conversation boundary
@@ -3262,7 +3278,68 @@ def _move_task_fence_final_turn_generation(
         if isinstance(agent_result, dict)
         else None
     )
+    if isinstance(agent_result, dict) and agent_result.get("already_sent"):
+        _mark_task_fence_delivery_exclusion(
+            _TASK_FENCE_DELIVERY_EXCLUDE_STREAMING
+        )
     setattr(event, _TASK_FENCE_FINAL_TURN_GENERATION_KEY, generation)
+
+
+def _task_fence_delivery_capability_for_event(
+    runner: Any,
+    event: MessageEvent,
+    session_key: str,
+    response: Any,
+    parent: Any,
+    *,
+    queued_followup: bool,
+    proxy_result: bool = False,
+    streaming_result: bool = False,
+    runtime_footer: bool = False,
+) -> Any | None:
+    """Return the one bounded Slack final-delivery capability, if exact."""
+
+    source = getattr(event, "source", None)
+    sidecar = getattr(event, "task_fence_ingress", None)
+    acceptance = getattr(event, "task_fence_acceptance", None)
+    configured_key = getattr(
+        getattr(runner, "config", None),
+        "task_fence_shadow_session_key",
+        "",
+    )
+    if (
+        queued_followup
+        or proxy_result
+        or streaming_result
+        or runtime_footer
+        or not isinstance(response, str)
+        or not response
+        or getattr(event, "internal", False)
+        or getattr(event, "message_type", None) is not MessageType.TEXT
+        or event.get_command() is not None
+        or not str(getattr(event, "message_id", "") or "")
+        or getattr(source, "platform", None) is not Platform.SLACK
+        or getattr(source, "profile", None) not in {None, "", "default"}
+        or getattr(sidecar, "source", None) != "gateway:slack"
+        or acceptance is None
+        or not configured_key
+        or session_key != configured_key
+    ):
+        return None
+
+    if parent is not None and (
+        not isinstance(parent, CausalEnvelope)
+        or parent.snapshot_event_id != acceptance.event_id
+        or parent.task_id != acceptance.task_id
+        or parent.invocation_id is not None
+    ):
+        parent = None
+
+    from gateway.task_fence_delivery import TaskFenceDeliveryCapability
+
+    return TaskFenceDeliveryCapability(
+        parent=parent,
+    )
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
@@ -12649,14 +12726,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # _run_agent may consume a newer queued turn before returning.
             # The inner handler replaces this with that terminal turn's value.
             setattr(event, _TASK_FENCE_FINAL_TURN_GENERATION_KEY, None)
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            setattr(event, _TASK_FENCE_FINAL_TURN_FOOTER_KEY, False)
+            _task_fence_exclusion_token = _TASK_FENCE_DELIVERY_EXCLUSIONS.set(0)
+            try:
+                _agent_result = await self._handle_message_with_agent(
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                )
+            finally:
+                _task_fence_delivery_exclusions = (
+                    _TASK_FENCE_DELIVERY_EXCLUSIONS.get() or 0
+                )
+                _TASK_FENCE_DELIVERY_EXCLUSIONS.reset(
+                    _task_fence_exclusion_token
+                )
             _task_fence_final_generation = getattr(
                 event,
                 _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
                 None,
             )
+            _task_fence_queued_followup = bool(
+                _task_fence_delivery_exclusions
+                & _TASK_FENCE_DELIVERY_EXCLUDE_QUEUED
+            )
+            _task_fence_proxy_result = bool(
+                _task_fence_delivery_exclusions
+                & _TASK_FENCE_DELIVERY_EXCLUDE_PROXY
+            )
+            _task_fence_streaming_result = bool(
+                _task_fence_delivery_exclusions
+                & _TASK_FENCE_DELIVERY_EXCLUDE_STREAMING
+            )
+            _task_fence_runtime_footer = bool(
+                getattr(event, _TASK_FENCE_FINAL_TURN_FOOTER_KEY, False)
+            )
             try:
                 delattr(event, _TASK_FENCE_FINAL_TURN_GENERATION_KEY)
+            except AttributeError:
+                pass
+            try:
+                delattr(event, _TASK_FENCE_FINAL_TURN_FOOTER_KEY)
             except AttributeError:
                 pass
             # Goal continuation: after the agent returns a final response
@@ -12690,6 +12801,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+            try:
+                from gateway.task_fence_delivery import (
+                    TASK_FENCE_DELIVERY_CAPABILITY_ATTR,
+                )
+
+                _delivery_capability = _task_fence_delivery_capability_for_event(
+                    self,
+                    event,
+                    _quick_key,
+                    _agent_result,
+                    _task_fence_final_generation,
+                    queued_followup=_task_fence_queued_followup,
+                    proxy_result=_task_fence_proxy_result,
+                    streaming_result=_task_fence_streaming_result,
+                    runtime_footer=_task_fence_runtime_footer,
+                )
+                if _delivery_capability is not None:
+                    setattr(
+                        event,
+                        TASK_FENCE_DELIVERY_CAPABILITY_ATTR,
+                        _delivery_capability,
+                    )
+            except Exception:
+                logger.warning(
+                    "Task Fence shadow delivery capability failed open for %s",
+                    _quick_key,
+                    exc_info=True,
+                )
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -14593,6 +14732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
+                setattr(event, _TASK_FENCE_FINAL_TURN_FOOTER_KEY, True)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -20729,6 +20869,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            _mark_task_fence_delivery_exclusion(
+                _TASK_FENCE_DELIVERY_EXCLUDE_PROXY
+            )
             result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -23892,6 +24035,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                _mark_task_fence_delivery_exclusion(
+                    _TASK_FENCE_DELIVERY_EXCLUDE_QUEUED
+                )
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
