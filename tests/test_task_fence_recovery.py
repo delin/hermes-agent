@@ -508,10 +508,11 @@ def test_recovery_turns_started_effect_into_one_durable_incident(tmp_path) -> No
 
 @pytest.mark.parametrize(
     "resolution_fault",
-    (None, "action", "correlation", "evidence"),
+    (None, "action", "correlation", "evidence", "cardinality"),
 )
 def test_recovery_adopts_preexisting_unknowns_into_one_durable_incident(
     tmp_path,
+    monkeypatch,
     resolution_fault,
 ) -> None:
     path = tmp_path / "state.db"
@@ -599,6 +600,20 @@ def test_recovery_adopts_preexisting_unknowns_into_one_durable_incident(
             reopened_transitions(attempt_id) == transitions_before[attempt_id]
             for attempt_id in attempt_ids
         )
+        if resolution_fault == "cardinality":
+            monkeypatch.setattr(
+                hermes_state,
+                "_TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS",
+                1,
+            )
+            before = _task_fence_state(reopened)
+            with pytest.raises(
+                TaskFenceRecoveryUnavailable,
+                match="incompatible_recovery_projection",
+            ):
+                _recover(reopened)
+            assert _task_fence_state(reopened) == before
+            return
         with pytest.raises(TaskFenceIngressRejected):
             reopened.accept_task_fence_ingress(
                 _ingress(
@@ -768,6 +783,260 @@ def test_recovery_rejects_empty_preexisting_incident_instead_of_repairing_it(
         "SELECT COUNT(*) FROM task_fence_incident_attempts"
     ).fetchone()[0] == 0
     db.close()
+
+
+def test_recovery_deep_validates_only_mutable_or_unresolved_permits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    accepted = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "message-bounded-frontier")
+    )
+    policy = TaskFencePolicy(db)
+    historical_reserved_ids = []
+    for ordinal in range(16):
+        historical_generation = db.reserve_task_fence_generation(accepted)
+        assert db.finish_task_fence_generation(
+            historical_generation,
+            state="committed",
+        )
+        historical_invocation = historical_generation.for_invocation(
+            f"tfiv-historical-reserved-{ordinal}"
+        )
+        historical_permit = policy.admit_operation(
+            historical_invocation,
+            _operation(historical_invocation.invocation_id),
+        )
+        assert historical_permit.permit_id is not None
+        historical_reserved_ids.append(historical_permit.permit_id)
+
+    generation = db.reserve_task_fence_generation(accepted)
+    assert db.finish_task_fence_generation(generation, state="committed")
+
+    terminal_permit_ids = []
+    for ordinal in range(32):
+        invocation = generation.for_invocation(f"tfiv-terminal-history-{ordinal}")
+        operation = _operation(invocation.invocation_id)
+        permit = policy.admit_operation(invocation, operation)
+        started = policy.authorize_and_start(
+            invocation,
+            operation,
+            permit.permit_id,
+        )
+        policy.finish_attempt(
+            started.attempt_id,
+            (
+                AttemptTerminal.SUCCEEDED
+                if ordinal % 2 == 0
+                else AttemptTerminal.FAILED_DEFINITE
+            ),
+            f"ack:terminal-history-{ordinal}",
+        )
+        terminal_permit_ids.append(permit.permit_id)
+
+    reserved_invocation = generation.for_invocation("tfiv-frontier-reserved")
+    reserved_operation = _operation(reserved_invocation.invocation_id)
+    reserved = policy.admit_operation(reserved_invocation, reserved_operation)
+    started_invocation = generation.for_invocation("tfiv-frontier-started")
+    started_operation = _operation(started_invocation.invocation_id)
+    started_permit = policy.admit_operation(started_invocation, started_operation)
+    started = policy.authorize_and_start(
+        started_invocation,
+        started_operation,
+        started_permit.permit_id,
+    )
+
+    terminal_rows_before = tuple(
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT permit.*, attempt.* "
+            "FROM task_fence_dispatch_permits AS permit "
+            "JOIN task_fence_attempts AS attempt "
+            "ON attempt.permit_id = permit.permit_id "
+            "WHERE attempt.state IN ('SUCCEEDED', 'FAILED_DEFINITE') "
+            "ORDER BY permit.permit_id"
+        )
+    )
+    terminal_transitions_before = tuple(
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT transition.* "
+            "FROM task_fence_attempt_transitions AS transition "
+            "JOIN task_fence_attempts AS attempt "
+            "ON attempt.attempt_id = transition.attempt_id "
+            "WHERE attempt.state IN ('SUCCEEDED', 'FAILED_DEFINITE') "
+            "ORDER BY transition.transition_order"
+        )
+    )
+    assert len(terminal_rows_before) == len(terminal_permit_ids) == 32
+    assert len(historical_reserved_ids) == 16
+    db.close()
+
+    checked_permit_ids = []
+    original_validator = (
+        SessionDB._task_fence_policy_permit_storage_compatible_unlocked
+    )
+
+    def track_validator(self, conn, permit):
+        checked_permit_ids.append(permit["permit_id"])
+        return original_validator(self, conn, permit)
+
+    monkeypatch.setattr(
+        SessionDB,
+        "_task_fence_policy_permit_storage_compatible_unlocked",
+        track_validator,
+    )
+    reopened = SessionDB(path)
+    try:
+        _recover(reopened)
+        assert set(checked_permit_ids) == {
+            *historical_reserved_ids,
+            reserved.permit_id,
+            started_permit.permit_id,
+        }
+        assert set(checked_permit_ids).isdisjoint(terminal_permit_ids)
+        assert reopened._conn.execute(
+            "SELECT state FROM task_fence_dispatch_permits WHERE permit_id = ?",
+            (reserved.permit_id,),
+        ).fetchone()[0] == "revoked"
+        assert reopened._conn.execute(
+            "SELECT state FROM task_fence_attempts WHERE attempt_id = ?",
+            (started.attempt_id,),
+        ).fetchone()[0] == "OUTCOME_UNKNOWN"
+        assert tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT permit.*, attempt.* "
+                "FROM task_fence_dispatch_permits AS permit "
+                "JOIN task_fence_attempts AS attempt "
+                "ON attempt.permit_id = permit.permit_id "
+                "WHERE attempt.state IN ('SUCCEEDED', 'FAILED_DEFINITE') "
+                "ORDER BY permit.permit_id"
+            )
+        ) == terminal_rows_before
+        assert tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT transition.* "
+                "FROM task_fence_attempt_transitions AS transition "
+                "JOIN task_fence_attempts AS attempt "
+                "ON attempt.attempt_id = transition.attempt_id "
+                "WHERE attempt.state IN ('SUCCEEDED', 'FAILED_DEFINITE') "
+                "ORDER BY transition.transition_order"
+            )
+        ) == terminal_transitions_before
+        assert {
+            row[0]
+            for row in reopened._conn.execute(
+                "SELECT state FROM task_fence_dispatch_permits "
+                "WHERE permit_id IN ("
+                + ",".join("?" for _permit_id in historical_reserved_ids)
+                + ")",
+                historical_reserved_ids,
+            )
+        } == {"revoked"}
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    (AttemptTerminal.SUCCEEDED, AttemptTerminal.FAILED_DEFINITE),
+)
+def test_recovery_rejects_terminal_projection_without_terminal_proof(
+    tmp_path,
+    terminal,
+) -> None:
+    path = tmp_path / f"state-{terminal.value}.db"
+    db = SessionDB(path)
+    accepted = db.accept_task_fence_ingress(
+        _ingress("initial_submit", f"message-forged-{terminal.value}")
+    )
+    generation = db.reserve_task_fence_generation(accepted)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    invocation = generation.for_invocation(f"tfiv-forged-{terminal.value}")
+    operation = _operation(invocation.invocation_id)
+    policy = TaskFencePolicy(db)
+    permit = policy.admit_operation(invocation, operation)
+    started = policy.authorize_and_start(
+        invocation,
+        operation,
+        permit.permit_id,
+    )
+    started_at = db._conn.execute(
+        "SELECT started_at FROM task_fence_attempts WHERE attempt_id = ?",
+        (started.attempt_id,),
+    ).fetchone()[0]
+    db._conn.execute(
+        "UPDATE task_fence_attempts SET state = ?, disposition = ?, "
+        "acknowledgement_ref = ?, terminal_at = ? WHERE attempt_id = ?",
+        (
+            terminal.value,
+            terminal.value,
+            f"ack:forged-{terminal.value}",
+            started_at,
+            started.attempt_id,
+        ),
+    )
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM task_fence_attempt_transitions "
+        "WHERE attempt_id = ?",
+        (started.attempt_id,),
+    ).fetchone()[0] == 1
+    db.close()
+
+    reopened = SessionDB(path)
+    try:
+        before = _task_fence_state(reopened)
+        with pytest.raises(
+            TaskFenceRecoveryUnavailable,
+            match="incompatible_recovery_projection",
+        ):
+            _recover(reopened)
+        assert _task_fence_state(reopened) == before
+    finally:
+        reopened.close()
+
+
+def test_recovery_frontier_limit_rejects_without_mutation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    accepted = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "message-frontier-limit")
+    )
+    generation = db.reserve_task_fence_generation(accepted)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    policy = TaskFencePolicy(db)
+    for ordinal in range(2):
+        invocation = generation.for_invocation(f"tfiv-frontier-limit-{ordinal}")
+        policy.admit_operation(invocation, _operation(invocation.invocation_id))
+    started_invocation = generation.for_invocation("tfiv-frontier-limit-started")
+    started_operation = _operation(started_invocation.invocation_id)
+    started_permit = policy.admit_operation(started_invocation, started_operation)
+    policy.authorize_and_start(
+        started_invocation,
+        started_operation,
+        started_permit.permit_id,
+    )
+    db.close()
+
+    monkeypatch.setattr(hermes_state, "_TASK_FENCE_MAX_RECOVERY_AUTHORITIES", 2)
+    reopened = SessionDB(path)
+    try:
+        before = _task_fence_state(reopened)
+        with pytest.raises(
+            TaskFenceRecoveryUnavailable,
+            match="recovery_authority_limit_exceeded",
+        ):
+            _recover(reopened)
+        assert _task_fence_state(reopened) == before
+    finally:
+        reopened.close()
 
 
 @pytest.mark.parametrize("fault_target", ("task", "control"))
