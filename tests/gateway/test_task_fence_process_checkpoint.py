@@ -1,14 +1,74 @@
+import hashlib
 import json
 import os
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
+import hermes_state
 from gateway import task_fence_startup as startup
+from hermes_state import SessionDB
+from task_fence import (
+    OperationDescriptor,
+    OperationKind,
+    TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
+    TaskFenceArtifactIdentity,
+    TaskFenceProtocolRejected,
+    TaskFenceRecoveryUnavailable,
+)
 
 
 _SESSION_KEY = "slack:workspace:channel:user"
+
+
+def _artifact_identity() -> TaskFenceArtifactIdentity:
+    return TaskFenceArtifactIdentity(
+        tested_artifact_commit="a" * 40,
+        tested_artifact_checksum="sha256:" + "b" * 64,
+        dependency_lock_fingerprint="sha256:" + "c" * 64,
+    )
+
+
+def _operation(
+    observation: startup._ProcessCheckpointObservation,
+) -> OperationDescriptor:
+    return OperationDescriptor(
+        invocation_id=observation.invocation_id,
+        kind=OperationKind.TOOL,
+        adapter=TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
+        invocation_fingerprint=observation.invocation_fingerprint,
+    )
+
+
+def _task_fence_state(db: SessionDB) -> tuple:
+    tables = tuple(
+        row[0]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name GLOB 'task_fence_*' ORDER BY name"
+        )
+    )
+    rows = tuple(
+        (
+            table,
+            tuple(
+                tuple(row)
+                for row in db._conn.execute(
+                    f'SELECT * FROM "{table}" ORDER BY rowid'
+                )
+            ),
+        )
+        for table in tables
+    )
+    sequence = tuple(
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT name, seq FROM sqlite_sequence "
+            "WHERE name GLOB 'task_fence_*' ORDER BY name"
+        )
+    )
+    return rows, sequence
 
 
 def _candidate(
@@ -550,3 +610,280 @@ def test_process_checkpoint_snapshot_errors_do_not_expose_raw_values(
     combined = repr(exc_info.value) + "\n" + caplog.text
     assert "toxic-command-secret" not in combined
     assert "toxic-route-secret" not in combined
+
+
+def test_process_checkpoint_observation_is_durable_replay_stable_and_hash_only(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "processes.json"
+    _write_checkpoint(checkpoint, [_candidate()])
+    operations = tuple(
+        _operation(observation)
+        for observation in startup._read_process_checkpoint_snapshot(
+            checkpoint,
+            shadow_session_key=_SESSION_KEY,
+        )
+    )
+    checkpoint_before = checkpoint.read_bytes()
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        first = db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SESSION_KEY,
+            process_checkpoint_operations=operations,
+        )
+        assert first.runtime_epoch == 1
+        assert checkpoint.read_bytes() == checkpoint_before
+
+        rows = db._conn.execute(
+            "SELECT decision_id, operation_invocation_id, outcome, reason_code, "
+            "decision_point, operation_kind, adapter, invocation_fingerprint, "
+            "candidate_task_id, candidate_generation_id, "
+            "candidate_runtime_epoch, permit_id, attempt_id "
+            "FROM task_fence_policy_decisions WHERE adapter = ?",
+            (TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,),
+        ).fetchall()
+        assert len(rows) == 1
+        assert tuple(rows[0])[1:] == (
+            operations[0].invocation_id,
+            "would_block",
+            "missing_provenance",
+            "admission",
+            "tool",
+            TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
+            operations[0].invocation_fingerprint,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        journal_dump = repr(tuple(rows[0]))
+        assert "proc_selected" not in journal_dump
+        assert "toxic-command-secret" not in journal_dump
+        assert "private-" not in journal_dump
+        first_decision_id = rows[0]["decision_id"]
+
+        replay = db.recover_task_fence_state(
+            expected_runtime_epoch=1,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SESSION_KEY,
+            process_checkpoint_operations=operations,
+        )
+        assert replay.runtime_epoch == 2
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions WHERE adapter = ?",
+            (TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,),
+        ).fetchone()[0] == 1
+
+        _write_checkpoint(
+            checkpoint,
+            [_candidate(command="changed-toxic-command-secret")],
+        )
+        changed_operations = tuple(
+            _operation(observation)
+            for observation in startup._read_process_checkpoint_snapshot(
+                checkpoint,
+                shadow_session_key=_SESSION_KEY,
+            )
+        )
+        assert changed_operations[0].invocation_id == operations[0].invocation_id
+        assert (
+            changed_operations[0].invocation_fingerprint
+            != operations[0].invocation_fingerprint
+        )
+        changed_checkpoint = checkpoint.read_bytes()
+        changed = db.recover_task_fence_state(
+            expected_runtime_epoch=2,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SESSION_KEY,
+            process_checkpoint_operations=changed_operations,
+        )
+        assert changed.runtime_epoch == 3
+        assert checkpoint.read_bytes() == changed_checkpoint
+        changed_rows = db._conn.execute(
+            "SELECT decision_id, operation_invocation_id, "
+            "invocation_fingerprint FROM task_fence_policy_decisions "
+            "WHERE adapter = ? ORDER BY decision_id",
+            (TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,),
+        ).fetchall()
+        assert len(changed_rows) == 2
+        assert {row["operation_invocation_id"] for row in changed_rows} == {
+            operations[0].invocation_id
+        }
+        assert len({row["invocation_fingerprint"] for row in changed_rows}) == 2
+        assert first_decision_id in {row["decision_id"] for row in changed_rows}
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    (
+        ("list", "invalid_process_checkpoint_operations"),
+        ("too-many", "invalid_process_checkpoint_operations"),
+        ("wrong-kind", "invalid_process_checkpoint_operations"),
+        ("wrong-adapter", "invalid_process_checkpoint_operations"),
+        ("wrong-prefix", "invalid_process_checkpoint_operations"),
+        ("duplicate", "invalid_process_checkpoint_operations"),
+        ("mutated-fingerprint", "invalid_process_checkpoint_operations"),
+        (
+            "no-shadow",
+            "process_checkpoint_operations_require_shadow_session_key",
+        ),
+        ("no-artifact", "shadow_session_key_requires_artifact"),
+    ),
+)
+def test_process_checkpoint_operation_boundary_is_closed_and_read_only(
+    tmp_path: Path,
+    case: str,
+    reason: str,
+) -> None:
+    valid = OperationDescriptor(
+        invocation_id="tfqp_" + hashlib.sha256(b"valid").hexdigest(),
+        kind=OperationKind.TOOL,
+        adapter=TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
+        invocation_fingerprint=hashlib.sha256(b"projection").hexdigest(),
+    )
+    operations: object = (valid,)
+    shadow_session_key: str | None = _SESSION_KEY
+    artifact: TaskFenceArtifactIdentity | None = _artifact_identity()
+    if case == "list":
+        operations = [valid]
+    elif case == "too-many":
+        operations = tuple(
+            replace(
+                valid,
+                invocation_id="tfqp_" + hashlib.sha256(str(index).encode()).hexdigest(),
+            )
+            for index in range(startup._MAX_PROCESS_CHECKPOINT_ENTRIES + 1)
+        )
+    elif case == "wrong-kind":
+        operations = (replace(valid, kind=OperationKind.DELIVERY),)
+    elif case == "wrong-adapter":
+        operations = (replace(valid, adapter="runtime:other"),)
+    elif case == "wrong-prefix":
+        operations = (
+            replace(valid, invocation_id="tfqr_" + hashlib.sha256(b"id").hexdigest()),
+        )
+    elif case == "duplicate":
+        operations = (valid, valid)
+    elif case == "mutated-fingerprint":
+        object.__setattr__(valid, "invocation_fingerprint", "not-a-fingerprint")
+    elif case == "no-shadow":
+        shadow_session_key = None
+    elif case == "no-artifact":
+        artifact = None
+
+    db = SessionDB(tmp_path / "state.db")
+    before = _task_fence_state(db)
+    try:
+        with pytest.raises(TaskFenceProtocolRejected, match=reason) as exc_info:
+            db.recover_task_fence_state(
+                expected_runtime_epoch=0,
+                expected_mode_generation=0,
+                tested_artifact_identity=artifact,
+                shadow_session_key=shadow_session_key,
+                process_checkpoint_operations=operations,
+            )
+        assert exc_info.value.reason == reason
+        assert _task_fence_state(db) == before
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("fault_target", ("decision", "control"))
+def test_process_checkpoint_observation_rolls_back_with_startup_recovery(
+    tmp_path: Path,
+    fault_target: str,
+) -> None:
+    checkpoint = tmp_path / "processes.json"
+    checkpoint_before = _write_checkpoint(checkpoint, [_candidate()])
+    operations = tuple(
+        _operation(observation)
+        for observation in startup._read_process_checkpoint_snapshot(
+            checkpoint,
+            shadow_session_key=_SESSION_KEY,
+        )
+    )
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    trigger = {
+        "decision": (
+            "BEFORE INSERT ON main.task_fence_policy_decisions",
+            "private process observation fault",
+        ),
+        "control": (
+            "BEFORE UPDATE OF runtime_epoch ON main.task_fence_control "
+            "WHEN NEW.runtime_epoch != OLD.runtime_epoch",
+            "private process recovery fault",
+        ),
+    }[fault_target]
+    db._conn.execute(
+        "CREATE TEMP TRIGGER fail_process_checkpoint_observation "
+        f"{trigger[0]} BEGIN SELECT RAISE(ABORT, '{trigger[1]}'); END"
+    )
+    before = _task_fence_state(db)
+
+    with pytest.raises(
+        TaskFenceRecoveryUnavailable,
+        match="recovery_database_error",
+    ) as exc_info:
+        db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SESSION_KEY,
+            process_checkpoint_operations=operations,
+        )
+
+    assert exc_info.value.reason == "recovery_database_error"
+    assert exc_info.value.__cause__ is None
+    assert "private" not in str(exc_info.value)
+    assert _task_fence_state(db) == before
+    assert checkpoint.read_bytes() == checkpoint_before
+    db.close()
+
+    reopened = SessionDB(path)
+    try:
+        assert _task_fence_state(reopened) == before
+    finally:
+        reopened.close()
+
+
+def test_process_checkpoint_observation_shares_recovery_authority_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "processes.json"
+    checkpoint_before = _write_checkpoint(checkpoint, [_candidate()])
+    operations = tuple(
+        _operation(observation)
+        for observation in startup._read_process_checkpoint_snapshot(
+            checkpoint,
+            shadow_session_key=_SESSION_KEY,
+        )
+    )
+    db = SessionDB(tmp_path / "state.db")
+    before = _task_fence_state(db)
+    monkeypatch.setattr(hermes_state, "_TASK_FENCE_MAX_RECOVERY_AUTHORITIES", 0)
+
+    with pytest.raises(
+        TaskFenceRecoveryUnavailable,
+        match="recovery_authority_limit_exceeded",
+    ):
+        db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SESSION_KEY,
+            process_checkpoint_operations=operations,
+        )
+
+    assert _task_fence_state(db) == before
+    assert checkpoint.read_bytes() == checkpoint_before
+    db.close()

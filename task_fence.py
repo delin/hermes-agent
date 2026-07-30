@@ -37,6 +37,9 @@ _DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 
 TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
 TASK_FENCE_FINAL_GENERATION_KEY = "_task_fence_final_generation"
+TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER = (
+    "runtime:process_checkpoint_recovery_pending"
+)
 
 
 class Origin(str, Enum):

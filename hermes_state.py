@@ -53,6 +53,7 @@ from task_fence import (
     OperationKind,
     TASK_FENCE_ACTIONS,
     TASK_FENCE_POLICY_VERSION,
+    TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
     TASK_FENCE_STORE_SCHEMA_VERSION,
     CorrelationKind,
     ExecutionEffect,
@@ -345,6 +346,7 @@ _TASK_FENCE_MAX_RECOVERY_ROWS = 1_000_000
 _TASK_FENCE_MAX_RECOVERY_AUTHORITIES = 8_192
 _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS = 64
 _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
+_TASK_FENCE_MAX_PROCESS_CHECKPOINT_OPERATIONS = 64
 _TASK_FENCE_MAX_RUNTIME_EPOCH = 2**63 - 1
 _TASK_FENCE_ASYNC_RESTORE_ADAPTER = "runtime:async_delegation_restore_ready"
 _TASK_FENCE_ASYNC_RECOVERY_PENDING_ADAPTER = "runtime:async_delegation_recovery_pending"
@@ -353,6 +355,9 @@ _TASK_FENCE_DELIVERY_RECOVERY_PENDING_ADAPTER = (
 )
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
 _TASK_FENCE_POLICY_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
+_TASK_FENCE_PROCESS_CHECKPOINT_INVOCATION_ID_RE = re.compile(
+    r"\Atfqp_[0-9a-f]{64}\Z"
+)
 _TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
 # Fixed audit-only bound; no config until a real consumer sets a latency budget.
 _TASK_FENCE_POLICY_PERMIT_TTL_SECONDS = 24 * 60 * 60
@@ -6174,6 +6179,7 @@ class SessionDB:
         expected_mode_generation: int,
         tested_artifact_identity: Optional[TaskFenceArtifactIdentity] = None,
         shadow_session_key: Optional[str] = None,
+        process_checkpoint_operations: Tuple[OperationDescriptor, ...] = (),
     ) -> TaskFenceRecovery:
         """Recover shadow state and observe durable queued recovery candidates."""
 
@@ -6191,6 +6197,44 @@ class SessionDB:
                 raise TaskFenceProtocolRejected("invalid_shadow_session_key")
             if tested_artifact_identity is None:
                 raise TaskFenceProtocolRejected("shadow_session_key_requires_artifact")
+        if (
+            type(process_checkpoint_operations) is not tuple
+            or len(process_checkpoint_operations)
+            > _TASK_FENCE_MAX_PROCESS_CHECKPOINT_OPERATIONS
+        ):
+            raise TaskFenceProtocolRejected(
+                "invalid_process_checkpoint_operations"
+            )
+        if process_checkpoint_operations and shadow_session_key is None:
+            raise TaskFenceProtocolRejected(
+                "process_checkpoint_operations_require_shadow_session_key"
+            )
+        process_checkpoint_invocation_ids: set[str] = set()
+        for operation in process_checkpoint_operations:
+            if type(operation) is not OperationDescriptor:
+                raise TaskFenceProtocolRejected(
+                    "invalid_process_checkpoint_operations"
+                )
+            try:
+                validate_operation_descriptor(operation)
+            except TaskFenceProtocolRejected:
+                raise TaskFenceProtocolRejected(
+                    "invalid_process_checkpoint_operations"
+                ) from None
+            if (
+                operation.kind is not OperationKind.TOOL
+                or operation.adapter
+                != TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER
+                or _TASK_FENCE_PROCESS_CHECKPOINT_INVOCATION_ID_RE.fullmatch(
+                    operation.invocation_id
+                )
+                is None
+                or operation.invocation_id in process_checkpoint_invocation_ids
+            ):
+                raise TaskFenceProtocolRejected(
+                    "invalid_process_checkpoint_operations"
+                )
+            process_checkpoint_invocation_ids.add(operation.invocation_id)
         if self.read_only or self._conn is None:
             raise TaskFenceRecoveryUnavailable("store_unavailable")
 
@@ -6243,6 +6287,11 @@ class SessionDB:
                     )
 
             authority_rows_remaining = _TASK_FENCE_MAX_RECOVERY_AUTHORITIES
+            if len(process_checkpoint_operations) > authority_rows_remaining:
+                raise TaskFenceRecoveryUnavailable(
+                    "recovery_authority_limit_exceeded"
+                )
+            authority_rows_remaining -= len(process_checkpoint_operations)
 
             def bounded_authority_rows(
                 statement: str,
@@ -7079,7 +7128,17 @@ class SessionDB:
                     OperationDescriptor,
                     DispatchDecision,
                 ]
-            ] = []
+            ] = [
+                (
+                    None,
+                    operation,
+                    DispatchDecision(
+                        DecisionOutcome.WOULD_BLOCK,
+                        DecisionReason.MISSING_PROVENANCE,
+                    ),
+                )
+                for operation in process_checkpoint_operations
+            ]
             if shadow_session_key is not None:
                 async_rows = bounded_authority_rows(
                     "SELECT delegation.delegation_id, "

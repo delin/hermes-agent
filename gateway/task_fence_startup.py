@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from task_fence import (
+    OperationDescriptor,
+    OperationKind,
+    TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
     TaskFenceArtifactIdentity,
     TaskFenceProtocolRejected,
     TaskFenceRecovery,
@@ -423,6 +426,15 @@ def prepare_task_fence_shadow_startup(config: Any) -> TaskFenceRecovery | None:
             "recovery candidate(s)",
             len(process_checkpoint),
         )
+        process_checkpoint_operations = tuple(
+            OperationDescriptor(
+                invocation_id=observation.invocation_id,
+                kind=OperationKind.TOOL,
+                adapter=TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
+                invocation_fingerprint=observation.invocation_fingerprint,
+            )
+            for observation in process_checkpoint
+        )
         database = SessionDB(hermes_home / "state.db")
         store = database.inspect_task_fence_store()
         if not store.compatible:
@@ -438,6 +450,7 @@ def prepare_task_fence_shadow_startup(config: Any) -> TaskFenceRecovery | None:
             expected_mode_generation=store.mode_generation,
             tested_artifact_identity=identity,
             shadow_session_key=config.task_fence_shadow_session_key,
+            process_checkpoint_operations=process_checkpoint_operations,
         )
     except TaskFenceStartupUnavailable:
         raise

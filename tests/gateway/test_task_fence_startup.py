@@ -252,14 +252,17 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     monkeypatch.setattr(startup, "_parse_receipt", traced_parse)
 
     real_checkpoint_snapshot = startup._read_process_checkpoint_snapshot
+    checkpoint_observations = ()
 
     def traced_checkpoint_snapshot(path: Path, *, shadow_session_key: str):
+        nonlocal checkpoint_observations
         events.append("checkpoint")
         observations = real_checkpoint_snapshot(
             path,
             shadow_session_key=shadow_session_key,
         )
-        assert len(observations) == 1
+        assert len(observations) == 2
+        checkpoint_observations = observations
         return observations
 
     monkeypatch.setattr(
@@ -272,6 +275,20 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
 
     def traced_recover(self: SessionDB, **kwargs):
         events.append("composite")
+        process_operations = kwargs["process_checkpoint_operations"]
+        assert tuple(
+            (operation.invocation_id, operation.invocation_fingerprint)
+            for operation in process_operations
+        ) == tuple(
+            (observation.invocation_id, observation.invocation_fingerprint)
+            for observation in checkpoint_observations
+        )
+        assert {
+            operation.kind.value for operation in process_operations
+        } == {"tool"}
+        assert {
+            operation.adapter for operation in process_operations
+        } == {"runtime:process_checkpoint_recovery_pending"}
         return real_recover(self, **kwargs)
 
     monkeypatch.setattr(SessionDB, "recover_task_fence_state", traced_recover)
@@ -327,12 +344,21 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     process_checkpoint = tmp_path / "processes.json"
     process_checkpoint.write_text(
         json.dumps(
-            [{
-                "session_id": "proc_startup_candidate",
-                "pid": 999_999_999,
-                "session_key": _SHADOW_SESSION_KEY,
-                "watcher_interval": 5,
-            }]
+            [
+                {
+                    "session_id": "proc_startup_candidate",
+                    "pid": 999_999_999,
+                    "session_key": _SHADOW_SESSION_KEY,
+                    "watcher_interval": 5,
+                },
+                {
+                    "session_id": "proc_startup_manual",
+                    "pid": 999_999_998,
+                    "session_key": _SHADOW_SESSION_KEY,
+                    "watcher_interval": 0,
+                    "notify_on_complete": False,
+                },
+            ]
         ),
         encoding="utf-8",
     )
@@ -367,6 +393,17 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
                     for row in database._conn.execute(
                         "SELECT outcome, reason_code, decision_point, "
                         "operation_kind, adapter FROM task_fence_policy_decisions"
+                    )
+                }
+                process_decisions = {
+                    (
+                        row["operation_invocation_id"],
+                        row["invocation_fingerprint"],
+                    )
+                    for row in database._conn.execute(
+                        "SELECT operation_invocation_id, invocation_fingerprint "
+                        "FROM task_fence_policy_decisions WHERE adapter = "
+                        "'runtime:process_checkpoint_recovery_pending'"
                     )
                 }
                 queued = tuple(
@@ -408,6 +445,20 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
                     "delivery",
                     "runtime:delivery_obligation_recovery_pending",
                 ),
+                "runtime:process_checkpoint_recovery_pending": (
+                    "would_block",
+                    "missing_provenance",
+                    "admission",
+                    "tool",
+                    "runtime:process_checkpoint_recovery_pending",
+                ),
+            }
+            assert process_decisions == {
+                (
+                    observation.invocation_id,
+                    observation.invocation_fingerprint,
+                )
+                for observation in checkpoint_observations
             }
             assert queued == (
                 ("deadbee0", "running", "pending", None),
