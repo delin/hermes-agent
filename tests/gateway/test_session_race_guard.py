@@ -263,6 +263,127 @@ def test_merge_pending_message_event_promotes_document_followups_over_text():
     assert merged.media_types == ["application/pdf"]
 
 
+@pytest.mark.parametrize("internal_first", [False, True])
+def test_merge_with_internal_event_clears_task_fence_parent(internal_first):
+    """A combined human/runtime prompt has no single causal acceptance."""
+
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+    human = MessageEvent(
+        text="human follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        task_fence_ingress=object(),
+        task_fence_acceptance=object(),
+    )
+    wake = MessageEvent(
+        text="runtime wake",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        task_fence_acceptance=object(),
+    )
+    first, second = (wake, human) if internal_first else (human, wake)
+    later_human = MessageEvent(
+        text="later human follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        task_fence_ingress=object(),
+        task_fence_acceptance=object(),
+    )
+    expected_text = f"{first.text}\n{second.text}\n{later_human.text}"
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, second, merge_text=True)
+    merge_pending_message_event(
+        pending,
+        session_key,
+        later_human,
+        merge_text=True,
+    )
+
+    merged = pending[session_key]
+    assert merged.text == expected_text
+    assert merged.task_fence_ingress is None
+    assert merged.task_fence_acceptance is None
+    assert merged.task_fence_acceptance_attempted is True
+
+
+def test_merge_preserves_incoming_mixed_origin_taint():
+    """A pre-composed incoming bundle cannot regain authority later."""
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+
+    def human(text):
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            task_fence_ingress=object(),
+            task_fence_acceptance=object(),
+        )
+
+    bundle = {}
+    merge_pending_message_event(
+        bundle,
+        session_key,
+        human("bundled human"),
+        merge_text=True,
+    )
+    merge_pending_message_event(
+        bundle,
+        session_key,
+        MessageEvent(
+            text="bundled wake",
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            task_fence_acceptance=object(),
+        ),
+        merge_text=True,
+    )
+
+    pending = {}
+    merge_pending_message_event(
+        pending,
+        session_key,
+        human("existing human"),
+        merge_text=True,
+    )
+    merge_pending_message_event(
+        pending,
+        session_key,
+        bundle[session_key],
+        merge_text=True,
+    )
+    merge_pending_message_event(
+        pending,
+        session_key,
+        human("later human"),
+        merge_text=True,
+    )
+
+    merged = pending[session_key]
+    assert merged.text == (
+        "existing human\nbundled human\nbundled wake\nlater human"
+    )
+    assert merged.task_fence_ingress is None
+    assert merged.task_fence_acceptance is None
+    assert merged.task_fence_acceptance_attempted is True
+
+
 @pytest.mark.asyncio
 async def test_recent_telegram_text_followup_is_queued_without_interrupt():
     runner = _make_runner()

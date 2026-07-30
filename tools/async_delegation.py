@@ -413,8 +413,8 @@ def _observe_task_fence_completion_claim(
     event_json: object,
     parent_generation_id: object,
     parent_runtime_epoch: object,
-) -> None:
-    """Best-effort durable synthetic evidence after one winning claim."""
+) -> Optional[Any]:
+    """Accept exact delegation evidence and return its process-local snapshot."""
 
     if parent_generation_id is None and parent_runtime_epoch is None:
         return
@@ -467,6 +467,7 @@ def _observe_task_fence_completion_claim(
                 or acceptance.closed_run_id is not None
             ):
                 raise RuntimeError("synthetic evidence changed run state")
+            return acceptance
         finally:
             db.close()
     except Exception as exc:
@@ -474,10 +475,15 @@ def _observe_task_fence_completion_claim(
             "Task Fence shadow async-completion evidence failed: %s",
             type(exc).__name__,
         )
+    return None
 
 
-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Claim one pending completion across competing consumers/processes."""
+def _claim_completion_delivery(
+    delegation_id: str,
+    claim_id: str,
+) -> tuple[bool, Optional[Any]]:
+    """Claim once and retain any trusted Task Fence acceptance locally."""
+
     now = time.time()
     evidence = None
     with _DB_LOCK, _transaction() as conn:
@@ -489,7 +495,7 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (delegation_id,),
         ).fetchone()
         if row is None:
-            return True  # legacy event created before durable dispatch
+            return True, None  # legacy event created before durable dispatch
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
@@ -506,8 +512,9 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                 row[3],
                 row[4],
             )
+    acceptance = None
     if evidence is not None:
-        _observe_task_fence_completion_claim(
+        acceptance = _observe_task_fence_completion_claim(
             delegation_id=delegation_id,
             state=evidence[0],
             dispatched_at=evidence[1],
@@ -515,7 +522,23 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             parent_generation_id=evidence[3],
             parent_runtime_epoch=evidence[4],
         )
+    return claimed, acceptance
+
+
+def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Claim one pending completion across competing consumers/processes."""
+
+    claimed, _acceptance = _claim_completion_delivery(delegation_id, claim_id)
     return claimed
+
+
+def claim_completion_delivery_with_acceptance(
+    delegation_id: str,
+    claim_id: str,
+) -> tuple[bool, Optional[Any]]:
+    """Claim for Wake and return only the already-durable acceptance."""
+
+    return _claim_completion_delivery(delegation_id, claim_id)
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:

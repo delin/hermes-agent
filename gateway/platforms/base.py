@@ -2365,8 +2365,22 @@ def _carry_latest_task_fence_ingress_result(
     existing: MessageEvent,
     incoming: MessageEvent,
 ) -> None:
-    """Keep merged text bound only to the latest event's ingress result."""
+    """Keep plain merged text bound only to one exact ingress result."""
 
+    if (
+        getattr(existing, "_task_fence_mixed_origin", False)
+        or getattr(incoming, "_task_fence_mixed_origin", False)
+        or existing.internal
+        or incoming.internal
+    ):
+        # A merged prompt containing any runtime text has no single exact
+        # human/synthetic parent. Preserve the legacy merged turn, but do not
+        # let either acceptance launder authority for the combined payload.
+        existing.task_fence_ingress = None
+        existing.task_fence_acceptance = None
+        existing.task_fence_acceptance_attempted = True
+        existing._task_fence_mixed_origin = True
+        return
     existing.task_fence_ingress = incoming.task_fence_ingress
     existing.task_fence_acceptance = incoming.task_fence_acceptance
     existing.task_fence_acceptance_attempted = (

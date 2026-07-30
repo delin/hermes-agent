@@ -175,8 +175,8 @@ def _capture_task_fence_process_parent() -> "tuple[Optional[str], Optional[int],
         return None, None, None
 
 
-def observe_task_fence_process_completion(event: Dict[str, Any]) -> None:
-    """Best-effort exact evidence after one ordinary completion delivery."""
+def observe_task_fence_process_completion(event: Dict[str, Any]) -> Optional[Any]:
+    """Accept exact process evidence and return its process-local snapshot."""
 
     if not isinstance(event, dict) or event.get("type") != "completion":
         return
@@ -280,6 +280,7 @@ def observe_task_fence_process_completion(event: Dict[str, Any]) -> None:
                 or acceptance.closed_run_id is not None
             ):
                 raise RuntimeError("process completion evidence changed run state")
+            return acceptance
         finally:
             db.close()
     except Exception as exc:
@@ -287,6 +288,7 @@ def observe_task_fence_process_completion(event: Dict[str, Any]) -> None:
             "Task Fence shadow process-completion evidence failed: %s",
             type(exc).__name__,
         )
+    return None
 
 
 class ProcessRegistry:

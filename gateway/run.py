@@ -18391,7 +18391,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     async def _inject_watch_notification(
-        self, synth_text: str, evt: dict,
+        self,
+        synth_text: str,
+        evt: dict,
+        task_fence_acceptance: Any = None,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -18402,6 +18405,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        task_fence_acceptance_factory: Optional[Callable[[], Any]] = None
+        if (
+            task_fence_acceptance is None
+            and evt.get("type") == "completion"
+        ):
+            def accept_process_completion() -> Any:
+                from tools.process_registry import (
+                    observe_task_fence_process_completion,
+                )
+
+                return observe_task_fence_process_completion(evt)
+
+            task_fence_acceptance_factory = accept_process_completion
+
         source = self._build_process_event_source(evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -18426,7 +18443,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            task_fence_acceptance=task_fence_acceptance,
+                            task_fence_acceptance_factory=(
+                                task_fence_acceptance_factory
+                            ),
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -18469,7 +18494,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    task_fence_acceptance=task_fence_acceptance,
+                    task_fence_acceptance_factory=(
+                        task_fence_acceptance_factory
+                    ),
+                )
                 return True
             except Exception as e:
                 logger.warning(
@@ -18483,21 +18516,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
-            synth_event = MessageEvent(
-                text=synth_text,
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
-                metadata=metadata,
-            )
+            from gateway.wake import deliver_wake
+
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
                 source.chat_id,
                 source.thread_id,
             )
-            await adapter.handle_message(synth_event)
+            wake_event = await deliver_wake(
+                adapter,
+                text=synth_text,
+                source=source,
+                message_id=str(evt.get("message_id") or "").strip(),
+                metadata=metadata,
+                task_fence_acceptance=task_fence_acceptance,
+            )
+            if (
+                task_fence_acceptance is None
+                and evt.get("type") == "completion"
+                and wake_event is not None
+            ):
+                # BasePlatformAdapter has accepted/queued this exact object,
+                # but its spawned handler cannot run until this coroutine next
+                # yields. Preserve WP7.3's post-adapter evidence boundary while
+                # attaching the durable snapshot before typing/model start.
+                wake_event.task_fence_acceptance = (
+                    task_fence_acceptance_factory()
+                )
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
@@ -18591,16 +18637,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
+        task_fence_acceptance = None
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import (
+                        claim_completion_delivery_with_acceptance,
+                    )
 
                     durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
+                    claimed, task_fence_acceptance = (
+                        claim_completion_delivery_with_acceptance(
+                            durable_delegation_id,
+                            durable_claim_id,
+                        )
+                    )
+                    if not claimed:
                         return None
                 except Exception as exc:
                     logger.warning(
@@ -18662,7 +18715,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         accepted = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
+            injection_result = await self._inject_watch_notification(
+                synth_text,
+                evt,
+                task_fence_acceptance=task_fence_acceptance,
+            )
             if injection_result is not True:
                 return injection_result
             accepted = True

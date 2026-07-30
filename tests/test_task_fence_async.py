@@ -782,8 +782,15 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
             "SELECT COUNT(*) FROM task_fence_acceptance_snapshots"
         ).fetchone()[0]
 
-        claim_a = async_delegation.claim_event_delivery(event, "consumer-a")
-        assert claim_a is not None
+        claim_a = "consumer-a:wake"
+        claimed, wake_acceptance = (
+            async_delegation.claim_completion_delivery_with_acceptance(
+                delegation_id,
+                claim_a,
+            )
+        )
+        assert claimed
+        assert wake_acceptance is not None
         assert async_delegation.claim_event_delivery(event, "consumer-loser") is None
 
         source_identity = json.dumps(
@@ -808,6 +815,7 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
         ).fetchall()
         assert len(synthetic) == 1
         evidence = synthetic[0]
+        assert wake_acceptance.event_id == evidence["event_id"]
         assert (
             evidence["source_event_id"],
             evidence["conversation_id"],
@@ -1287,9 +1295,16 @@ def test_live_process_completion_records_exact_synthetic_evidence(
             claim_event_delivery,
             complete_event_delivery,
         )
+        from tools.process_registry import (
+            observe_task_fence_process_completion,
+        )
 
         claim = claim_event_delivery(delivered_event, "process-test")
         assert claim == ""
+        wake_acceptance = observe_task_fence_process_completion(
+            delivered_event
+        )
+        assert wake_acceptance is not None
         complete_event_delivery(delivered_event, claim)
 
         identity = json.dumps(
@@ -1320,6 +1335,10 @@ def test_live_process_completion_records_exact_synthetic_evidence(
             "WHERE i.source = 'runtime:process_completion'"
         ).fetchone()
         assert evidence is not None
+        assert wake_acceptance.event_id == db._conn.execute(
+            "SELECT event_id FROM task_fence_ingress "
+            "WHERE source = 'runtime:process_completion'"
+        ).fetchone()[0]
         assert tuple(evidence[:12]) == (
             source_event_id,
             "delegation-conversation",

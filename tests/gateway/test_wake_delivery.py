@@ -12,9 +12,19 @@ import asyncio
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.api_server import (
+    MAX_NORMALIZED_TEXT_LENGTH,
+    APIServerAdapter,
+)
+from gateway.run import GatewayRunner
 from gateway.session import SessionSource
-from gateway.wake import deliver_wake, adapter_supports_push
+from gateway.wake import (
+    TASK_FENCE_WAKE_TOKEN_HEADER,
+    adapter_supports_push,
+    deliver_wake,
+)
+from task_fence import IngressAcceptance
 
 
 class PushAdapter:
@@ -48,6 +58,20 @@ def _source():
     )
 
 
+def _acceptance() -> IngressAcceptance:
+    return IngressAcceptance(
+        event_id="wake-acceptance",
+        accepted_order=1,
+        task_id=None,
+        task_projection=None,
+        pending_input_ids=(),
+        replayed=False,
+        opened_run_id=None,
+        closed_run_id=None,
+        accepted_at=1.0,
+    )
+
+
 def test_adapter_supports_push_default_true():
     assert adapter_supports_push(PushAdapter()) is True
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
@@ -61,6 +85,25 @@ def test_deliver_wake_push_adapter_uses_handle_message():
     assert evt.text == "wake up"
     assert evt.internal is True
     assert evt.source.chat_id == "chat-1"
+
+
+def test_deliver_wake_push_preserves_only_process_local_acceptance():
+    adapter = PushAdapter()
+    acceptance = _acceptance()
+
+    returned = asyncio.run(
+        deliver_wake(
+            adapter,
+            text="wake up",
+            source=_source(),
+            task_fence_acceptance=acceptance,
+        )
+    )
+
+    assert returned is adapter.handled[0]
+    assert returned.internal is True
+    assert returned.task_fence_ingress is None
+    assert returned.task_fence_acceptance is acceptance
 
 
 def test_deliver_wake_push_adapter_requires_source():
@@ -124,6 +167,238 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
     ]
+
+
+@pytest.mark.parametrize(
+    "wake_text",
+    ["task done — wake", "x" * (MAX_NORMALIZED_TEXT_LENGTH + 1)],
+    ids=["short", "normalized-limit"],
+)
+def test_real_api_self_post_resolves_one_use_task_fence_acceptance(
+    wake_text,
+):
+    acceptance = _acceptance()
+    seen = []
+
+    async def run():
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"key": "sekrit"})
+        )
+
+        async def no_session_db():
+            return None
+
+        async def fake_run_agent(**kwargs):
+            seen.append(
+                (
+                    kwargs.get("task_fence_acceptance"),
+                    kwargs["user_message"],
+                )
+            )
+            return (
+                {
+                    "final_response": "ok",
+                    "completed": True,
+                    "session_id": kwargs["session_id"],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        adapter._ensure_session_db_async = no_session_db
+        adapter._run_agent = fake_run_agent
+        runner, port = await _serve(adapter._handle_chat_completions)
+        adapter._host = "127.0.0.1"
+        adapter._port = port
+        try:
+            await deliver_wake(
+                adapter,
+                text=wake_text,
+                session_id="raw-sid-42",
+                task_fence_acceptance=acceptance,
+            )
+            assert adapter._task_fence_wake_tokens == {}
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen == [
+        (acceptance, wake_text[:MAX_NORMALIZED_TEXT_LENGTH])
+    ]
+
+
+def test_process_completion_api_self_post_resolves_after_admission(
+    monkeypatch,
+):
+    from aiohttp import web
+
+    import gateway.wake as wake_mod
+    import tools.process_registry as process_registry_mod
+
+    acceptance = _acceptance()
+    event = {
+        "type": "completion",
+        "session_id": "proc-wake",
+        "origin_session_id": "raw-sid-42",
+    }
+    order = []
+    seen = []
+
+    def observe(candidate):
+        assert candidate is event
+        order.append("observe")
+        return acceptance
+
+    monkeypatch.setattr(
+        process_registry_mod,
+        "observe_task_fence_process_completion",
+        observe,
+    )
+    monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01,))
+
+    async def run():
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"key": "sekrit"})
+        )
+
+        async def no_session_db():
+            return None
+
+        async def fake_run_agent(**kwargs):
+            order.append("run")
+            seen.append(kwargs.get("task_fence_acceptance"))
+            return (
+                {
+                    "final_response": "ok",
+                    "completed": True,
+                    "session_id": kwargs["session_id"],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        adapter._ensure_session_db_async = no_session_db
+        adapter._run_agent = fake_run_agent
+        original_register = adapter._register_task_fence_wake
+
+        def register(**kwargs):
+            order.append("register")
+            return original_register(**kwargs)
+
+        adapter._register_task_fence_wake = register
+        admission_calls = 0
+
+        def concurrency_limited_response():
+            nonlocal admission_calls
+            admission_calls += 1
+            order.append("admission")
+            if admission_calls == 1:
+                return web.json_response({"error": "busy"}, status=429)
+            return None
+
+        adapter._concurrency_limited_response = concurrency_limited_response
+        http_runner, port = await _serve(adapter._handle_chat_completions)
+        adapter._host = "127.0.0.1"
+        adapter._port = port
+        gateway = object.__new__(GatewayRunner)
+        gateway.adapters = {Platform.API_SERVER: adapter}
+        try:
+            assert await gateway._inject_watch_notification(
+                "process done — wake",
+                event,
+            ) is True
+            assert adapter._task_fence_wake_tokens == {}
+        finally:
+            await http_runner.cleanup()
+
+    asyncio.run(run())
+    assert order == [
+        "register",
+        "admission",
+        "register",
+        "admission",
+        "observe",
+        "run",
+    ]
+    assert seen == [acceptance]
+
+
+def test_real_api_rejects_mismatched_or_replayed_wake_nonce():
+    from aiohttp import ClientSession
+
+    acceptance = _acceptance()
+    seen = []
+    factory_calls = []
+
+    def acceptance_factory():
+        factory_calls.append(True)
+        return acceptance
+
+    async def run():
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"key": "sekrit"})
+        )
+
+        async def no_session_db():
+            return None
+
+        async def fake_run_agent(**kwargs):
+            seen.append(kwargs.get("task_fence_acceptance"))
+            return (
+                {
+                    "final_response": "ok",
+                    "completed": True,
+                    "session_id": kwargs["session_id"],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        adapter._ensure_session_db_async = no_session_db
+        adapter._run_agent = fake_run_agent
+        runner, port = await _serve(adapter._handle_chat_completions)
+        token = adapter._register_task_fence_wake(
+            session_id="expected-sid",
+            text="wake",
+            acceptance_factory=acceptance_factory,
+        )
+        headers = {
+            "Authorization": "Bearer sekrit",
+            TASK_FENCE_WAKE_TOKEN_HEADER: token,
+        }
+        body = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "wake"}],
+            "stream": False,
+        }
+        try:
+            async with ClientSession() as client:
+                wrong_headers = {
+                    **headers,
+                    "X-Hermes-Session-Id": "wrong-sid",
+                }
+                async with client.post(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    json=body,
+                    headers=wrong_headers,
+                ) as response:
+                    assert response.status == 200
+                    await response.read()
+                replay_headers = {
+                    **headers,
+                    "X-Hermes-Session-Id": "expected-sid",
+                }
+                async with client.post(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    json=body,
+                    headers=replay_headers,
+                ) as response:
+                    assert response.status == 200
+                    await response.read()
+            assert adapter._task_fence_wake_tokens == {}
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen == [None, None]
+    assert factory_calls == []
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):

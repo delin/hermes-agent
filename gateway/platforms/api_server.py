@@ -50,12 +50,13 @@ from functools import wraps
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -91,6 +92,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from gateway.wake import TASK_FENCE_WAKE_TOKEN_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -1279,6 +1281,99 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # One-use, process-local bridge for trusted Wake acceptance across the
+        # loopback HTTP boundary. The wire carries only an unguessable nonce.
+        self._task_fence_wake_tokens: Dict[str, tuple[bytes, bytes, Any]] = {}
+
+    def _register_task_fence_wake(
+        self,
+        *,
+        session_id: str,
+        text: str,
+        acceptance: Any = None,
+        acceptance_factory: Optional[Callable[[], Any]] = None,
+    ) -> str:
+        """Register one exact Wake acceptance without serializing authority."""
+
+        from task_fence import IngressAcceptance
+
+        if (
+            (acceptance is None) == (acceptance_factory is None)
+            or not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(text, str)
+        ):
+            return ""
+        if acceptance is not None and not isinstance(
+            acceptance,
+            IngressAcceptance,
+        ):
+            return ""
+        if acceptance_factory is not None and not callable(
+            acceptance_factory
+        ):
+            return ""
+        try:
+            session_hash = hashlib.sha256(session_id.encode("utf-8")).digest()
+            normalized_text = _normalize_multimodal_content(text)
+            if not isinstance(normalized_text, str):
+                return ""
+            text_hash = hashlib.sha256(
+                normalized_text.encode("utf-8")
+            ).digest()
+        except UnicodeEncodeError:
+            return ""
+        token = secrets.token_urlsafe(32)
+        self._task_fence_wake_tokens[token] = (
+            session_hash,
+            text_hash,
+            acceptance if acceptance is not None else acceptance_factory,
+        )
+        return token
+
+    def _revoke_task_fence_wake(self, token: str) -> None:
+        """Drop an unused loopback Wake token."""
+
+        self._task_fence_wake_tokens.pop(token, None)
+
+    def _consume_task_fence_wake(
+        self,
+        request: "web.Request",
+        *,
+        session_id: str,
+        text: Any,
+    ) -> Optional[Any]:
+        """Resolve a one-use Wake nonce bound to this exact request."""
+
+        token = request.headers.get(TASK_FENCE_WAKE_TOKEN_HEADER, "").strip()
+        if not token or len(token) > 128:
+            return None
+        registered = self._task_fence_wake_tokens.pop(token, None)
+        if registered is None or not isinstance(text, str):
+            return None
+        try:
+            session_hash = hashlib.sha256(session_id.encode("utf-8")).digest()
+            text_hash = hashlib.sha256(text.encode("utf-8")).digest()
+        except UnicodeEncodeError:
+            return None
+        expected_session, expected_text, carrier = registered
+        if not (
+            hmac.compare_digest(expected_session, session_hash)
+            and hmac.compare_digest(expected_text, text_hash)
+        ):
+            return None
+        try:
+            acceptance = carrier() if callable(carrier) else carrier
+        except Exception as exc:
+            logger.warning(
+                "Task Fence shadow wake acceptance failed: %s",
+                type(exc).__name__,
+            )
+            return None
+
+        from task_fence import IngressAcceptance
+
+        return acceptance if isinstance(acceptance, IngressAcceptance) else None
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -3799,6 +3894,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        task_fence_acceptance = self._consume_task_fence_wake(
+            request,
+            session_id=session_id,
+            text=user_message,
+        )
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -3881,6 +3982,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                task_fence_acceptance=task_fence_acceptance,
                 **agent_overrides,
                 route=route,
             ))
@@ -3902,6 +4004,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                task_fence_acceptance=task_fence_acceptance,
                 **agent_overrides,
                 route=route,
             )
@@ -5720,6 +5823,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        task_fence_acceptance: Optional[Any] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5780,11 +5884,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    conversation_kwargs: Dict[str, Any] = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if task_fence_acceptance is not None:
+                        conversation_kwargs["task_fence_acceptance"] = (
+                            task_fence_acceptance
+                        )
+                    result = agent.run_conversation(**conversation_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

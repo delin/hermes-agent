@@ -365,13 +365,25 @@ def test_distinct_process_incarnations_are_not_deduplicated():
 
 def test_process_evidence_is_observed_after_adapter_acceptance(monkeypatch):
     order = []
+    delivered = []
+    acceptance = object()
 
-    async def _accepted(_event):
+    async def _accepted(event):
         order.append("adapter")
+        delivered.append(event)
 
     adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_accepted))
     runner = _runner(adapter)
     from tools import async_delegation
+    from tools import process_registry
+
+    monkeypatch.setattr(
+        process_registry,
+        "observe_task_fence_process_completion",
+        lambda event: order.append(
+            ("wake_acceptance", event["session_id"])
+        ) or acceptance,
+    )
 
     monkeypatch.setattr(
         async_delegation,
@@ -387,7 +399,42 @@ def test_process_evidence_is_observed_after_adapter_acceptance(monkeypatch):
             _completion_event(started_at=10.0),
         )
     ) is True
-    assert order == ["adapter", ("evidence", "proc_reused", "")]
+    assert order == [
+        "adapter",
+        ("wake_acceptance", "proc_reused"),
+        ("evidence", "proc_reused", ""),
+    ]
+    assert delivered[0].task_fence_acceptance is acceptance
+
+
+def test_async_claim_acceptance_reaches_only_the_winning_wake(monkeypatch):
+    acceptance = object()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    from tools import async_delegation
+
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_completion_delivery_with_acceptance",
+        lambda _delegation_id, _claim_id: (True, acceptance),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_completion_delivery",
+        lambda _delegation_id, _claim_id: True,
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(
+            "completion",
+            _async_event("deleg_with_acceptance"),
+        )
+    ) is True
+
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.internal is True
+    assert delivered.task_fence_ingress is None
+    assert delivered.task_fence_acceptance is acceptance
 
 
 def test_delivered_identity_retention_is_bounded():

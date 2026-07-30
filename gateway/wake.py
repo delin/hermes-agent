@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+TASK_FENCE_WAKE_TOKEN_HEADER = "X-Hermes-Task-Fence-Wake"
 
 # A wake self-post runs the entire agent turn synchronously (stream=false);
 # generous ceiling so long tool-using turns aren't killed mid-flight.
@@ -59,7 +61,11 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
-) -> None:
+    message_id: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+    task_fence_acceptance: Any = None,
+    task_fence_acceptance_factory: Optional[Callable[[], Any]] = None,
+) -> Optional[Any]:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
@@ -71,6 +77,11 @@ async def deliver_wake(
     caller can rewind/retry instead of treating the wake as delivered.
     """
     if adapter_supports_push(adapter):
+        if task_fence_acceptance_factory is not None:
+            raise ValueError(
+                "deliver_wake: acceptance factories are only valid for "
+                "non-push self-post delivery"
+            )
         if source is None:
             raise ValueError(
                 "deliver_wake: push-capable adapter requires a SessionSource"
@@ -82,20 +93,45 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            message_id=message_id or None,
+            metadata=dict(metadata or {}),
+            task_fence_acceptance=task_fence_acceptance,
         )
         await adapter.handle_message(synth_event)
-        return
+        return synth_event
 
     if not session_id:
         raise ValueError(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    if (
+        task_fence_acceptance is None
+        and task_fence_acceptance_factory is None
+    ):
+        await _self_post_chat_completion(
+            adapter,
+            text=text,
+            session_id=session_id,
+        )
+    else:
+        await _self_post_chat_completion(
+            adapter,
+            text=text,
+            session_id=session_id,
+            task_fence_acceptance=task_fence_acceptance,
+            task_fence_acceptance_factory=task_fence_acceptance_factory,
+        )
+    return None
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any,
+    *,
+    text: str,
+    session_id: str,
+    task_fence_acceptance: Any = None,
+    task_fence_acceptance_factory: Optional[Callable[[], Any]] = None,
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -123,7 +159,7 @@ async def _self_post_chat_completion(
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
     url = f"http://{host}:{port}/v1/chat/completions"
-    headers = {
+    base_headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
@@ -138,7 +174,33 @@ async def _self_post_chat_completion(
     for attempt in range(attempts):
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])
+        wake_token = ""
         try:
+            headers = dict(base_headers)
+            if (
+                task_fence_acceptance is not None
+                or task_fence_acceptance_factory is not None
+            ):
+                register = getattr(
+                    adapter,
+                    "_register_task_fence_wake",
+                    None,
+                )
+                if callable(register):
+                    wake_token = register(
+                        session_id=session_id,
+                        text=text,
+                        acceptance=task_fence_acceptance,
+                        acceptance_factory=task_fence_acceptance_factory,
+                    )
+                    if wake_token:
+                        headers[TASK_FENCE_WAKE_TOKEN_HEADER] = wake_token
+                else:
+                    logger.warning(
+                        "Task Fence shadow wake carrier unavailable for "
+                        "session %s",
+                        session_id,
+                    )
             timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(timeout=timeout) as http:
                 async with http.post(url, json=payload, headers=headers) as resp:
@@ -178,6 +240,11 @@ async def _self_post_chat_completion(
                 exc,
             )
             continue
+        finally:
+            if wake_token:
+                revoke = getattr(adapter, "_revoke_task_fence_wake", None)
+                if callable(revoke):
+                    revoke(wake_token)
     raise RuntimeError(
         f"wake self-post gave up for session {session_id} after "
         f"{attempts} attempts: {last_err}"

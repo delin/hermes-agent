@@ -516,6 +516,200 @@ async def test_goal_continuation_drains_into_real_descendant_or_fails_open(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "supersede_before_drain",
+    [False, True],
+    ids=["exact-wake-descendant", "stale-wake-before-drain"],
+)
+async def test_process_wake_runs_with_exact_synthetic_parent_or_fails_open(
+    task_fence_db,
+    supersede_before_drain,
+):
+    import hashlib
+    from unittest.mock import patch
+
+    import run_agent
+    from gateway.wake import deliver_wake
+    from task_fence import (
+        IngressEnvelope,
+        TASK_FENCE_FINAL_GENERATION_KEY,
+        current_causal_envelope,
+    )
+
+    parent_acceptance = task_fence_db.accept_task_fence_ingress(
+        IngressEnvelope(
+            source="gateway:slack",
+            source_event_id="wake-parent-event",
+            conversation_id=_session_key(),
+            action=TASK_FENCE_ACTIONS["initial_submit"],
+            payload_hash=hashlib.sha256(b"parent input").hexdigest(),
+            opaque_payload_ref="slack:wake-parent-event",
+        )
+    )
+    parent_generation = task_fence_db.reserve_task_fence_generation(
+        parent_acceptance
+    )
+    assert task_fence_db.finish_task_fence_generation(
+        parent_generation,
+        state="committed",
+    )
+    wake_acceptance = (
+        task_fence_db.accept_task_fence_process_completion_evidence(
+            source_event_id="wake-process-completion",
+            parent_generation_id=parent_generation.generation_id,
+            parent_runtime_epoch=parent_generation.runtime_epoch,
+            payload_hash=hashlib.sha256(b"completion evidence").hexdigest(),
+            opaque_payload_ref="process-completion:proc-wake",
+        )
+    )
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = run_agent.AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_id="wake-task-fence-session",
+            session_db=task_fence_db,
+        )
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent._disable_streaming = True
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+
+    provider_envelopes = []
+
+    def provider_create(**_kwargs):
+        provider_envelopes.append(current_causal_envelope())
+        return _text_response("wake child complete")
+
+    agent.client.chat.completions.create.side_effect = provider_create
+    adapter = _ShadowSlackAdapter(task_fence_db)
+    blocker_started = asyncio.Event()
+    blocker_release = asyncio.Event()
+    child_done = asyncio.Event()
+    child_results = []
+    child_acceptances = []
+
+    async def handler(event):
+        if event.text == "blocker":
+            blocker_started.set()
+            await blocker_release.wait()
+            return None
+        result = agent.run_conversation(
+            event.text,
+            conversation_history=[],
+            task_id="wake-task-fence-session",
+            task_fence_acceptance=event.task_fence_acceptance,
+        )
+        child_results.append(result)
+        child_acceptances.append(event.task_fence_acceptance)
+        child_done.set()
+        return result["final_response"]
+
+    adapter.set_message_handler(handler)
+    race_projection = None
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            if supersede_before_drain:
+                await adapter.handle_message(
+                    MessageEvent(
+                        text="blocker",
+                        message_type=MessageType.TEXT,
+                        source=_source(),
+                        internal=True,
+                    )
+                )
+                await asyncio.wait_for(blocker_started.wait(), timeout=5)
+
+            await deliver_wake(
+                adapter,
+                text="[IMPORTANT: process completed]",
+                source=_source(),
+                task_fence_acceptance=wake_acceptance,
+            )
+
+            if supersede_before_drain:
+                task_fence_db.accept_task_fence_ingress(
+                    IngressEnvelope(
+                        source="gateway:slack",
+                        source_event_id="wake-race-human",
+                        conversation_id=_session_key(),
+                        task_id=parent_generation.task_id,
+                        action=TASK_FENCE_ACTIONS["comment_hold"],
+                        payload_hash=hashlib.sha256(
+                            b"newer human input"
+                        ).hexdigest(),
+                    )
+                )
+                race_projection = task_fence_db.inspect_task_fence_task(
+                    parent_generation.task_id
+                ).task
+                blocker_release.set()
+
+            await asyncio.wait_for(child_done.wait(), timeout=5)
+
+        assert child_acceptances == [wake_acceptance]
+        assert child_results[0]["final_response"] == "wake child complete"
+        assert len(provider_envelopes) == 1
+        recorded = task_fence_db._conn.execute(
+            "SELECT source, origin, ingress_class, "
+            "causal_parent_generation_id FROM task_fence_ingress "
+            "WHERE event_id = ?",
+            (wake_acceptance.event_id,),
+        ).fetchone()
+        assert tuple(recorded) == (
+            "runtime:process_completion",
+            "runtime",
+            "synthetic",
+            parent_generation.generation_id,
+        )
+        generation_count = task_fence_db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_model_generations"
+        ).fetchone()[0]
+        child_generation = child_results[0][
+            TASK_FENCE_FINAL_GENERATION_KEY
+        ]
+        if not supersede_before_drain:
+            assert generation_count == 2
+            assert child_generation is not None
+            assert provider_envelopes[0] is not None
+            snapshot = task_fence_db._conn.execute(
+                "SELECT snapshot_event_id "
+                "FROM task_fence_model_generations "
+                "WHERE generation_id = ?",
+                (child_generation.generation_id,),
+            ).fetchone()
+            assert snapshot[0] == wake_acceptance.event_id
+        else:
+            assert generation_count == 1
+            assert child_generation is None
+            assert provider_envelopes[0] is None
+            assert race_projection is not None
+            assert task_fence_db.inspect_task_fence_task(
+                parent_generation.task_id
+            ).task == race_projection
+            assert _count(task_fence_db, "task_fence_dispatch_permits") == 0
+            assert _count(task_fence_db, "task_fence_attempts") == 0
+    finally:
+        blocker_release.set()
+        await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
 async def test_cold_acceptance_commits_before_typing_hook_and_handler(
     task_fence_db,
 ):

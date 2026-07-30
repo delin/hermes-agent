@@ -745,6 +745,31 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_forwards_task_fence_acceptance(self, adapter):
+        acceptance = object()
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=mock_agent,
+        ):
+            await adapter._run_agent(
+                user_message="wake",
+                conversation_history=[],
+                session_id="session-123",
+                task_fence_acceptance=acceptance,
+            )
+
+        mock_agent.run_conversation.assert_called_once_with(
+            user_message="wake",
+            conversation_history=[],
+            task_id="session-123",
+            task_fence_acceptance=acceptance,
+        )
+
     def test_create_agent_honors_request_model_provider_and_options(self, adapter, monkeypatch):
         import gateway.run as gateway_run
         import hermes_cli.runtime_provider as runtime_provider
