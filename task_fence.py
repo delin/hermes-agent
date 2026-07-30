@@ -31,6 +31,8 @@ _MAX_EVIDENCE_REFS = 32
 _MAX_CAUSAL_ENVELOPE_BYTES = 16_384
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_FULL_GIT_COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_SHA256_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 
 TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
@@ -314,6 +316,57 @@ class TaskFenceRecoveryUnavailable(RuntimeError):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
+
+
+class TaskFenceArtifactUnavailable(RuntimeError):
+    """A tested-artifact pin could not use the durable control store."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class TaskFenceArtifactIdentity:
+    """Canonical caller-supplied identity claim for one OCI platform artifact.
+
+    Shape validation does not authenticate provenance or prove commit, lock,
+    and artifact correspondence. The artifact checksum names the exact
+    published output descriptor for the cohort platform; the lock fingerprint
+    hashes the raw ``uv.lock`` blob bytes at the commit. Neither value may come
+    from a mutable tag, banner, build stamp, or other moving runtime metadata.
+    """
+
+    tested_artifact_commit: str
+    tested_artifact_checksum: str
+    dependency_lock_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not (
+            isinstance(self.tested_artifact_commit, str)
+            and _FULL_GIT_COMMIT_RE.fullmatch(self.tested_artifact_commit)
+            and self.tested_artifact_commit != "0" * 40
+        ):
+            raise TaskFenceProtocolRejected("invalid_tested_artifact_commit")
+        for field in (
+            "tested_artifact_checksum",
+            "dependency_lock_fingerprint",
+        ):
+            value = getattr(self, field)
+            if not (
+                isinstance(value, str)
+                and _SHA256_DIGEST_RE.fullmatch(value)
+                and value != "sha256:" + "0" * 64
+            ):
+                raise TaskFenceProtocolRejected(f"invalid_{field}")
+
+
+@dataclass(frozen=True)
+class TaskFenceArtifactPin:
+    """Result of atomically creating or replaying one exact artifact pin."""
+
+    identity: TaskFenceArtifactIdentity
+    created: bool
 
 
 @dataclass(frozen=True)

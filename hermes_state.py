@@ -63,6 +63,9 @@ from task_fence import (
     IntentEffect,
     Origin,
     TaskFenceAction,
+    TaskFenceArtifactIdentity,
+    TaskFenceArtifactPin,
+    TaskFenceArtifactUnavailable,
     TaskFenceIngressSidecar,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
@@ -443,6 +446,16 @@ class TaskFenceStoreInspection:
     tested_artifact_checksum: Optional[str]
     dependency_lock_fingerprint: Optional[str]
     table_counts: Tuple[TaskFenceTableCount, ...]
+
+
+@dataclass(frozen=True)
+class TaskFenceArtifactInspection:
+    """Read-only equality check against one externally observed artifact."""
+
+    store: TaskFenceStoreInspection
+    verified: bool
+    reason: str
+    tested_identity: Optional[TaskFenceArtifactIdentity]
 
 
 @dataclass(frozen=True)
@@ -6018,6 +6031,136 @@ class SessionDB:
             return _failed_task_fence_store_inspection(
                 _task_fence_inspection_failure_reason(exc)
             )
+
+    @staticmethod
+    def _task_fence_artifact_identity_from_store(
+        store: TaskFenceStoreInspection,
+    ) -> Optional[TaskFenceArtifactIdentity]:
+        values = (
+            store.tested_artifact_commit,
+            store.tested_artifact_checksum,
+            store.dependency_lock_fingerprint,
+        )
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise TaskFenceProtocolRejected("malformed_artifact_identity")
+        try:
+            return TaskFenceArtifactIdentity(
+                tested_artifact_commit=store.tested_artifact_commit,
+                tested_artifact_checksum=store.tested_artifact_checksum,
+                dependency_lock_fingerprint=store.dependency_lock_fingerprint,
+            )
+        except TaskFenceProtocolRejected:
+            raise TaskFenceProtocolRejected("malformed_artifact_identity") from None
+
+    def verify_task_fence_tested_artifact(
+        self,
+        observed_identity: TaskFenceArtifactIdentity,
+    ) -> TaskFenceArtifactInspection:
+        """Compare a trusted observation with the set-once tested artifact pin.
+
+        The caller owns observation of the running immutable artifact. This
+        method performs no discovery and grants no dispatch authority.
+        """
+
+        if not isinstance(observed_identity, TaskFenceArtifactIdentity):
+            raise TaskFenceProtocolRejected("invalid_artifact_identity")
+        store = self.inspect_task_fence_store(include_counts=False)
+        if not store.compatible:
+            return TaskFenceArtifactInspection(store, False, store.reason, None)
+        try:
+            tested = self._task_fence_artifact_identity_from_store(store)
+        except TaskFenceProtocolRejected:
+            return TaskFenceArtifactInspection(
+                store,
+                False,
+                "malformed_artifact_identity",
+                None,
+            )
+        if tested is None:
+            return TaskFenceArtifactInspection(store, False, "artifact_unset", None)
+        if tested != observed_identity:
+            return TaskFenceArtifactInspection(
+                store,
+                False,
+                "artifact_mismatch",
+                tested,
+            )
+        return TaskFenceArtifactInspection(store, True, "verified", tested)
+
+    def pin_task_fence_tested_artifact(
+        self,
+        identity: TaskFenceArtifactIdentity,
+        *,
+        expected_runtime_epoch: int,
+        expected_mode_generation: int,
+    ) -> TaskFenceArtifactPin:
+        """Atomically set one complete tested-artifact identity, at most once."""
+
+        if not isinstance(identity, TaskFenceArtifactIdentity):
+            raise TaskFenceProtocolRejected("invalid_artifact_identity")
+        if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
+        if type(expected_mode_generation) is not int or expected_mode_generation < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_mode_generation")
+        if self.read_only or self._conn is None:
+            raise TaskFenceArtifactUnavailable("store_unavailable")
+
+        def _pin(conn: sqlite3.Connection) -> TaskFenceArtifactPin:
+            store = self._inspect_task_fence_store_unlocked(include_counts=False)
+            if not store.compatible:
+                raise TaskFenceArtifactUnavailable(store.reason)
+            if store.runtime_epoch != expected_runtime_epoch:
+                raise TaskFenceArtifactUnavailable("runtime_epoch_changed")
+            if store.mode_generation != expected_mode_generation:
+                raise TaskFenceArtifactUnavailable("mode_generation_changed")
+            if store.ever_enforced is not False:
+                raise TaskFenceArtifactUnavailable("artifact_pin_precondition")
+
+            try:
+                stored = self._task_fence_artifact_identity_from_store(store)
+            except TaskFenceProtocolRejected:
+                raise TaskFenceArtifactUnavailable(
+                    "malformed_artifact_identity"
+                ) from None
+            if stored is not None:
+                if stored != identity:
+                    raise TaskFenceArtifactUnavailable("artifact_identity_conflict")
+                return TaskFenceArtifactPin(identity=stored, created=False)
+
+            updated = conn.execute(
+                "UPDATE main.task_fence_control SET tested_artifact_commit = ?, "
+                "tested_artifact_checksum = ?, dependency_lock_fingerprint = ?, "
+                "updated_at = ? WHERE singleton = 1 "
+                "AND store_schema_version = ? AND control_protocol_version = ? "
+                "AND runtime_epoch = ? AND mode_generation = ? "
+                "AND ever_enforced = 0 AND tested_artifact_commit IS NULL "
+                "AND tested_artifact_checksum IS NULL "
+                "AND dependency_lock_fingerprint IS NULL",
+                (
+                    identity.tested_artifact_commit,
+                    identity.tested_artifact_checksum,
+                    identity.dependency_lock_fingerprint,
+                    time.time(),
+                    TASK_FENCE_STORE_SCHEMA_VERSION,
+                    TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+                    expected_runtime_epoch,
+                    expected_mode_generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    "Task Fence artifact control authority changed"
+                )
+            return TaskFenceArtifactPin(identity=identity, created=True)
+
+        try:
+            return self._execute_write(_pin)
+        except (TaskFenceProtocolRejected, TaskFenceArtifactUnavailable):
+            raise
+        except sqlite3.DatabaseError:
+            raise TaskFenceArtifactUnavailable("artifact_database_error") from None
 
     def recover_task_fence_state(
         self,
