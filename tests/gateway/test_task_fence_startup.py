@@ -272,6 +272,13 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
         ") VALUES (?, ?, 'completed', 1.0, 2.0, 2.0, ?, ?, 'pending')",
         ("deadbeef", _SHADOW_SESSION_KEY, queued_event, queued_event),
     )
+    seed._conn.execute(
+        "INSERT INTO async_delegations ("
+        "delegation_id, origin_session, state, dispatched_at, updated_at, "
+        "task_json, delivery_state"
+        ") VALUES ('deadbee0', ?, 'running', 3.0, 3.0, '{}', 'pending')",
+        (_SHADOW_SESSION_KEY,),
+    )
     seed._conn.commit()
     seed.close()
 
@@ -298,24 +305,44 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
             assert store.dependency_lock_fingerprint == _LOCK_DIGEST
             database = SessionDB(tmp_path / "state.db")
             try:
-                decision = database._conn.execute(
-                    "SELECT outcome, reason_code, decision_point, "
-                    "operation_kind, adapter FROM task_fence_policy_decisions"
-                ).fetchone()
-                queued = database._conn.execute(
-                    "SELECT delivery_state, event_json FROM async_delegations "
-                    "WHERE delegation_id = 'deadbeef'"
-                ).fetchone()
+                decisions = {
+                    row["adapter"]: tuple(row)
+                    for row in database._conn.execute(
+                        "SELECT outcome, reason_code, decision_point, "
+                        "operation_kind, adapter FROM task_fence_policy_decisions"
+                    )
+                }
+                queued = tuple(
+                    tuple(row)
+                    for row in database._conn.execute(
+                        "SELECT delegation_id, state, delivery_state, event_json "
+                        "FROM async_delegations "
+                        "WHERE delegation_id IN ('deadbee0', 'deadbeef') "
+                        "ORDER BY delegation_id"
+                    )
+                )
             finally:
                 database.close()
-            assert tuple(decision) == (
-                "would_block",
-                "missing_provenance",
-                "admission",
-                "delivery",
-                "runtime:async_delegation_restore_ready",
+            assert decisions == {
+                "runtime:async_delegation_recovery_pending": (
+                    "would_block",
+                    "missing_provenance",
+                    "admission",
+                    "delivery",
+                    "runtime:async_delegation_recovery_pending",
+                ),
+                "runtime:async_delegation_restore_ready": (
+                    "would_block",
+                    "missing_provenance",
+                    "admission",
+                    "delivery",
+                    "runtime:async_delegation_restore_ready",
+                ),
+            }
+            assert queued == (
+                ("deadbee0", "running", "pending", None),
+                ("deadbeef", "completed", "pending", queued_event),
             )
-            assert tuple(queued) == ("pending", queued_event)
 
         async def start(self) -> bool:
             events.append("start")

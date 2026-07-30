@@ -1971,7 +1971,43 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
         ),
     )
     secret = "raw-queued-result-must-not-enter-task-fence-journal"
-    excluded_running_id = "f00d0007"
+    active_secret = "raw-running-task-must-not-enter-task-fence-journal"
+    recovery_pending = (
+        (
+            "f00d0007",
+            "running",
+            generation.generation_id,
+            generation.runtime_epoch,
+            DecisionReason.STALE_AUTHORITY.value,
+        ),
+        (
+            "f00d0008",
+            "finalizing",
+            None,
+            None,
+            DecisionReason.MISSING_PROVENANCE.value,
+        ),
+    )
+    live_running_id = "f00d0009"
+    foreign_running_id = "f00d0010"
+    reopened_delivery_running_id = "f00d0011"
+    observed_recovery_pending = (
+        *recovery_pending,
+        (
+            live_running_id,
+            "running",
+            generation.generation_id,
+            generation.runtime_epoch,
+            DecisionReason.STALE_AUTHORITY.value,
+        ),
+        (
+            reopened_delivery_running_id,
+            "running",
+            generation.generation_id,
+            generation.runtime_epoch,
+            DecisionReason.STALE_AUTHORITY.value,
+        ),
+    )
     try:
         for (
             delegation_id,
@@ -1987,12 +2023,82 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
                 parent_generation_id=parent_generation_id,
                 parent_runtime_epoch=parent_runtime_epoch,
             )
+        monkeypatch.setattr(
+            "gateway.status.get_process_start_time",
+            lambda _pid: 202,
+        )
+        async_delegation._persist_dispatch({
+            "delegation_id": recovery_pending[0][0],
+            "session_key": _SHADOW_SESSION_KEY,
+            "dispatched_at": 7.0,
+            "goal": active_secret,
+            "_task_fence_parent_generation_id": generation.generation_id,
+            "_task_fence_parent_runtime_epoch": generation.runtime_epoch,
+        })
+        for ordinal, (
+            delegation_id,
+            state,
+            parent_generation_id,
+            parent_runtime_epoch,
+            _reason,
+        ) in enumerate(recovery_pending[1:], start=8):
+            db._conn.execute(
+                "INSERT INTO async_delegations ("
+                "delegation_id, origin_session, state, dispatched_at, updated_at, "
+                "delivery_state, task_json, causal_parent_generation_id, "
+                "causal_parent_runtime_epoch"
+                ") VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (
+                    delegation_id,
+                    _SHADOW_SESSION_KEY,
+                    state,
+                    float(ordinal),
+                    float(ordinal),
+                    json.dumps({"goal": active_secret}),
+                    parent_generation_id,
+                    parent_runtime_epoch,
+                ),
+            )
         db._conn.execute(
             "INSERT INTO async_delegations ("
             "delegation_id, origin_session, state, dispatched_at, updated_at, "
-            "delivery_state, task_json"
-            ") VALUES (?, ?, 'running', 7.0, 7.0, 'pending', '{}')",
-            (excluded_running_id, _SHADOW_SESSION_KEY),
+            "delivery_state, task_json, causal_parent_generation_id, "
+            "causal_parent_runtime_epoch, owner_pid, owner_started_at"
+            ") VALUES (?, ?, 'running', 9.0, 9.0, 'pending', ?, ?, ?, 4242, 101)",
+            (
+                live_running_id,
+                _SHADOW_SESSION_KEY,
+                json.dumps({"goal": active_secret}),
+                generation.generation_id,
+                generation.runtime_epoch,
+            ),
+        )
+        db._conn.execute(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, state, dispatched_at, updated_at, "
+            "delivery_state, delivered_at, task_json, "
+            "causal_parent_generation_id, causal_parent_runtime_epoch"
+            ") VALUES (?, ?, 'running', 11.0, 11.0, 'delivered', 11.0, ?, ?, ?)",
+            (
+                reopened_delivery_running_id,
+                _SHADOW_SESSION_KEY,
+                json.dumps({"goal": active_secret}),
+                generation.generation_id,
+                generation.runtime_epoch,
+            ),
+        )
+        db._conn.execute(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, state, dispatched_at, updated_at, "
+            "delivery_state, task_json, causal_parent_generation_id, "
+            "causal_parent_runtime_epoch"
+            ") VALUES (?, 'foreign-session', 'running', 10.0, 10.0, "
+            "'pending', '{}', ?, ?)",
+            (
+                foreign_running_id,
+                generation.generation_id,
+                generation.runtime_epoch,
+            ),
         )
         secret_event = json.loads(
             db._conn.execute(
@@ -2014,6 +2120,14 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
     finally:
         db.close()
 
+    def unexpected_pid_probe(_pid):
+        raise AssertionError("startup transaction must not probe OS process state")
+
+    monkeypatch.setattr("gateway.status._pid_exists", unexpected_pid_probe)
+    monkeypatch.setattr(
+        "gateway.status.get_process_start_time",
+        unexpected_pid_probe,
+    )
     reopened = SessionDB(path)
     try:
         recovery = reopened.recover_task_fence_state(
@@ -2043,13 +2157,6 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
             )
         }
         assert len(decisions) == 5
-        assert (
-            _async_restore_invocation(
-                excluded_running_id,
-                durable_identity[excluded_running_id],
-            )
-            not in decisions
-        )
         for (
             delegation_id,
             session_key,
@@ -2107,16 +2214,110 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
                     decision["candidate_runtime_epoch"],
                 ) == (None, None, None)
 
-        journal_dump = repr(tuple(tuple(row) for row in decisions.values()))
+        recovery_decisions = {
+            row["operation_invocation_id"]: row
+            for row in reopened._conn.execute(
+                "SELECT operation_invocation_id, outcome, reason_code, "
+                "decision_point, operation_kind, adapter, "
+                "invocation_fingerprint, candidate_task_id, "
+                "candidate_generation_id, candidate_runtime_epoch, "
+                "permit_id, attempt_id FROM task_fence_policy_decisions "
+                "WHERE adapter = 'runtime:async_delegation_recovery_pending'"
+            )
+        }
+        assert len(recovery_decisions) == 4
+        assert (
+            _async_restore_invocation(
+                foreign_running_id,
+                durable_identity[foreign_running_id],
+            )
+            not in recovery_decisions
+        )
+        for (
+            delegation_id,
+            state,
+            _parent_generation_id,
+            _parent_runtime_epoch,
+            reason,
+        ) in observed_recovery_pending:
+            invocation_id = _async_restore_invocation(
+                delegation_id,
+                durable_identity[delegation_id],
+            )
+            decision = recovery_decisions[invocation_id]
+            assert (
+                decision["outcome"],
+                decision["reason_code"],
+                decision["decision_point"],
+                decision["operation_kind"],
+                decision["adapter"],
+                decision["permit_id"],
+                decision["attempt_id"],
+            ) == (
+                DecisionOutcome.WOULD_BLOCK.value,
+                reason,
+                "admission",
+                "delivery",
+                "runtime:async_delegation_recovery_pending",
+                None,
+                None,
+            )
+            active_row = reopened._conn.execute(
+                "SELECT state, delivery_state, owner_pid, owner_started_at, task_json "
+                "FROM async_delegations WHERE delegation_id = ?",
+                (delegation_id,),
+            ).fetchone()
+            assert active_row["state"] == state
+            observation = json.dumps(
+                tuple(active_row),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            assert (
+                decision["invocation_fingerprint"]
+                == hashlib.sha256(observation).hexdigest()
+            )
+            if reason == DecisionReason.STALE_AUTHORITY.value:
+                assert (
+                    decision["candidate_task_id"],
+                    decision["candidate_generation_id"],
+                    decision["candidate_runtime_epoch"],
+                ) == (
+                    acceptance.task_id,
+                    generation.generation_id,
+                    generation.runtime_epoch,
+                )
+            else:
+                assert (
+                    decision["candidate_task_id"],
+                    decision["candidate_generation_id"],
+                    decision["candidate_runtime_epoch"],
+                ) == (None, None, None)
+
+        journal_dump = repr(
+            tuple(
+                tuple(row)
+                for row in (*decisions.values(), *recovery_decisions.values())
+            )
+        )
         assert secret not in journal_dump
+        assert active_secret not in journal_dump
         assert _SHADOW_SESSION_KEY not in journal_dump
         assert all(delegation_id not in journal_dump for delegation_id, *_ in cases)
+        assert all(
+            delegation_id not in journal_dump
+            for delegation_id, *_ in observed_recovery_pending
+        )
+        assert foreign_running_id not in journal_dump
 
         first_decision_ids = tuple(
             row[0]
             for row in reopened._conn.execute(
                 "SELECT decision_id FROM task_fence_policy_decisions "
-                "WHERE adapter = 'runtime:async_delegation_restore_ready' "
+                "WHERE adapter IN ("
+                "'runtime:async_delegation_restore_ready', "
+                "'runtime:async_delegation_recovery_pending') "
                 "ORDER BY decision_id"
             )
         )
@@ -2133,7 +2334,9 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
                 row[0]
                 for row in reopened._conn.execute(
                     "SELECT decision_id FROM task_fence_policy_decisions "
-                    "WHERE adapter = 'runtime:async_delegation_restore_ready' "
+                    "WHERE adapter IN ("
+                    "'runtime:async_delegation_restore_ready', "
+                    "'runtime:async_delegation_recovery_pending') "
                     "ORDER BY decision_id"
                 )
             )
@@ -2151,6 +2354,13 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
             "UPDATE async_delegations SET event_json = ? "
             "WHERE delegation_id = 'f00d0002'",
             (json.dumps(changed_event),),
+        )
+        reopened._conn.execute(
+            "UPDATE async_delegations SET task_json = ? WHERE delegation_id = ?",
+            (
+                json.dumps({"goal": "changed-exact-running-task"}),
+                live_running_id,
+            ),
         )
         reopened._conn.commit()
         changed_async = _async_rows(reopened)
@@ -2175,15 +2385,39 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
         assert len(changed_decisions) == 2
         assert len({row["decision_id"] for row in changed_decisions}) == 2
         assert len({row["invocation_fingerprint"] for row in changed_decisions}) == 2
+        live_changed_decisions = reopened._conn.execute(
+            "SELECT decision_id, invocation_fingerprint "
+            "FROM task_fence_policy_decisions "
+            "WHERE adapter = 'runtime:async_delegation_recovery_pending' "
+            "AND operation_invocation_id = ? ORDER BY decision_id",
+            (
+                _async_restore_invocation(
+                    live_running_id,
+                    durable_identity[live_running_id],
+                ),
+            ),
+        ).fetchall()
+        assert len(live_changed_decisions) == 2
+        assert len({row["decision_id"] for row in live_changed_decisions}) == 2
+        assert (
+            len({row["invocation_fingerprint"] for row in live_changed_decisions}) == 2
+        )
     finally:
         reopened.close()
 
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == 4242)
+    monkeypatch.setattr(
+        "gateway.status.get_process_start_time",
+        lambda pid: 101 if pid == 4242 else None,
+    )
     restored_queue = queue.Queue()
-    assert async_delegation.restore_undelivered_completions(restored_queue) == 7
-    restored = [restored_queue.get_nowait() for _ in range(7)]
+    assert async_delegation.restore_undelivered_completions(restored_queue) == 10
+    restored = [restored_queue.get_nowait() for _ in range(10)]
     assert {event["delegation_id"] for event in restored} == {
         *(case[0] for case in cases),
-        excluded_running_id,
+        *(case[0] for case in recovery_pending),
+        foreign_running_id,
+        reopened_delivery_running_id,
     }
     for event in restored:
         claim_id = async_delegation.claim_event_delivery(
@@ -2195,7 +2429,49 @@ def test_startup_recovery_observes_stale_async_completions_without_changing_deli
             event["delegation_id"],
             claim_id,
         )
+    live_row = async_delegation.get_durable_delegation(live_running_id)
+    assert live_row is not None
+    assert live_row["state"] == "running"
+    assert live_row["delivery_state"] == "pending"
     assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
+
+
+def test_materialized_finalizing_event_keeps_restore_ready_observation(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    event = json.dumps({
+        "type": "async_delegation",
+        "delegation_id": "f00d0012",
+        "status": "completed",
+    })
+    db._conn.execute(
+        "INSERT INTO async_delegations ("
+        "delegation_id, origin_session, state, dispatched_at, completed_at, "
+        "updated_at, event_json, result_json, delivery_state, task_json"
+        ") VALUES (?, ?, 'finalizing', 1.0, 2.0, 2.0, ?, ?, 'pending', '{}')",
+        ("f00d0012", _SHADOW_SESSION_KEY, event, event),
+    )
+    db._conn.commit()
+    before_async = _async_rows(db)
+
+    recovery = db.recover_task_fence_state(
+        expected_runtime_epoch=0,
+        expected_mode_generation=0,
+        tested_artifact_identity=_artifact_identity(),
+        shadow_session_key=_SHADOW_SESSION_KEY,
+    )
+
+    assert recovery.runtime_epoch == 1
+    decision = db._conn.execute(
+        "SELECT adapter, invocation_fingerprint FROM task_fence_policy_decisions"
+    ).fetchone()
+    assert tuple(decision) == (
+        "runtime:async_delegation_restore_ready",
+        hashlib.sha256(event.encode("utf-8")).hexdigest(),
+    )
+    assert _async_rows(db) == before_async
+    db.close()
 
 
 @pytest.mark.parametrize(
@@ -2291,11 +2567,13 @@ def test_async_restore_corrupt_historical_parent_is_missing_provenance(
 
 
 @pytest.mark.parametrize("fault_target", ("decision", "control"))
+@pytest.mark.parametrize("candidate_state", ("completed", "running"))
 def test_async_restore_observation_rolls_back_with_startup_recovery(
     tmp_path,
     monkeypatch,
     _clean_async_registry,
     fault_target,
+    candidate_state,
 ):
     from tools import async_delegation
 
@@ -2305,13 +2583,32 @@ def test_async_restore_observation_rolls_back_with_startup_recovery(
         path,
         conversation_id=_SHADOW_SESSION_KEY,
     )
-    _dispatch_completed_batch(
-        async_delegation,
-        delegation_id=f"fade000{int(fault_target == 'control')}",
-        session_key=_SHADOW_SESSION_KEY,
-        parent_generation_id=generation.generation_id,
-        parent_runtime_epoch=generation.runtime_epoch,
+    delegation_id = (
+        f"fade{int(candidate_state == 'running')}00{int(fault_target == 'control')}"
     )
+    if candidate_state == "completed":
+        _dispatch_completed_batch(
+            async_delegation,
+            delegation_id=delegation_id,
+            session_key=_SHADOW_SESSION_KEY,
+            parent_generation_id=generation.generation_id,
+            parent_runtime_epoch=generation.runtime_epoch,
+        )
+    else:
+        db._conn.execute(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, state, dispatched_at, updated_at, "
+            "delivery_state, task_json, causal_parent_generation_id, "
+            "causal_parent_runtime_epoch"
+            ") VALUES (?, ?, 'running', 1.0, 1.0, 'pending', '{}', ?, ?)",
+            (
+                delegation_id,
+                _SHADOW_SESSION_KEY,
+                generation.generation_id,
+                generation.runtime_epoch,
+            ),
+        )
+        db._conn.commit()
     trigger = {
         "decision": (
             "BEFORE INSERT ON main.task_fence_policy_decisions",
@@ -2356,9 +2653,11 @@ def test_async_restore_observation_rolls_back_with_startup_recovery(
         reopened.close()
 
 
+@pytest.mark.parametrize("candidate_state", ("completed", "running"))
 def test_async_restore_observation_shares_recovery_authority_bound(
     tmp_path,
     monkeypatch,
+    candidate_state,
 ) -> None:
     import hermes_state
 
@@ -2368,13 +2667,22 @@ def test_async_restore_observation_shares_recovery_authority_bound(
         "delegation_id": "face0001",
         "status": "completed",
     })
-    db._conn.execute(
-        "INSERT INTO async_delegations ("
-        "delegation_id, origin_session, state, dispatched_at, completed_at, "
-        "updated_at, event_json, result_json, delivery_state"
-        ") VALUES (?, ?, 'completed', 1.0, 2.0, 2.0, ?, ?, 'pending')",
-        ("face0001", _SHADOW_SESSION_KEY, event, event),
-    )
+    if candidate_state == "completed":
+        db._conn.execute(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, state, dispatched_at, completed_at, "
+            "updated_at, event_json, result_json, delivery_state"
+            ") VALUES (?, ?, 'completed', 1.0, 2.0, 2.0, ?, ?, 'pending')",
+            ("face0001", _SHADOW_SESSION_KEY, event, event),
+        )
+    else:
+        db._conn.execute(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, state, dispatched_at, updated_at, "
+            "task_json, delivery_state"
+            ") VALUES (?, ?, 'running', 1.0, 1.0, '{}', 'pending')",
+            ("face0001", _SHADOW_SESSION_KEY),
+        )
     db._conn.commit()
     before_task_fence = _task_fence_rows(db)
     before_async = _async_rows(db)
@@ -2391,6 +2699,37 @@ def test_async_restore_observation_shares_recovery_authority_bound(
             shadow_session_key=_SHADOW_SESSION_KEY,
         )
 
+    assert _task_fence_rows(db) == before_task_fence
+    assert _async_rows(db) == before_async
+    db.close()
+
+
+def test_async_recovery_pending_serialization_failure_is_closed(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    db._conn.execute(
+        "INSERT INTO async_delegations ("
+        "delegation_id, origin_session, state, dispatched_at, updated_at, "
+        "task_json, delivery_state, owner_pid"
+        ") VALUES (?, ?, 'running', 1.0, 1.0, '{}', 'pending', ?)",
+        ("face0002", _SHADOW_SESSION_KEY, b"not-an-integer-owner"),
+    )
+    db._conn.commit()
+    before_task_fence = _task_fence_rows(db)
+    before_async = _async_rows(db)
+
+    with pytest.raises(
+        TaskFenceRecoveryUnavailable,
+        match="incompatible_recovery_projection",
+    ) as exc:
+        db.recover_task_fence_state(
+            expected_runtime_epoch=0,
+            expected_mode_generation=0,
+            tested_artifact_identity=_artifact_identity(),
+            shadow_session_key=_SHADOW_SESSION_KEY,
+        )
+
+    assert exc.value.reason == "incompatible_recovery_projection"
+    assert exc.value.__cause__ is None
     assert _task_fence_rows(db) == before_task_fence
     assert _async_rows(db) == before_async
     db.close()

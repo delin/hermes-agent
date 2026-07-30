@@ -347,6 +347,7 @@ _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS = 64
 _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
 _TASK_FENCE_MAX_RUNTIME_EPOCH = 2**63 - 1
 _TASK_FENCE_ASYNC_RESTORE_ADAPTER = "runtime:async_delegation_restore_ready"
+_TASK_FENCE_ASYNC_RECOVERY_PENDING_ADAPTER = "runtime:async_delegation_recovery_pending"
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
 _TASK_FENCE_POLICY_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 _TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
@@ -6171,7 +6172,7 @@ class SessionDB:
         tested_artifact_identity: Optional[TaskFenceArtifactIdentity] = None,
         shadow_session_key: Optional[str] = None,
     ) -> TaskFenceRecovery:
-        """Recover shadow state and observe restore-ready async completions."""
+        """Recover shadow state and observe durable async recovery candidates."""
 
         if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
             raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
@@ -7079,7 +7080,11 @@ class SessionDB:
             if shadow_session_key is not None:
                 async_rows = bounded_authority_rows(
                     "SELECT delegation.delegation_id, "
+                    "delegation.state AS delegation_state, "
+                    "delegation.delivery_state AS delegation_delivery_state, "
                     "delegation.dispatched_at, delegation.event_json, "
+                    "delegation.task_json, delegation.owner_pid, "
+                    "delegation.owner_started_at, "
                     "delegation.causal_parent_generation_id, "
                     "delegation.causal_parent_runtime_epoch, "
                     "generation.generation_id, generation.task_id, "
@@ -7141,30 +7146,61 @@ class SessionDB:
                     "LEFT JOIN main.task_fence_acceptance_snapshots AS acceptance "
                     "ON acceptance.event_id = generation.snapshot_event_id "
                     "WHERE delegation.origin_session = ? "
-                    "AND delegation.state != 'running' "
+                    "AND (delegation.state IN ('running', 'finalizing') "
+                    "OR (delegation.state != 'running' "
                     "AND delegation.delivery_state = 'pending' "
-                    "AND delegation.event_json IS NOT NULL "
+                    "AND delegation.event_json IS NOT NULL)) "
                     "ORDER BY delegation.completed_at, "
                     "delegation.delegation_id LIMIT ?",
                     (shadow_session_key,),
                 )
                 for row in async_rows:
                     delegation_id = row["delegation_id"]
+                    delegation_state = row["delegation_state"]
                     dispatched_at = row["dispatched_at"]
                     event_json = row["event_json"]
+                    restore_ready = (
+                        delegation_state != "running"
+                        and row["delegation_delivery_state"] == "pending"
+                        and event_json is not None
+                    )
                     if (
                         not _task_fence_v2_identifier_compatible(delegation_id)
                         or type(dispatched_at) not in {int, float}
                         or not math.isfinite(float(dispatched_at))
                         or dispatched_at < 0
-                        or not isinstance(event_json, str)
+                        or (restore_ready and not isinstance(event_json, str))
+                        or (
+                            not restore_ready
+                            and delegation_state not in {"running", "finalizing"}
+                        )
+                        or (
+                            not restore_ready
+                            and row["task_json"] is not None
+                            and not isinstance(row["task_json"], str)
+                        )
                     ):
                         raise TaskFenceRecoveryUnavailable(
                             "incompatible_recovery_projection"
                         )
                     try:
-                        event_bytes = event_json.encode("utf-8")
-                    except UnicodeEncodeError:
+                        observation_bytes = (
+                            event_json.encode("utf-8")
+                            if restore_ready
+                            else json.dumps(
+                                (
+                                    delegation_state,
+                                    row["delegation_delivery_state"],
+                                    row["owner_pid"],
+                                    row["owner_started_at"],
+                                    row["task_json"],
+                                ),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ).encode("utf-8")
+                        )
+                    except (TypeError, ValueError, UnicodeEncodeError):
                         raise TaskFenceRecoveryUnavailable(
                             "incompatible_recovery_projection"
                         ) from None
@@ -7178,8 +7214,14 @@ class SessionDB:
                     operation = OperationDescriptor(
                         invocation_id=f"tfqr_{invocation_digest}",
                         kind=OperationKind.DELIVERY,
-                        adapter=_TASK_FENCE_ASYNC_RESTORE_ADAPTER,
-                        invocation_fingerprint=hashlib.sha256(event_bytes).hexdigest(),
+                        adapter=(
+                            _TASK_FENCE_ASYNC_RESTORE_ADAPTER
+                            if restore_ready
+                            else _TASK_FENCE_ASYNC_RECOVERY_PENDING_ADAPTER
+                        ),
+                        invocation_fingerprint=hashlib.sha256(
+                            observation_bytes
+                        ).hexdigest(),
                     )
 
                     parent_generation_id = row["causal_parent_generation_id"]
