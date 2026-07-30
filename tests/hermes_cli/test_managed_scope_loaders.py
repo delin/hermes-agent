@@ -53,8 +53,18 @@ def test_gateway_config_loader_honors_managed(homes, monkeypatch):
     _seed(
         home,
         managed,
-        user="group_sessions_per_user: false\n",
-        mgd="group_sessions_per_user: true\n",
+        user=(
+            "group_sessions_per_user: false\n"
+            "gateway:\n"
+            "  task_fence:\n"
+            "    shadow_session_key: user-lane\n"
+        ),
+        mgd=(
+            "group_sessions_per_user: true\n"
+            "gateway:\n"
+            "  task_fence:\n"
+            "    shadow_session_key: managed-lane\n"
+        ),
     )
     import gateway.config as gc
 
@@ -62,6 +72,8 @@ def test_gateway_config_loader_honors_managed(homes, monkeypatch):
     cfg = gc.load_gateway_config()
     # Managed value should have flowed into the GatewayConfig.
     assert cfg.group_sessions_per_user is True
+    assert cfg.task_fence_shadow_session_key == "managed-lane"
+    assert gc.load_task_fence_shadow_session_key() == "managed-lane"
 
 
 def test_tui_loader_honors_managed(homes, monkeypatch):

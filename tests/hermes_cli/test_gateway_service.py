@@ -1835,6 +1835,7 @@ class TestGatewaySystemServiceRouting:
     def test_gateway_status_prefers_system_service_when_only_system_unit_exists(self, monkeypatch):
         user_unit = SimpleNamespace(exists=lambda: False)
         system_unit = SimpleNamespace(exists=lambda: True)
+        synced_scopes = []
 
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
@@ -1843,6 +1844,21 @@ class TestGatewaySystemServiceRouting:
             gateway_cli,
             "get_systemd_unit_path",
             lambda system=False: system_unit if system else user_unit,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_sync_hermes_home_from_systemd_unit",
+            lambda system: synced_scopes.append(system),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
+                manager="systemd (system)",
+                service_installed=True,
+                service_running=False,
+                service_scope="system",
+            ),
         )
 
         calls = []
@@ -1854,6 +1870,7 @@ class TestGatewaySystemServiceRouting:
 
         gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
 
+        assert synced_scopes == [True]
         assert calls == [(False, False, False)]
 
     def test_gateway_status_reports_manual_process_when_service_is_stopped(self, monkeypatch, capsys):

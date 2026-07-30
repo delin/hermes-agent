@@ -1,7 +1,7 @@
 """Tests for SessionDB WAL checkpoint strategy (issue #45383).
 
 Verifies that periodic checkpoints use PASSIVE mode (safe for large DBs)
-while close() and pre-VACUUM paths still use TRUNCATE.
+while writable close() and pre-VACUUM paths still use TRUNCATE.
 """
 
 import sqlite3
@@ -74,7 +74,7 @@ class TestTryWalCheckpointPassive:
 
 
 class TestCloseUsesTruncate:
-    """close() should still use TRUNCATE to shrink WAL on shutdown."""
+    """Writable close() uses TRUNCATE; read-only close issues no pragma."""
 
     def test_close_uses_truncate_mode(self, db):
         """TRUNCATE at close is safe — no concurrent writers during shutdown."""
@@ -108,6 +108,29 @@ class TestCloseUsesTruncate:
         assert any("WAL checkpoint (TRUNCATE) at close failed" in r.message for r in caplog.records), (
             f"Expected debug log about TRUNCATE failure at close, got: {caplog.text}"
         )
+
+    def test_read_only_close_issues_no_checkpoint(self, tmp_path):
+        path = tmp_path / "read-only-close.db"
+        writer = SessionDB(path)
+        writer.close()
+
+        read_only = SessionDB(path, read_only=True)
+        real_conn = read_only._conn
+        execute_calls = []
+
+        def tracking_execute(sql, *args, **kwargs):
+            execute_calls.append(sql)
+            return real_conn.execute(sql, *args, **kwargs)
+
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = tracking_execute
+        mock_conn.close.side_effect = real_conn.close
+        read_only._conn = mock_conn
+
+        read_only.close()
+
+        assert execute_calls == []
+        mock_conn.close.assert_called_once_with()
 
 
 class TestCheckpointFrequency:

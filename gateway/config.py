@@ -63,6 +63,54 @@ def _coerce_task_fence_shadow_session_key(value: Any) -> str:
     return session_key
 
 
+def _load_primary_gateway_yaml(home: Path) -> Optional[dict]:
+    """Load managed-overlay-aware config.yaml without gateway side effects."""
+    config_path = home / "config.yaml"
+    if not config_path.exists():
+        return None
+
+    import yaml
+
+    with open(config_path, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise TypeError("config.yaml root must be a mapping")
+
+    from hermes_cli import managed_scope
+
+    return managed_scope.apply_managed_overlay(config)
+
+
+def _resolve_task_fence_shadow_session_key(config: dict) -> str:
+    """Resolve the sole config.yaml Task Fence lane."""
+    gateway_config = config.get("gateway")
+    if not isinstance(gateway_config, dict) or "task_fence" not in gateway_config:
+        return ""
+
+    task_fence_config = gateway_config.get("task_fence")
+    if not isinstance(task_fence_config, dict):
+        logger.warning(
+            "Ignoring invalid gateway.task_fence in config.yaml "
+            "(expected mapping, got %s)",
+            type(task_fence_config).__name__,
+        )
+        return ""
+    return _coerce_task_fence_shadow_session_key(
+        task_fence_config.get("shadow_session_key")
+    )
+
+
+def load_task_fence_shadow_session_key() -> str:
+    """Load only the effective shadow lane, without gateway plugin discovery."""
+    try:
+        config = _load_primary_gateway_yaml(get_hermes_home())
+    except Exception:
+        return ""
+    if config is None:
+        return ""
+    return _resolve_task_fence_shadow_session_key(config)
+
+
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
 # override. Anything not in either set — and a blank/whitespace value — is
 # treated as "unset" so it falls through to config.yaml rather than silently
@@ -1333,20 +1381,8 @@ def load_gateway_config() -> GatewayConfig:
 
     # Primary source: config.yaml
     try:
-        import yaml
-        config_yaml_path = _home / "config.yaml"
-        if config_yaml_path.exists():
-            with open(config_yaml_path, encoding="utf-8") as f:
-                yaml_cfg = yaml.safe_load(f) or {}
-
-            # Managed scope: overlay administrator-pinned values so the gateway
-            # honors them too. This loader builds its own dict instead of going
-            # through hermes_cli.config.load_config, so without this a managed
-            # session_reset / quick_commands / stt / model would be ignored by
-            # the messaging gateway. Fail-open via the shared helper.
-            from hermes_cli import managed_scope
-            yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
-
+        yaml_cfg = _load_primary_gateway_yaml(_home)
+        if yaml_cfg is not None:
             # Shared nested-fallback source: settings meant to be top-level
             # keys are also accepted when a user nests them under `gateway:`
             # (e.g. via `hermes config set gateway.<key> ...`, which naturally
@@ -1419,16 +1455,9 @@ def load_gateway_config() -> GatewayConfig:
 
             if isinstance(gateway_section, dict):
                 if "task_fence" in gateway_section:
-                    task_fence_cfg = gateway_section.get("task_fence")
-                    if isinstance(task_fence_cfg, dict):
-                        gw_data["task_fence"] = task_fence_cfg
-                    else:
-                        logger.warning(
-                            "Ignoring invalid gateway.task_fence in "
-                            "config.yaml (expected mapping, got %s)",
-                            type(task_fence_cfg).__name__,
-                        )
-                        gw_data["task_fence"] = {}
+                    gw_data["task_fence_shadow_session_key"] = (
+                        _resolve_task_fence_shadow_session_key(yaml_cfg)
+                    )
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]

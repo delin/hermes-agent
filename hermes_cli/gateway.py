@@ -29,7 +29,11 @@ if os.name == "posix":
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
+from gateway.config import (
+    coerce_systemd_watchdog_seconds,
+    load_gateway_config,
+    load_task_fence_shadow_session_key,
+)
 from gateway.status import terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -1406,6 +1410,129 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
         print(f"  PID(s): {_format_gateway_pids(snapshot.gateway_pids, limit=None)}")
         print("  This is usually a manual foreground/tmux/nohup run, so `hermes gateway`")
         print("  can refuse to start another copy until this process stops.")
+
+
+def _print_task_fence_shadow_status() -> None:
+    """Render the configured profile's bounded, read-only shadow projection."""
+    print()
+    print("Task Fence shadow (active non-terminal task only):")
+    try:
+        session_key = load_task_fence_shadow_session_key()
+    except Exception:
+        print("  State: inspection unavailable (config_load_failed)")
+        return
+    if not session_key:
+        print("  State: not configured")
+        return
+
+    db_path = get_hermes_home() / "state.db"
+    if not db_path.is_file():
+        print("  State: inspection unavailable (state_db_not_found)")
+        return
+
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path, read_only=True)
+        try:
+            inspection = db.inspect_task_fence_conversation(session_key)
+        finally:
+            db.close()
+    except Exception:
+        print("  State: inspection unavailable (inspection_failed)")
+        return
+
+    if not inspection.store.compatible:
+        print(f"  State: inspection unavailable ({inspection.store.reason})")
+        return
+    if not inspection.compatible:
+        print(f"  State: inspection unavailable ({inspection.reason})")
+        return
+
+    store = inspection.store
+    print(f"  Inspection: {inspection.reason}")
+    print(f"  Conversation: sha256:{inspection.conversation_fingerprint}")
+    print(
+        "  Store: "
+        f"initialized={'yes' if store.initialized else 'no'}, "
+        f"schema={store.observed_store_schema_version}, "
+        f"protocol={store.observed_control_protocol_version}, "
+        f"runtime_epoch={store.runtime_epoch}, "
+        f"mode_generation={store.mode_generation}, "
+        f"ever_enforced={'yes' if store.ever_enforced else 'no'}"
+    )
+
+    task = inspection.task
+    if task is None:
+        print("  Active task: none")
+        print(
+            "  Scope: terminal tasks, history, and their incidents are not inspected."
+        )
+        return
+
+    cohort = inspection.cohort
+    if cohort is None:
+        print("  Cohort: not materialized")
+    else:
+        print(
+            "  Cohort: "
+            f"sha256:{cohort.cohort_fingerprint}, "
+            f"binding={cohort.binding}, mode={cohort.mode}, "
+            f"generation={cohort.mode_generation}, "
+            f"activation={cohort.activation_state}, "
+            f"degraded={'yes' if cohort.audit_degraded else 'no'}"
+        )
+
+    print(
+        "  Active task: "
+        f"{task.task_id}, status={task.status}, intent_epoch={task.intent_epoch}, "
+        f"control_revision={task.control_revision}, "
+        f"runtime_epoch={task.current_runtime_epoch}, "
+        f"accepted_order={task.last_accepted_order}"
+    )
+    if inspection.active_run is None:
+        print("  Active run: none")
+    else:
+        print(
+            "  Active run: "
+            f"{inspection.active_run.run_id}, "
+            f"authority_event={inspection.active_run.authority_event_id}"
+        )
+
+    pending = ", ".join(inspection.pending_input_ids) or "none"
+    pending_suffix = (
+        f" (showing first {len(inspection.pending_input_ids)}; truncated)"
+        if inspection.pending_inputs_truncated
+        else ""
+    )
+    print(f"  Pending inputs: {pending}{pending_suffix}")
+
+    started = (
+        ", ".join(
+            f"{attempt.attempt_id}@{attempt.run_id}"
+            for attempt in inspection.started_attempts
+        )
+        or "none"
+    )
+    started_suffix = (
+        f" (showing first {len(inspection.started_attempts)}; truncated)"
+        if inspection.started_attempts_truncated
+        else ""
+    )
+    print(f"  STARTED attempts: {started}{started_suffix}")
+
+    incident = inspection.open_incident
+    if incident is None:
+        print("  Open incident for active task: none")
+    else:
+        attempt_ids = ", ".join(incident.attempt_ids)
+        print(
+            "  Open incident for active task: "
+            f"{incident.incident_id}, reason={incident.reason_code}, "
+            f"source_run={incident.source_run_id or 'none'}, "
+            f"attempts={attempt_ids}"
+        )
+    print("  Scope: terminal tasks, history, and their incidents are not inspected.")
 
 
 def _print_other_profiles_gateway_status() -> None:
@@ -7254,6 +7381,10 @@ def _gateway_command_inner(args):
         deep = getattr(args, "deep", False)
         full = getattr(args, "full", False)
         system = getattr(args, "system", False)
+        if supports_systemd_services():
+            effective_system = _select_systemd_scope(system)
+            if effective_system:
+                _sync_hermes_home_from_systemd_unit(system=True)
         snapshot = get_gateway_runtime_snapshot(system=system)
 
         # Check for service first
@@ -7340,6 +7471,8 @@ def _gateway_command_inner(args):
                     print(
                         "  sudo hermes gateway install --system  # Install as boot-time system service"
                     )
+
+        _print_task_fence_shadow_status()
 
         # Show other profiles' gateway status for multi-profile awareness
         _print_other_profiles_gateway_status()
