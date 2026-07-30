@@ -7,14 +7,17 @@ import pytest
 import hermes_state
 from hermes_state import SessionDB
 from task_fence import (
+    AttemptTerminal,
     DecisionOutcome,
     DecisionReason,
     IngressEnvelope,
     OperationDescriptor,
     OperationKind,
+    ResolutionDisposition,
     TASK_FENCE_ACTIONS,
-    TaskFencePolicy,
+    TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
+    TaskFencePolicy,
     TaskFenceRecoveryUnavailable,
     TerminalReason,
 )
@@ -31,6 +34,8 @@ def _ingress(
     task_id: str | None = None,
     correlation_ids: tuple[str, ...] = (),
     conversation_id: str = "recovery-conversation",
+    resolution_disposition: ResolutionDisposition | None = None,
+    evidence_refs: tuple[str, ...] = (),
 ) -> IngressEnvelope:
     return IngressEnvelope(
         source="gateway:test:recovery",
@@ -40,6 +45,8 @@ def _ingress(
         payload_hash=_hash(source_event_id),
         task_id=task_id,
         correlation_ids=correlation_ids,
+        resolution_disposition=resolution_disposition,
+        evidence_refs=evidence_refs,
         terminal_reason=(TerminalReason.STOPPED if action == "stop" else None),
     )
 
@@ -89,6 +96,31 @@ def _task_fence_state(db: SessionDB) -> tuple[tuple[str, tuple[tuple, ...]], ...
         )
         for table in table_names
     )
+
+
+def _rewrite_append_only_row(
+    db: SessionDB,
+    *,
+    trigger_name: str,
+    statement: str,
+    params: tuple,
+) -> None:
+    trigger = db._conn.execute(
+        "SELECT sql FROM main.sqlite_master "
+        "WHERE type = 'trigger' AND name = ?",
+        (trigger_name,),
+    ).fetchone()
+    assert trigger is not None and isinstance(trigger[0], str)
+    db._conn.execute("BEGIN IMMEDIATE")
+    try:
+        db._conn.execute(f'DROP TRIGGER main."{trigger_name}"')
+        db._conn.execute(statement, params)
+        db._conn.execute(trigger[0])
+        db._conn.commit()
+    except BaseException:
+        db._conn.rollback()
+        raise
+    assert db.inspect_task_fence_store().compatible is True
 
 
 def test_recovery_requeues_unpresented_input_without_rewriting_history(
@@ -315,24 +347,15 @@ def test_recovery_rejects_latent_skipped_epoch_ledger_without_mutation(
     )
     assert resumed.opened_run_id is not None
 
-    trigger = db._conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
-        "AND name = 'task_fence_recovery_requeues_no_update'"
-    ).fetchone()
-    assert trigger is not None and isinstance(trigger[0], str)
-    db._conn.execute("BEGIN IMMEDIATE")
-    try:
-        db._conn.execute("DROP TRIGGER main.task_fence_recovery_requeues_no_update")
-        db._conn.execute(
+    _rewrite_append_only_row(
+        db,
+        trigger_name="task_fence_recovery_requeues_no_update",
+        statement=(
             "UPDATE task_fence_recovery_requeues SET runtime_epoch = 2 "
-            "WHERE input_event_id = ?",
-            (accepted.event_id,),
-        )
-        db._conn.execute(trigger[0])
-        db._conn.commit()
-    except BaseException:
-        db._conn.rollback()
-        raise
+            "WHERE input_event_id = ?"
+        ),
+        params=(accepted.event_id,),
+    )
 
     before = _task_fence_state(db)
     with pytest.raises(
@@ -481,6 +504,270 @@ def test_recovery_turns_started_effect_into_one_durable_incident(tmp_path) -> No
         assert blocked.outcome is DecisionOutcome.WOULD_BLOCK
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize(
+    "resolution_fault",
+    (None, "action", "correlation", "evidence"),
+)
+def test_recovery_adopts_preexisting_unknowns_into_one_durable_incident(
+    tmp_path,
+    resolution_fault,
+) -> None:
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    accepted = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "message-preexisting-unknown")
+    )
+    generation = db.reserve_task_fence_generation(accepted)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    policy = TaskFencePolicy(db)
+    attempt_ids = []
+    for suffix in ("first", "second"):
+        invocation = generation.for_invocation(f"tfiv-preexisting-unknown-{suffix}")
+        operation = _operation(invocation.invocation_id)
+        reserved = policy.admit_operation(invocation, operation)
+        started = policy.authorize_and_start(
+            invocation,
+            operation,
+            reserved.permit_id,
+        )
+        policy.finish_attempt(
+            started.attempt_id,
+            AttemptTerminal.OUTCOME_UNKNOWN,
+            None,
+        )
+        attempt_ids.append(started.attempt_id)
+
+    def transitions(attempt_id: str) -> tuple[tuple, ...]:
+        return tuple(
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref "
+                "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                "ORDER BY transition_order",
+                (attempt_id,),
+            )
+        )
+
+    transitions_before = {
+        attempt_id: transitions(attempt_id) for attempt_id in attempt_ids
+    }
+    assert all(len(items) == 2 for items in transitions_before.values())
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM task_fence_incident_attempts "
+        "WHERE attempt_id IN (?, ?)",
+        tuple(attempt_ids),
+    ).fetchone()[0] == 0
+    db.close()
+
+    reopened = SessionDB(path)
+
+    def reopened_transitions(attempt_id: str) -> tuple[tuple, ...]:
+        return tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT from_state, to_state, disposition, evidence_ref "
+                "FROM task_fence_attempt_transitions WHERE attempt_id = ? "
+                "ORDER BY transition_order",
+                (attempt_id,),
+            )
+        )
+
+    first = _recover(reopened)
+    try:
+        assert (first.previous_runtime_epoch, first.runtime_epoch) == (0, 1)
+        task = reopened.inspect_task_fence_task(accepted.task_id).task
+        assert task is not None
+        assert task.status == "incident"
+        incident = reopened._conn.execute(
+            "SELECT incident_id, state, reason_code FROM task_fence_incidents "
+            "WHERE task_id = ?",
+            (accepted.task_id,),
+        ).fetchone()
+        assert incident is not None
+        assert tuple(incident[1:]) == ("open", "outcome_unknown")
+        assert tuple(
+            row[0]
+            for row in reopened._conn.execute(
+                "SELECT attempt_id FROM task_fence_incident_attempts "
+                "WHERE incident_id = ? ORDER BY attempt_id",
+                (incident[0],),
+            )
+        ) == tuple(sorted(attempt_ids))
+        assert all(
+            reopened_transitions(attempt_id) == transitions_before[attempt_id]
+            for attempt_id in attempt_ids
+        )
+        with pytest.raises(TaskFenceIngressRejected):
+            reopened.accept_task_fence_ingress(
+                _ingress(
+                    "resume",
+                    "message-resume-unresolved-unknown",
+                    task_id=accepted.task_id,
+                )
+            )
+
+        second = _recover(reopened)
+        assert (second.previous_runtime_epoch, second.runtime_epoch) == (1, 2)
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_incidents WHERE task_id = ?",
+            (accepted.task_id,),
+        ).fetchone()[0] == 1
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_incident_attempts "
+            "WHERE attempt_id IN (?, ?)",
+            tuple(attempt_ids),
+        ).fetchone()[0] == 2
+
+        resolved = reopened.accept_task_fence_ingress(
+            _ingress(
+                "resolve_incident",
+                "message-resolve-preexisting-unknowns",
+                task_id=accepted.task_id,
+                correlation_ids=tuple(sorted(attempt_ids)),
+                resolution_disposition=(
+                    ResolutionDisposition.ACCEPTED_UNKNOWN_NO_RETRY
+                ),
+                evidence_refs=("operator:recovery-review",),
+            )
+        )
+        resolved_task = reopened.inspect_task_fence_task(accepted.task_id).task
+        assert resolved_task is not None
+        assert resolved_task.status == "paused"
+
+        resolution = reopened._conn.execute(
+            "SELECT resolution_id FROM task_fence_resolutions "
+            "WHERE incident_id = ?",
+            (incident[0],),
+        ).fetchone()
+        assert resolution is not None
+        if resolution_fault is not None:
+            trigger_name, statement, params = {
+                "action": (
+                    "task_fence_ingress_no_update",
+                    "UPDATE task_fence_ingress SET origin = 'runtime' "
+                    "WHERE event_id = ?",
+                    (resolved.event_id,),
+                ),
+                "correlation": (
+                    "task_fence_ingress_correlations_no_update",
+                    "UPDATE task_fence_ingress_correlations "
+                    "SET correlation_id = 'tfat_forged' "
+                    "WHERE event_id = ? AND correlation_id = ?",
+                    (resolved.event_id, attempt_ids[0]),
+                ),
+                "evidence": (
+                    "task_fence_resolution_evidence_no_update",
+                    "UPDATE task_fence_resolution_evidence "
+                    "SET evidence_ref = 'operator:forged' "
+                    "WHERE resolution_id = ?",
+                    (resolution[0],),
+                ),
+            }[resolution_fault]
+            _rewrite_append_only_row(
+                reopened,
+                trigger_name=trigger_name,
+                statement=statement,
+                params=params,
+            )
+            before = _task_fence_state(reopened)
+            with pytest.raises(
+                TaskFenceRecoveryUnavailable,
+                match="incompatible_recovery_projection",
+            ):
+                _recover(reopened)
+            assert _task_fence_state(reopened) == before
+            return
+
+        third = _recover(reopened)
+        assert (third.previous_runtime_epoch, third.runtime_epoch) == (2, 3)
+        assert tuple(
+            reopened._conn.execute(
+                "SELECT state, reason_code FROM task_fence_incidents "
+                "WHERE incident_id = ?",
+                (incident[0],),
+            ).fetchone()
+        ) == ("resolved", "outcome_unknown")
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_incidents WHERE task_id = ?",
+            (accepted.task_id,),
+        ).fetchone()[0] == 1
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_incidents "
+            "WHERE task_id = ? AND state = 'open'",
+            (accepted.task_id,),
+        ).fetchone()[0] == 0
+        assert tuple(
+            row[0]
+            for row in reopened._conn.execute(
+                "SELECT attempt_id FROM task_fence_incident_attempts "
+                "WHERE incident_id = ? ORDER BY attempt_id",
+                (incident[0],),
+            )
+        ) == tuple(sorted(attempt_ids))
+        assert all(
+            reopened_transitions(attempt_id) == transitions_before[attempt_id]
+            for attempt_id in attempt_ids
+        )
+        recovered_task = reopened.inspect_task_fence_task(accepted.task_id).task
+        assert recovered_task is not None
+        assert recovered_task.status == "paused"
+    finally:
+        reopened.close()
+
+
+def test_recovery_rejects_empty_preexisting_incident_instead_of_repairing_it(
+    tmp_path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    accepted = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "message-empty-incident")
+    )
+    generation = db.reserve_task_fence_generation(accepted)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    invocation = generation.for_invocation("tfiv-empty-incident")
+    operation = _operation(invocation.invocation_id)
+    policy = TaskFencePolicy(db)
+    reserved = policy.admit_operation(invocation, operation)
+    started = policy.authorize_and_start(
+        invocation,
+        operation,
+        reserved.permit_id,
+    )
+    policy.finish_attempt(
+        started.attempt_id,
+        AttemptTerminal.OUTCOME_UNKNOWN,
+        None,
+    )
+    stopped = db.accept_task_fence_ingress(
+        _ingress("stop", "message-empty-incident-stop", task_id=accepted.task_id)
+    )
+    assert stopped.task_projection is not None
+    assert stopped.task_projection.status == "stopped"
+    terminal_at = db._conn.execute(
+        "SELECT terminal_at FROM task_fence_attempts WHERE attempt_id = ?",
+        (started.attempt_id,),
+    ).fetchone()[0]
+    db._conn.execute(
+        "INSERT INTO task_fence_incidents ("
+        "incident_id, task_id, source_run_id, reason_code, state, opened_at"
+        ") VALUES ('tfin_empty_preexisting', ?, ?, "
+        "'outcome_unknown', 'open', ?)",
+        (accepted.task_id, accepted.opened_run_id, terminal_at),
+    )
+
+    before = _task_fence_state(db)
+    with pytest.raises(
+        TaskFenceRecoveryUnavailable,
+        match="incompatible_recovery_projection",
+    ):
+        _recover(db)
+    assert _task_fence_state(db) == before
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM task_fence_incident_attempts"
+    ).fetchone()[0] == 0
+    db.close()
 
 
 @pytest.mark.parametrize("fault_target", ("task", "control"))

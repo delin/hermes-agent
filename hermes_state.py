@@ -6137,9 +6137,14 @@ class SessionDB:
 
             open_incidents: Dict[str, sqlite3.Row] = {}
             incident_rows = conn.execute(
-                "SELECT incident_id, task_id, source_run_id, reason_code, "
-                "opened_at, resolved_at FROM main.task_fence_incidents "
-                "WHERE state = 'open' ORDER BY task_id"
+                "SELECT incident.incident_id AS incident_id, "
+                "incident.task_id AS task_id, incident.source_run_id, "
+                "incident.reason_code, incident.opened_at, "
+                "incident.resolved_at, resolution.resolution_id "
+                "FROM main.task_fence_incidents AS incident "
+                "LEFT JOIN main.task_fence_resolutions AS resolution "
+                "ON resolution.incident_id = incident.incident_id "
+                "WHERE incident.state = 'open' ORDER BY incident.task_id"
             ).fetchall()
             for incident in incident_rows:
                 opened_at = incident["opened_at"]
@@ -6154,12 +6159,12 @@ class SessionDB:
                     or not _task_fence_v2_identifier_compatible(
                         incident["source_run_id"], optional=True
                     )
-                    or not isinstance(incident["reason_code"], str)
-                    or not incident["reason_code"]
+                    or incident["reason_code"] != "outcome_unknown"
                     or type(opened_at) not in {int, float}
                     or not math.isfinite(float(opened_at))
                     or opened_at < 0
                     or incident["resolved_at"] is not None
+                    or incident["resolution_id"] is not None
                 ):
                     raise TaskFenceRecoveryUnavailable(
                         "incompatible_recovery_projection"
@@ -6507,6 +6512,230 @@ class SessionDB:
                     "incompatible_recovery_projection"
                 )
 
+            unknown_rows = conn.execute(
+                "SELECT attempt.attempt_id, permit.task_id, permit.run_id, "
+                "link.incident_id, incident.task_id AS incident_task_id, "
+                "incident.reason_code AS incident_reason_code, "
+                "incident.state AS incident_state, "
+                "incident.opened_at AS incident_opened_at, "
+                "incident.resolved_at AS incident_resolved_at, "
+                "resolution.resolution_id, "
+                "resolution.resolved_at AS resolution_resolved_at "
+                "FROM main.task_fence_attempts AS attempt "
+                "JOIN main.task_fence_dispatch_permits AS permit "
+                "ON permit.permit_id = attempt.permit_id "
+                "LEFT JOIN main.task_fence_incident_attempts AS link "
+                "ON link.attempt_id = attempt.attempt_id "
+                "LEFT JOIN main.task_fence_incidents AS incident "
+                "ON incident.incident_id = link.incident_id "
+                "LEFT JOIN main.task_fence_resolutions AS resolution "
+                "ON resolution.incident_id = incident.incident_id "
+                "WHERE attempt.state = 'OUTCOME_UNKNOWN' "
+                "ORDER BY attempt.attempt_id, link.incident_id"
+            ).fetchall()
+            unknown_links: Dict[str, List[sqlite3.Row]] = {}
+            unknown_by_id: Dict[str, sqlite3.Row] = {}
+            for row in unknown_rows:
+                unknown_by_id.setdefault(row["attempt_id"], row)
+                if row["incident_id"] is not None:
+                    unknown_links.setdefault(row["attempt_id"], []).append(row)
+
+            unlinked_unknown_by_task: Dict[str, List[sqlite3.Row]] = {}
+            open_linked_tasks = set()
+            validated_resolved_incidents = set()
+            for attempt_id, attempt in unknown_by_id.items():
+                task = task_by_id.get(attempt["task_id"])
+                links = unknown_links.get(attempt_id, [])
+                if task is None or len(links) > 1:
+                    raise TaskFenceRecoveryUnavailable(
+                        "incompatible_recovery_projection"
+                    )
+                if not links:
+                    unlinked_unknown_by_task.setdefault(
+                        attempt["task_id"],
+                        [],
+                    ).append(attempt)
+                    continue
+                incident = links[0]
+                opened_at = incident["incident_opened_at"]
+                resolved_at = incident["incident_resolved_at"]
+                if (
+                    incident["incident_task_id"] != attempt["task_id"]
+                    or incident["incident_reason_code"] != "outcome_unknown"
+                    or type(opened_at) not in {int, float}
+                    or not math.isfinite(float(opened_at))
+                    or opened_at < 0
+                ):
+                    raise TaskFenceRecoveryUnavailable(
+                        "incompatible_recovery_projection"
+                    )
+                if incident["incident_state"] == "open":
+                    open_incident = open_incidents.get(attempt["task_id"])
+                    if (
+                        open_incident is None
+                        or open_incident["incident_id"]
+                        != incident["incident_id"]
+                        or resolved_at is not None
+                        or incident["resolution_id"] is not None
+                    ):
+                        raise TaskFenceRecoveryUnavailable(
+                            "incompatible_recovery_projection"
+                        )
+                    open_linked_tasks.add(attempt["task_id"])
+                    continue
+                if (
+                    incident["incident_state"] != "resolved"
+                    or type(resolved_at) not in {int, float}
+                    or not math.isfinite(float(resolved_at))
+                    or resolved_at < opened_at
+                    or not _task_fence_v2_identifier_compatible(
+                        incident["resolution_id"]
+                    )
+                    or incident["resolution_resolved_at"] != resolved_at
+                ):
+                    raise TaskFenceRecoveryUnavailable(
+                        "incompatible_recovery_projection"
+                    )
+
+                incident_id = incident["incident_id"]
+                if incident_id in validated_resolved_incidents:
+                    continue
+                resolution = conn.execute(
+                    "SELECT resolution.resolution_id, "
+                    "resolution.resolution_event_id, resolution.disposition, "
+                    "resolution.resolved_at, "
+                    "ingress.event_id AS resolution_ingress_event_id, "
+                    "ingress.task_id AS resolution_task_id, "
+                    "ingress.protocol_version, "
+                    "ingress.origin, ingress.ingress_class, ingress.intent, "
+                    "ingress.execution, ingress.input_effect, "
+                    "ingress.correlation_kind, "
+                    "ingress.resolution_disposition, ingress.terminal_reason, "
+                    "ingress.causal_parent_generation_id, ingress.accepted_at, "
+                    "snapshot.event_id AS resolution_snapshot_event_id "
+                    "FROM main.task_fence_resolutions AS resolution "
+                    "JOIN main.task_fence_ingress AS ingress "
+                    "ON ingress.event_id = resolution.resolution_event_id "
+                    "JOIN main.task_fence_acceptance_snapshots AS snapshot "
+                    "ON snapshot.event_id = ingress.event_id "
+                    "WHERE resolution.incident_id = ?",
+                    (incident_id,),
+                ).fetchone()
+                if resolution is None:
+                    raise TaskFenceRecoveryUnavailable(
+                        "incompatible_recovery_projection"
+                    )
+                resolution_action = self._task_fence_action_from_history_row(
+                    resolution
+                )
+                incident_attempt_ids = tuple(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT attempt_id "
+                        "FROM main.task_fence_incident_attempts "
+                        "WHERE incident_id = ? ORDER BY attempt_id",
+                        (incident_id,),
+                    )
+                )
+                correlation_ids = tuple(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT correlation_id "
+                        "FROM main.task_fence_ingress_correlations "
+                        "WHERE event_id = ? ORDER BY correlation_id",
+                        (resolution["resolution_event_id"],),
+                    )
+                )
+                ingress_evidence = tuple(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT evidence_ref "
+                        "FROM main.task_fence_ingress_evidence "
+                        "WHERE event_id = ? ORDER BY evidence_ref",
+                        (resolution["resolution_event_id"],),
+                    )
+                )
+                resolution_evidence = tuple(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT evidence_ref "
+                        "FROM main.task_fence_resolution_evidence "
+                        "WHERE resolution_id = ? ORDER BY evidence_ref",
+                        (resolution["resolution_id"],),
+                    )
+                )
+                if (
+                    resolution["resolution_id"] != incident["resolution_id"]
+                    or not _task_fence_v2_identifier_compatible(
+                        resolution["resolution_event_id"]
+                    )
+                    or resolution["resolution_ingress_event_id"]
+                    != resolution["resolution_event_id"]
+                    or resolution["resolution_snapshot_event_id"]
+                    != resolution["resolution_event_id"]
+                    or resolution["resolution_task_id"] != attempt["task_id"]
+                    or type(resolution["protocol_version"]) is not int
+                    or resolution["protocol_version"]
+                    != TASK_FENCE_CONTROL_PROTOCOL_VERSION
+                    or resolution["disposition"]
+                    not in {
+                        "confirmed_success",
+                        "confirmed_failure",
+                        "accepted_unknown_no_retry",
+                    }
+                    or resolution["disposition"]
+                    != resolution["resolution_disposition"]
+                    or resolution["terminal_reason"] is not None
+                    or resolution["causal_parent_generation_id"] is not None
+                    or resolution["resolved_at"] != resolved_at
+                    or type(resolution["accepted_at"]) not in {int, float}
+                    or not math.isfinite(float(resolution["accepted_at"]))
+                    or resolution["accepted_at"] != resolved_at
+                    or isinstance(
+                        resolution_action,
+                        _TaskFenceIngressFailure,
+                    )
+                    or resolution_action != TASK_FENCE_ACTIONS["resolve_incident"]
+                    or not incident_attempt_ids
+                    or incident_attempt_ids != correlation_ids
+                    or any(
+                        not _task_fence_v2_identifier_compatible(attempt_id)
+                        for attempt_id in incident_attempt_ids
+                    )
+                    or not ingress_evidence
+                    or ingress_evidence != resolution_evidence
+                    or any(
+                        not _task_fence_policy_evidence_compatible(
+                            evidence_ref,
+                            optional=False,
+                        )
+                        for evidence_ref in ingress_evidence
+                    )
+                ):
+                    raise TaskFenceRecoveryUnavailable(
+                        "incompatible_recovery_projection"
+                    )
+                validated_resolved_incidents.add(incident_id)
+
+            for task_id in open_incidents:
+                if task_id not in open_linked_tasks:
+                    raise TaskFenceRecoveryUnavailable(
+                        "incompatible_recovery_projection"
+                    )
+
+            incident_candidates: Dict[
+                str,
+                List[Tuple[sqlite3.Row, bool]],
+            ] = {}
+            for task_id, attempts in started_by_task.items():
+                incident_candidates.setdefault(task_id, []).extend(
+                    (attempt, True) for attempt in attempts
+                )
+            for task_id, attempts in unlinked_unknown_by_task.items():
+                incident_candidates.setdefault(task_id, []).extend(
+                    (attempt, False) for attempt in attempts
+                )
+
             now = time.time()
             next_runtime_epoch = expected_runtime_epoch + 1
             for task, run, generation_id, input_ids, committed in running_plans:
@@ -6576,7 +6805,7 @@ class SessionDB:
                 (expected_runtime_epoch,),
             )
 
-            for task_id, attempts in started_by_task.items():
+            for task_id, candidates in incident_candidates.items():
                 incident = open_incidents.get(task_id)
                 if incident is None:
                     incident_id = f"tfin_{uuid.uuid4().hex}"
@@ -6585,31 +6814,32 @@ class SessionDB:
                         "incident_id, task_id, source_run_id, reason_code, "
                         "state, opened_at"
                         ") VALUES (?, ?, ?, 'outcome_unknown', 'open', ?)",
-                        (incident_id, task_id, attempts[0]["run_id"], now),
+                        (incident_id, task_id, candidates[0][0]["run_id"], now),
                     )
                 else:
                     incident_id = incident["incident_id"]
-                for attempt in attempts:
-                    updated = conn.execute(
-                        "UPDATE main.task_fence_attempts "
-                        "SET state = 'OUTCOME_UNKNOWN', "
-                        "disposition = 'OUTCOME_UNKNOWN', "
-                        "acknowledgement_ref = NULL, terminal_at = ? "
-                        "WHERE attempt_id = ? AND state = 'STARTED'",
-                        (now, attempt["attempt_id"]),
-                    )
-                    if updated.rowcount != 1:
-                        raise sqlite3.IntegrityError(
-                            "Task Fence recovery attempt authority changed"
+                for attempt, started in candidates:
+                    if started:
+                        updated = conn.execute(
+                            "UPDATE main.task_fence_attempts "
+                            "SET state = 'OUTCOME_UNKNOWN', "
+                            "disposition = 'OUTCOME_UNKNOWN', "
+                            "acknowledgement_ref = NULL, terminal_at = ? "
+                            "WHERE attempt_id = ? AND state = 'STARTED'",
+                            (now, attempt["attempt_id"]),
                         )
-                    conn.execute(
-                        "INSERT INTO main.task_fence_attempt_transitions ("
-                        "attempt_id, from_state, to_state, disposition, "
-                        "evidence_ref, transitioned_at"
-                        ") VALUES (?, 'STARTED', 'OUTCOME_UNKNOWN', "
-                        "'OUTCOME_UNKNOWN', NULL, ?)",
-                        (attempt["attempt_id"], now),
-                    )
+                        if updated.rowcount != 1:
+                            raise sqlite3.IntegrityError(
+                                "Task Fence recovery attempt authority changed"
+                            )
+                        conn.execute(
+                            "INSERT INTO main.task_fence_attempt_transitions ("
+                            "attempt_id, from_state, to_state, disposition, "
+                            "evidence_ref, transitioned_at"
+                            ") VALUES (?, 'STARTED', 'OUTCOME_UNKNOWN', "
+                            "'OUTCOME_UNKNOWN', NULL, ?)",
+                            (attempt["attempt_id"], now),
+                        )
                     conn.execute(
                         "INSERT INTO main.task_fence_incident_attempts "
                         "(incident_id, attempt_id) VALUES (?, ?)",
@@ -6621,7 +6851,7 @@ class SessionDB:
                 if status not in {"stopped", "done", "waiting_user", "incident"}:
                     status = "paused"
                 if (
-                    task["task_id"] in started_by_task
+                    task["task_id"] in incident_candidates
                     and status not in {"stopped", "done"}
                 ):
                     status = "incident"
