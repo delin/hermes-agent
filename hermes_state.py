@@ -479,6 +479,42 @@ class TaskFenceTaskInspection:
 
 
 @dataclass(frozen=True)
+class TaskFenceCohortProjection:
+    """Hash-identified durable cohort state for one inspected conversation."""
+
+    cohort_fingerprint: str
+    binding: str
+    mode: str
+    mode_generation: int
+    activation_state: str
+    audit_degraded: bool
+
+
+@dataclass(frozen=True)
+class TaskFenceConversationTaskProjection:
+    """Current task authority without echoing the raw conversation key."""
+
+    task_id: str
+    status: str
+    intent_epoch: int
+    control_revision: int
+    current_runtime_epoch: int
+    last_accepted_order: int
+
+
+@dataclass(frozen=True)
+class TaskFenceConversationInspection:
+    """SELECT-only store/task/cohort selection for one conversation."""
+
+    store: TaskFenceStoreInspection
+    compatible: bool
+    reason: str
+    conversation_fingerprint: Optional[str]
+    cohort: Optional[TaskFenceCohortProjection]
+    task: Optional[TaskFenceConversationTaskProjection]
+
+
+@dataclass(frozen=True)
 class TaskFencePolicyDecisionRecord:
     """One immutable, secret-free durable policy observation."""
 
@@ -8117,6 +8153,202 @@ class SessionDB:
                 )
             )
         )
+
+    def _inspect_task_fence_conversation(
+        self,
+        conversation_id: str,
+    ) -> TaskFenceConversationInspection:
+        with self._lock:
+            if self._conn is None:
+                raise sqlite3.ProgrammingError("SessionDB is closed")
+            owned_snapshot = self._begin_task_fence_read_snapshot_unlocked()
+            try:
+                store = self._inspect_task_fence_store_unlocked(
+                    include_counts=False
+                )
+                conversation_fingerprint: Optional[str] = None
+
+                def result(
+                    *,
+                    compatible: bool,
+                    reason: str,
+                    cohort: Optional[TaskFenceCohortProjection] = None,
+                    task: Optional[TaskFenceConversationTaskProjection] = None,
+                ) -> TaskFenceConversationInspection:
+                    return TaskFenceConversationInspection(
+                        store=store,
+                        compatible=compatible,
+                        reason=reason,
+                        conversation_fingerprint=conversation_fingerprint,
+                        cohort=cohort,
+                        task=task,
+                    )
+
+                if not store.compatible:
+                    return result(compatible=False, reason=store.reason)
+                if not _task_fence_v2_identifier_compatible(conversation_id):
+                    return result(
+                        compatible=False,
+                        reason="invalid_conversation_id",
+                    )
+                conversation_fingerprint = hashlib.sha256(
+                    b"hermes.task_fence.conversation.v1\0"
+                    + conversation_id.encode("utf-8")
+                ).hexdigest()
+
+                task_rows = self._conn.execute(
+                    f"SELECT {_TASK_FENCE_TASK_SELECT_COLUMNS} "
+                    "FROM main.task_fence_tasks WHERE conversation_id = ? "
+                    "AND status NOT IN ('stopped', 'done') "
+                    "ORDER BY created_at, task_id LIMIT 2",
+                    (conversation_id,),
+                ).fetchall()
+                if len(task_rows) > 1:
+                    return result(
+                        compatible=False,
+                        reason="ambiguous_active_task",
+                    )
+
+                task_row = task_rows[0] if task_rows else None
+                task: Optional[TaskFenceConversationTaskProjection] = None
+                if task_row is not None:
+                    if (
+                        not self._task_fence_task_projection_compatible(task_row)
+                        or not _task_fence_v2_identifier_compatible(
+                            task_row["task_id"]
+                        )
+                        or not _task_fence_v2_identifier_compatible(
+                            task_row["cohort_key"],
+                            optional=True,
+                        )
+                    ):
+                        return result(
+                            compatible=False,
+                            reason="malformed_task_projection",
+                        )
+                    if task_row["current_runtime_epoch"] != store.runtime_epoch:
+                        return result(
+                            compatible=False,
+                            reason="task_runtime_epoch_mismatch",
+                        )
+                    task = TaskFenceConversationTaskProjection(
+                        task_id=task_row["task_id"],
+                        status=task_row["status"],
+                        intent_epoch=task_row["intent_epoch"],
+                        control_revision=task_row["control_revision"],
+                        current_runtime_epoch=task_row[
+                            "current_runtime_epoch"
+                        ],
+                        last_accepted_order=task_row["last_accepted_order"],
+                    )
+
+                if task_row is None:
+                    return result(
+                        compatible=True,
+                        reason="no_active_task",
+                    )
+
+                implicit_binding = task_row["cohort_key"] is None
+                cohort_key = (
+                    _TASK_FENCE_IMPLICIT_AUDIT_COHORT
+                    if implicit_binding
+                    else task_row["cohort_key"]
+                )
+                cohort_rows = self._conn.execute(
+                    "SELECT cohort_key, mode, mode_generation, "
+                    "activation_state, audit_degraded "
+                    "FROM main.task_fence_cohorts WHERE cohort_key = ? "
+                    "ORDER BY cohort_key LIMIT 2",
+                    (cohort_key,),
+                ).fetchall()
+                if len(cohort_rows) > 1:
+                    return result(
+                        compatible=False,
+                        reason="malformed_cohort_projection",
+                    )
+                if not cohort_rows:
+                    if not implicit_binding:
+                        return result(
+                            compatible=False,
+                            reason="cohort_not_found",
+                        )
+                    return result(
+                        compatible=True,
+                        reason="cohort_not_materialized",
+                        task=task,
+                    )
+
+                cohort_row = cohort_rows[0]
+                if (
+                    not _task_fence_v2_identifier_compatible(
+                        cohort_row["cohort_key"]
+                    )
+                    or cohort_row["cohort_key"] != cohort_key
+                    or cohort_row["mode"]
+                    not in {"audit", "enforce", "halt_dispatch"}
+                    or type(cohort_row["mode_generation"]) is not int
+                    or cohort_row["mode_generation"] < 0
+                    or cohort_row["activation_state"]
+                    not in {"inactive", "active", "halted"}
+                    or type(cohort_row["audit_degraded"]) is not int
+                    or cohort_row["audit_degraded"] not in (0, 1)
+                ):
+                    return result(
+                        compatible=False,
+                        reason="malformed_cohort_projection",
+                    )
+                if cohort_row["mode_generation"] != store.mode_generation:
+                    return result(
+                        compatible=False,
+                        reason="cohort_generation_mismatch",
+                    )
+                if implicit_binding and (
+                    cohort_row["mode"] != "audit"
+                    or cohort_row["activation_state"] != "inactive"
+                ):
+                    return result(
+                        compatible=False,
+                        reason="implicit_cohort_mismatch",
+                    )
+                cohort = TaskFenceCohortProjection(
+                    cohort_fingerprint=hashlib.sha256(
+                        b"hermes.task_fence.cohort.v1\0"
+                        + cohort_key.encode("utf-8")
+                    ).hexdigest(),
+                    binding="implicit" if implicit_binding else "explicit",
+                    mode=cohort_row["mode"],
+                    mode_generation=cohort_row["mode_generation"],
+                    activation_state=cohort_row["activation_state"],
+                    audit_degraded=bool(cohort_row["audit_degraded"]),
+                )
+                return result(
+                    compatible=True,
+                    reason="compatible",
+                    cohort=cohort,
+                    task=task,
+                )
+            finally:
+                self._end_task_fence_read_snapshot_unlocked(owned_snapshot)
+
+    def inspect_task_fence_conversation(
+        self,
+        conversation_id: str,
+    ) -> TaskFenceConversationInspection:
+        """Select one active task and its cohort through one read snapshot."""
+
+        try:
+            return self._inspect_task_fence_conversation(conversation_id)
+        except Exception as exc:
+            logger.debug("Task Fence conversation inspection failed: %s", exc)
+            reason = _task_fence_inspection_failure_reason(exc)
+            return TaskFenceConversationInspection(
+                store=_failed_task_fence_store_inspection(reason),
+                compatible=False,
+                reason=reason,
+                conversation_fingerprint=None,
+                cohort=None,
+                task=None,
+            )
 
     @staticmethod
     def _task_fence_ingress_fingerprint(

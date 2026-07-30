@@ -189,6 +189,67 @@ def test_operation_descriptor_and_decisions_are_closed_and_bounded():
         )
 
 
+def test_real_policy_lane_conversation_inspection_is_read_only(tmp_path):
+    path = tmp_path / "state.db"
+    db, acceptance, envelope, operation = _live_lane(path)
+    try:
+        admitted = TaskFencePolicy(db).admit_operation(envelope, operation)
+        assert admitted.outcome is DecisionOutcome.WOULD_RESERVE
+    finally:
+        db.close()
+
+    before_bytes = path.read_bytes()
+    before_stat = path.stat()
+    read_only = SessionDB(path, read_only=True)
+    try:
+        inspection = read_only.inspect_task_fence_conversation(
+            "policy-conversation"
+        )
+        unknown = read_only.inspect_task_fence_conversation(
+            "unknown-policy-conversation"
+        )
+        assert read_only._conn.total_changes == 0
+    finally:
+        read_only.close()
+    after_stat = path.stat()
+
+    assert inspection.compatible is True
+    assert inspection.reason == "compatible"
+    assert inspection.store.compatible is True
+    assert inspection.conversation_fingerprint is not None
+    assert len(inspection.conversation_fingerprint) == 64
+    assert inspection.task is not None
+    assert inspection.task.task_id == acceptance.task_id
+    assert inspection.task.status == "running"
+    assert inspection.task.intent_epoch == 1
+    assert inspection.task.control_revision == 1
+    assert inspection.cohort is not None
+    assert inspection.cohort.binding == "implicit"
+    assert len(inspection.cohort.cohort_fingerprint) == 64
+    assert inspection.cohort.mode == "audit"
+    assert inspection.cohort.mode_generation == 0
+    assert inspection.cohort.activation_state == "inactive"
+    assert inspection.cohort.audit_degraded is False
+    assert "policy-conversation" not in repr(inspection)
+    assert hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT not in repr(inspection)
+    assert unknown.compatible is True
+    assert unknown.reason == "no_active_task"
+    assert unknown.task is None
+    assert unknown.cohort is None
+    assert path.read_bytes() == before_bytes
+    assert (
+        after_stat.st_dev,
+        after_stat.st_ino,
+        after_stat.st_size,
+        after_stat.st_mtime_ns,
+    ) == (
+        before_stat.st_dev,
+        before_stat.st_ino,
+        before_stat.st_size,
+        before_stat.st_mtime_ns,
+    )
+
+
 def test_admission_reserves_without_consuming_then_authorization_starts(tmp_path):
     db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
     policy = TaskFencePolicy(db)

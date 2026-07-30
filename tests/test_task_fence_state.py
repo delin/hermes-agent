@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+import hashlib
 import sqlite3
 import threading
 
@@ -359,6 +360,30 @@ def _insert_task(
             runtime_epoch,
             1.0,
             2.0,
+        ),
+    )
+
+
+def _insert_cohort(
+    conn,
+    *,
+    cohort_key,
+    mode="audit",
+    mode_generation=0,
+    activation_state="inactive",
+    audit_degraded=0,
+):
+    conn.execute(
+        "INSERT INTO task_fence_cohorts ("
+        "cohort_key, mode, mode_generation, activation_state, "
+        "audit_degraded, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, 1.0, 2.0)",
+        (
+            cohort_key,
+            mode,
+            mode_generation,
+            activation_state,
+            audit_degraded,
         ),
     )
 
@@ -2146,6 +2171,324 @@ def test_task_projection_is_scalar_immutable_and_read_only(tmp_path):
     assert missing.reason == "not_found"
     assert missing.task is None
     assert _task_fence_schema_objects(path) == before
+
+
+def test_conversation_inspection_is_exact_secret_free_and_active_only(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.close()
+
+    selected_conversation = "workspace:secret-selected-conversation"
+    other_conversation = "workspace:secret-other-conversation"
+    terminal_conversation = "workspace:secret-terminal-conversation"
+    implicit_conversation = "workspace:secret-implicit-conversation"
+    reserved_conversation = "workspace:secret-reserved-conversation"
+    conn = sqlite3.connect(path)
+    try:
+        _insert_cohort(
+            conn,
+            cohort_key="cohort-selected",
+            audit_degraded=1,
+        )
+        _insert_cohort(conn, cohort_key="cohort-other")
+        _insert_task(
+            conn,
+            task_id="task-terminal-old",
+            conversation_id=selected_conversation,
+            status="done",
+        )
+        _insert_task(
+            conn,
+            task_id="task-selected",
+            conversation_id=selected_conversation,
+            status="paused",
+            intent_epoch=3,
+            control_revision=5,
+        )
+        conn.execute(
+            "UPDATE task_fence_tasks SET cohort_key = 'cohort-selected' "
+            "WHERE task_id = 'task-selected'"
+        )
+        _insert_task(
+            conn,
+            task_id="task-other",
+            conversation_id=other_conversation,
+            status="waiting_user",
+        )
+        conn.execute(
+            "UPDATE task_fence_tasks SET cohort_key = 'cohort-other' "
+            "WHERE task_id = 'task-other'"
+        )
+        _insert_task(
+            conn,
+            task_id="task-terminal-only",
+            conversation_id=terminal_conversation,
+            status="stopped",
+        )
+        _insert_task(
+            conn,
+            task_id="task-implicit",
+            conversation_id=implicit_conversation,
+            status="paused",
+        )
+        _insert_task(
+            conn,
+            task_id="task-explicit-reserved",
+            conversation_id=reserved_conversation,
+            status="paused",
+        )
+        conn.execute(
+            "UPDATE task_fence_tasks SET cohort_key = ? "
+            "WHERE task_id = 'task-explicit-reserved'",
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    read_only = SessionDB(path, read_only=True)
+    try:
+        selected = read_only.inspect_task_fence_conversation(
+            selected_conversation
+        )
+        selected_replay = read_only.inspect_task_fence_conversation(
+            selected_conversation
+        )
+        other = read_only.inspect_task_fence_conversation(other_conversation)
+        terminal_only = read_only.inspect_task_fence_conversation(
+            terminal_conversation
+        )
+        implicit = read_only.inspect_task_fence_conversation(
+            implicit_conversation
+        )
+        explicit_reserved = read_only.inspect_task_fence_conversation(
+            reserved_conversation
+        )
+        invalid = read_only.inspect_task_fence_conversation("")
+        assert read_only._conn.total_changes == 0
+    finally:
+        read_only.close()
+
+    assert selected.compatible is True
+    assert selected.reason == "compatible"
+    assert selected.task is not None
+    assert selected.task.task_id == "task-selected"
+    assert selected.task.status == "paused"
+    assert selected.task.intent_epoch == 3
+    assert selected.task.control_revision == 5
+    assert selected.conversation_fingerprint is not None
+    assert selected.conversation_fingerprint == hashlib.sha256(
+        b"hermes.task_fence.conversation.v1\0"
+        + selected_conversation.encode("utf-8")
+    ).hexdigest()
+    assert (
+        selected_replay.conversation_fingerprint
+        == selected.conversation_fingerprint
+    )
+    assert other.conversation_fingerprint != selected.conversation_fingerprint
+    assert selected.cohort is not None
+    assert selected.cohort.binding == "explicit"
+    assert selected.cohort.cohort_fingerprint == hashlib.sha256(
+        b"hermes.task_fence.cohort.v1\0cohort-selected"
+    ).hexdigest()
+    assert selected.cohort.mode == "audit"
+    assert selected.cohort.activation_state == "inactive"
+    assert selected.cohort.audit_degraded is True
+    rendered = repr(selected)
+    assert selected_conversation not in rendered
+    assert other_conversation not in rendered
+    assert terminal_conversation not in rendered
+    assert implicit_conversation not in rendered
+    assert reserved_conversation not in rendered
+    assert "cohort-selected" not in rendered
+    with pytest.raises(FrozenInstanceError):
+        setattr(selected.task, "status", "running")
+
+    assert terminal_only.compatible is True
+    assert terminal_only.reason == "no_active_task"
+    assert terminal_only.task is None
+    assert terminal_only.cohort is None
+    assert implicit.compatible is True
+    assert implicit.reason == "cohort_not_materialized"
+    assert implicit.task is not None
+    assert implicit.task.task_id == "task-implicit"
+    assert implicit.cohort is None
+    assert explicit_reserved.compatible is False
+    assert explicit_reserved.reason == "cohort_not_found"
+    assert explicit_reserved.task is None
+    assert explicit_reserved.cohort is None
+    assert invalid.compatible is False
+    assert invalid.reason == "invalid_conversation_id"
+    assert invalid.conversation_fingerprint is None
+
+    conn = sqlite3.connect(path)
+    try:
+        implicit_rows = conn.execute(
+            "SELECT COUNT(*) FROM task_fence_cohorts "
+            "WHERE cohort_key = ?",
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert implicit_rows == 0
+
+
+def test_conversation_inspection_rejects_non_audit_implicit_cohort(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.close()
+
+    conn = sqlite3.connect(path)
+    try:
+        _insert_cohort(
+            conn,
+            cohort_key=hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,
+        )
+        _insert_task(
+            conn,
+            task_id="task-implicit",
+            conversation_id="conversation-implicit",
+            status="paused",
+        )
+        conn.commit()
+        conn.execute(
+            "UPDATE task_fence_cohorts "
+            "SET mode = 'enforce', activation_state = 'active' "
+            "WHERE cohort_key = ?",
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    read_only = SessionDB(path, read_only=True)
+    try:
+        enforced = read_only.inspect_task_fence_conversation(
+            "conversation-implicit"
+        )
+    finally:
+        read_only.close()
+    assert enforced.compatible is False
+    assert enforced.reason == "implicit_cohort_mismatch"
+    assert enforced.task is None
+    assert enforced.cohort is None
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE task_fence_cohorts "
+            "SET mode = 'audit', activation_state = 'halted' "
+            "WHERE cohort_key = ?",
+            (hermes_state._TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    read_only = SessionDB(path, read_only=True)
+    try:
+        halted = read_only.inspect_task_fence_conversation(
+            "conversation-implicit"
+        )
+    finally:
+        read_only.close()
+    assert halted.compatible is False
+    assert halted.reason == "implicit_cohort_mismatch"
+    assert halted.task is None
+    assert halted.cohort is None
+
+
+def test_conversation_inspection_uses_one_store_task_cohort_snapshot(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.close()
+
+    conn = sqlite3.connect(path)
+    try:
+        _insert_cohort(conn, cohort_key="cohort-snapshot")
+        _insert_task(
+            conn,
+            task_id="task-snapshot",
+            conversation_id="conversation-snapshot",
+            status="paused",
+            control_revision=1,
+        )
+        conn.execute(
+            "UPDATE task_fence_tasks SET cohort_key = 'cohort-snapshot' "
+            "WHERE task_id = 'task-snapshot'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reader = SessionDB(path, read_only=True)
+    store_read = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    original_inspect = reader._inspect_task_fence_store_unlocked
+
+    def pause_after_store(*, include_counts):
+        inspected = original_inspect(include_counts=include_counts)
+        store_read.set()
+        if not writer_done.wait(timeout=5):
+            raise RuntimeError("concurrent projection update timed out")
+        return inspected
+
+    def update_projection():
+        try:
+            if not store_read.wait(timeout=5):
+                raise RuntimeError("inspection did not read the store")
+            writer = sqlite3.connect(path, timeout=5, isolation_level=None)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute(
+                    "UPDATE task_fence_tasks SET control_revision = 2 "
+                    "WHERE task_id = 'task-snapshot'"
+                )
+                writer.execute(
+                    "UPDATE task_fence_cohorts SET audit_degraded = 1 "
+                    "WHERE cohort_key = 'cohort-snapshot'"
+                )
+                writer.commit()
+            finally:
+                writer.close()
+        except Exception as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    monkeypatch.setattr(
+        reader,
+        "_inspect_task_fence_store_unlocked",
+        pause_after_store,
+    )
+    writer_thread = threading.Thread(target=update_projection)
+    writer_thread.start()
+    try:
+        before = reader.inspect_task_fence_conversation(
+            "conversation-snapshot"
+        )
+        writer_thread.join(timeout=5)
+        after = reader.inspect_task_fence_conversation(
+            "conversation-snapshot"
+        )
+    finally:
+        reader.close()
+
+    assert writer_thread.is_alive() is False
+    assert writer_errors == []
+    assert before.compatible is True
+    assert before.task is not None
+    assert before.cohort is not None
+    assert before.task.control_revision == 1
+    assert before.cohort.audit_degraded is False
+    assert after.compatible is True
+    assert after.task is not None
+    assert after.cohort is not None
+    assert after.task.control_revision == 2
+    assert after.cohort.audit_degraded is True
 
 
 @pytest.mark.parametrize(
