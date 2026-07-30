@@ -287,6 +287,339 @@ jobs:
           retention-days: 90
 
   # ---------------------------------------------------------------------------
+  # The maintained fork publishes release descriptors to private GHCR with a
+  # job-scoped package token. It intentionally creates no mutable image tag or
+  # multi-platform index; the exact per-platform receipts are the deployment
+  # source. Keeping this separate preserves the upstream Docker Hub authority.
+  # ---------------------------------------------------------------------------
+  publish-maintained-fork:
+    if: >-
+      github.repository == 'delin/hermes-agent' &&
+      github.event_name == 'release' &&
+      github.event.action == 'published' &&
+      github.ref == format('refs/tags/{0}', github.event.release.tag_name)
+    permissions:
+      contents: read
+      packages: write
+    environment: container-publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            cache-from: type=gha,scope=docker-amd64
+            cache-to: type=gha,mode=max,scope=docker-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache-from: type=gha,scope=docker-arm64
+            cache-to: type=gha,mode=max,scope=docker-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      IMAGE_NAME: ghcr.io/delin/hermes-agent
+    steps:
+      - name: Checkout trusted release source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push ${{ matrix.arch }} by digest
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: ${{ matrix.cache-from }}
+          cache-to: ${{ matrix.cache-to }}
+
+      - name: Pull exact published descriptor
+        uses: ./.github/actions/retry
+        with:
+          command: docker pull --platform "${{ matrix.platform }}" "${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+
+      - name: Remove GHCR credentials before tests
+        run: docker logout ghcr.io
+
+      - name: Install uv (for published-image tests)
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+
+      - name: Set up Python 3.11 (for published-image tests)
+        run: uv python install 3.11
+
+      - name: Install Python dependencies (for published-image tests)
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run docker integration tests against exact published descriptor
+        env:
+          HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: scripts/run_tests.sh tests/docker/ --file-timeout 600
+
+      - name: Export tested artifact receipt
+        env:
+          ARTIFACT_DIGEST: ${{ steps.push.outputs.digest }}
+          TESTED_COMMIT: ${{ github.sha }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "$TESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ "$TESTED_COMMIT" =~ ^0+$ ]]; then
+            echo "::error::invalid tested commit identity"
+            exit 1
+          fi
+          if [[ ! "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::invalid published artifact digest"
+            exit 1
+          fi
+          artifact_hex="${ARTIFACT_DIGEST#sha256:}"
+          if [[ "$artifact_hex" =~ ^0+$ ]]; then
+            echo "::error::zero published artifact digest"
+            exit 1
+          fi
+          case "$TARGET_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *)
+              echo "::error::unsupported tested artifact platform"
+              exit 1
+              ;;
+          esac
+
+          checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [[ "$checkout_commit" != "$TESTED_COMMIT" ]]; then
+            echo "::error::checked-out commit does not match the workflow commit"
+            exit 1
+          fi
+
+          committed_lock="${RUNNER_TEMP}/task-fence-uv.lock"
+          git cat-file blob "${TESTED_COMMIT}:uv.lock" > "$committed_lock"
+          if ! cmp --silent "$committed_lock" uv.lock; then
+            echo "::error::checked-out uv.lock does not match the committed raw blob"
+            exit 1
+          fi
+          lock_line="$(sha256sum --binary "$committed_lock")"
+          lock_hex="${lock_line%% *}"
+          if [[ ! "$lock_hex" =~ ^[0-9a-f]{64}$ ]] || [[ "$lock_hex" =~ ^0+$ ]]; then
+            echo "::error::invalid raw uv.lock digest"
+            exit 1
+          fi
+
+          image_commit="$(docker run --rm --entrypoint cat "$IMAGE_REF" /opt/hermes/.hermes_build_sha)"
+          image_lock_line="$(docker run --rm --entrypoint sha256sum "$IMAGE_REF" /opt/hermes/uv.lock)"
+          image_lock_hex="${image_lock_line%% *}"
+          image_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE_REF")"
+          if [[ "$image_commit" != "$TESTED_COMMIT" ]]; then
+            echo "::error::published image commit does not match the workflow commit"
+            exit 1
+          fi
+          if [[ "$image_lock_hex" != "$lock_hex" ]]; then
+            echo "::error::published image uv.lock does not match the tested raw bytes"
+            exit 1
+          fi
+          if [[ "$image_platform" != "$TARGET_PLATFORM" ]]; then
+            echo "::error::published image platform does not match the target platform"
+            exit 1
+          fi
+
+          mkdir --parents /tmp/tested-artifact
+          jq --null-input --compact-output --sort-keys \
+            --arg schema "hermes.task-fence.tested-artifact-receipt/v1" \
+            --arg platform "$TARGET_PLATFORM" \
+            --arg commit "$TESTED_COMMIT" \
+            --arg artifact "$ARTIFACT_DIGEST" \
+            --arg lock "sha256:${lock_hex}" \
+            '{
+              schema: $schema,
+              target_platform: $platform,
+              tested_artifact_commit: $commit,
+              tested_artifact_checksum: $artifact,
+              dependency_lock_fingerprint: $lock
+            }' > "/tmp/tested-artifact/${{ matrix.arch }}.json"
+
+      - name: Upload tested artifact receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tested-artifact-${{ matrix.arch }}
+          path: /tmp/tested-artifact/${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # The maintained fork has no mutable release image tag. Its release event
+  # archives the two exact tested per-platform receipts as set-once assets.
+  # This job has release-write authority but no registry package authority.
+  # ---------------------------------------------------------------------------
+  archive-release-receipts:
+    if: >-
+      github.repository == 'delin/hermes-agent' &&
+      github.event_name == 'release' &&
+      github.event.action == 'published' &&
+      github.ref == format('refs/tags/{0}', github.event.release.tag_name)
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-latest
+    needs: [publish-maintained-fork]
+    timeout-minutes: 10
+    environment: container-publish
+    steps:
+      - name: Checkout maintained-fork release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download tested artifact receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/tested-artifacts
+          pattern: tested-artifact-*
+          merge-multiple: true
+
+      - name: Validate and archive release receipts
+        working-directory: /tmp/tested-artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TESTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          receipt_files=(amd64.json arm64.json)
+          expected_platforms=(linux/amd64 linux/arm64)
+
+          shopt -s nullglob dotglob
+          downloaded_receipts=(*)
+          shopt -u dotglob
+          if [ "${#downloaded_receipts[@]}" -ne "${#receipt_files[@]}" ]; then
+            echo "::error::expected exactly two tested artifact receipts"
+            exit 1
+          fi
+          if [[ ! "$TESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ "$TESTED_COMMIT" =~ ^0+$ ]]; then
+            echo "::error::invalid tested commit identity"
+            exit 1
+          fi
+          if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::invalid release identity"
+            exit 1
+          fi
+          tag_commit="$(git -C "$GITHUB_WORKSPACE" rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$tag_commit" != "$TESTED_COMMIT" ]]; then
+            echo "::error::release tag does not resolve to the tested commit"
+            exit 1
+          fi
+
+          lock_fingerprint=""
+          previous_digest=""
+          for index in 0 1; do
+            receipt_file="${receipt_files[$index]}"
+            expected_platform="${expected_platforms[$index]}"
+            if [ ! -f "$receipt_file" ]; then
+              echo "::error::missing tested artifact receipt: $receipt_file"
+              exit 1
+            fi
+            if [ "$(jq --raw-output 'keys | sort | join(",")' "$receipt_file")" != "dependency_lock_fingerprint,schema,target_platform,tested_artifact_checksum,tested_artifact_commit" ]; then
+              echo "::error::unexpected tested artifact receipt fields: $receipt_file"
+              exit 1
+            fi
+            schema="$(jq --exit-status --raw-output '.schema' "$receipt_file")"
+            platform="$(jq --exit-status --raw-output '.target_platform' "$receipt_file")"
+            commit="$(jq --exit-status --raw-output '.tested_artifact_commit' "$receipt_file")"
+            digest="$(jq --exit-status --raw-output '.tested_artifact_checksum' "$receipt_file")"
+            receipt_lock="$(jq --exit-status --raw-output '.dependency_lock_fingerprint' "$receipt_file")"
+            if [[ "$schema" != "hermes.task-fence.tested-artifact-receipt/v1" ]] || [[ "$platform" != "$expected_platform" ]] || [[ "$commit" != "$TESTED_COMMIT" ]]; then
+              echo "::error::tested artifact receipt identity mismatch: $receipt_file"
+              exit 1
+            fi
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || [[ "${digest#sha256:}" =~ ^0+$ ]]; then
+              echo "::error::invalid tested artifact digest: $receipt_file"
+              exit 1
+            fi
+            if [[ ! "$receipt_lock" =~ ^sha256:[0-9a-f]{64}$ ]] || [[ "${receipt_lock#sha256:}" =~ ^0+$ ]]; then
+              echo "::error::invalid dependency lock fingerprint: $receipt_file"
+              exit 1
+            fi
+            if [[ -n "$lock_fingerprint" && "$receipt_lock" != "$lock_fingerprint" ]]; then
+              echo "::error::tested artifacts disagree on dependency lock fingerprint"
+              exit 1
+            fi
+            if [[ -n "$previous_digest" && "$digest" == "$previous_digest" ]]; then
+              echo "::error::tested platform artifacts unexpectedly share one descriptor"
+              exit 1
+            fi
+            lock_fingerprint="$receipt_lock"
+            previous_digest="$digest"
+          done
+
+          release_json="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          api_release_id="$(jq --exit-status --raw-output '.id | select(type == "number")' <<< "$release_json")"
+          api_release_tag="$(jq --exit-status --raw-output '.tag_name | select(type == "string")' <<< "$release_json")"
+          api_release_draft="$(jq --exit-status --raw-output '.draft | if type == "boolean" then tostring else error("invalid release draft flag") end' <<< "$release_json")"
+          if [[ "$api_release_id" != "$RELEASE_ID" ]] || [[ "$api_release_tag" != "$RELEASE_TAG" ]] || [[ "$api_release_draft" != "false" ]]; then
+            echo "::error::release API identity mismatch"
+            exit 1
+          fi
+
+          asset_pages="$(gh api --paginate --slurp --method GET "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100")"
+          assets_json="$(jq --exit-status --compact-output 'if type == "array" and all(.[]; type == "array") then add else error("invalid release assets response") end' <<< "$asset_pages")"
+          if ! jq --exit-status 'type == "array"' <<< "$assets_json" > /dev/null; then
+            echo "::error::release assets response is not an array"
+            exit 1
+          fi
+
+          existing_dir="${RUNNER_TEMP}/task-fence-existing-release-assets"
+          mkdir --parents "$existing_dir"
+          missing_receipts=()
+          for receipt_file in "${receipt_files[@]}"; do
+            asset_count="$(jq --arg name "$receipt_file" '[.[] | select(.name == $name)] | length' <<< "$assets_json")"
+            case "$asset_count" in
+              0)
+                missing_receipts+=("$receipt_file")
+                ;;
+              1)
+                asset_id="$(jq --exit-status --raw-output --arg name "$receipt_file" '.[] | select(.name == $name) | .id | select(type == "number")' <<< "$assets_json")"
+                existing_file="${existing_dir}/${receipt_file}"
+                gh api --method GET --header 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "$existing_file"
+                if ! cmp --silent "$receipt_file" "$existing_file"; then
+                  echo "::error::release receipt already exists with different bytes: $receipt_file"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "::error::release has duplicate receipt assets: $receipt_file"
+                exit 1
+                ;;
+            esac
+          done
+
+          if [ "${#missing_receipts[@]}" -gt 0 ]; then
+            gh release upload "$RELEASE_TAG" "${missing_receipts[@]}" --repo "$GITHUB_REPOSITORY"
+          fi
+
+  # ---------------------------------------------------------------------------
   # Stitch both per-arch digests into a single tagged multi-arch manifest.
   # This is a registry-side operation — no building, no layer re-push —
   # so it runs in ~30 seconds.
