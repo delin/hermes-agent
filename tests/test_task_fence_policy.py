@@ -64,11 +64,11 @@ def _live_lane(
     operation = OperationDescriptor(
         invocation_id=invocation_id,
         kind=kind,
-        adapter=(
-            "provider:test-model"
-            if kind is OperationKind.MODEL
-            else "registry:write_file"
-        ),
+        adapter={
+            OperationKind.MODEL: "provider:test-model",
+            OperationKind.TOOL: "registry:write_file",
+            OperationKind.DELIVERY: "gateway:slack:chat_post_message",
+        }[kind],
         invocation_fingerprint=_hash("post-default-operation"),
     )
     return db, acceptance, envelope, operation
@@ -258,6 +258,44 @@ def test_admission_reserves_without_consuming_then_authorization_starts(tmp_path
                 (started.attempt_id,),
             ).fetchone()
         ) == (None, "STARTED", "would_allow")
+    finally:
+        db.close()
+
+
+def test_delivery_kind_uses_committed_generation_and_persists_exactly(tmp_path):
+    db, _acceptance, envelope, operation = _live_lane(
+        tmp_path / "state.db",
+        kind=OperationKind.DELIVERY,
+    )
+    policy = TaskFencePolicy(db)
+    try:
+        admitted = policy.admit_operation(envelope, operation)
+        started = policy.authorize_and_start(
+            envelope,
+            operation,
+            admitted.permit_id,
+        )
+
+        assert admitted.outcome is DecisionOutcome.WOULD_RESERVE
+        assert started.outcome is DecisionOutcome.WOULD_ALLOW
+        assert tuple(
+            db._conn.execute(
+                "SELECT audience, executor FROM task_fence_dispatch_permits "
+                "WHERE permit_id = ?",
+                (admitted.permit_id,),
+            ).fetchone()
+        ) == ("delivery", operation.adapter)
+        assert {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT DISTINCT operation_kind FROM task_fence_policy_decisions"
+            )
+        } == {"delivery"}
+        inspection = db.inspect_task_fence_policy_decision(started.decision_id)
+        assert inspection.compatible is True
+        assert inspection.decision is not None
+        assert inspection.decision.operation == operation
+        assert inspection.decision.operation.kind is OperationKind.DELIVERY
     finally:
         db.close()
 
@@ -542,6 +580,7 @@ def test_model_authorization_revalidates_uniform_input_state(tmp_path):
     (
         (OperationKind.MODEL, "committed"),
         (OperationKind.TOOL, "started"),
+        (OperationKind.DELIVERY, "started"),
     ),
 )
 def test_operation_kind_must_match_generation_phase(

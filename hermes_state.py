@@ -332,8 +332,9 @@ _TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES = 10_000
 _TASK_FENCE_MAX_V2_MIGRATION_PENDING_ROWS = 1_000_000
 _TASK_FENCE_MAX_V2_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_MAX_V2_MIGRATION_HISTORY_WORK = 1_000_000
-_TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset({2, 3, 4})
+_TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 _TASK_FENCE_MAX_V3_MIGRATION_ROWS = 1_000_000
+_TASK_FENCE_MAX_V4_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
 _TASK_FENCE_POLICY_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 _TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
@@ -2574,12 +2575,31 @@ CREATE INDEX IF NOT EXISTS main.idx_task_fence_policy_decisions_invocation
 """
 
 
+# Preserve the archived v4 DDL byte-for-byte; v5 widens only this closed value.
+_TASK_FENCE_V4_OPERATION_KIND_CHECK = "operation_kind IN ('model', 'tool')"
+_TASK_FENCE_V5_OPERATION_KIND_CHECK = (
+    "operation_kind IN ('model', 'tool', 'delivery')"
+)
+if TASK_FENCE_SCHEMA_V4_EXTENSION_SQL.count(
+    _TASK_FENCE_V4_OPERATION_KIND_CHECK
+) != 1:
+    raise RuntimeError("Task Fence v4 operation-kind schema drift")
+TASK_FENCE_SCHEMA_V5_EXTENSION_SQL = TASK_FENCE_SCHEMA_V4_EXTENSION_SQL.replace(
+    _TASK_FENCE_V4_OPERATION_KIND_CHECK,
+    _TASK_FENCE_V5_OPERATION_KIND_CHECK,
+    1,
+)
+
+
 TASK_FENCE_SCHEMA_POST_V1_SQL = (
     TASK_FENCE_SCHEMA_V2_EXTENSION_SQL
     + TASK_FENCE_SCHEMA_V3_REDUCTION_SQL
-    + TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
+    + TASK_FENCE_SCHEMA_V5_EXTENSION_SQL
 )
-TASK_FENCE_SCHEMA_SQL = TASK_FENCE_SCHEMA_V3_SQL + TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
+TASK_FENCE_SCHEMA_V4_SQL = (
+    TASK_FENCE_SCHEMA_V3_SQL + TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
+)
+TASK_FENCE_SCHEMA_SQL = TASK_FENCE_SCHEMA_V3_SQL + TASK_FENCE_SCHEMA_V5_EXTENSION_SQL
 
 _task_fence_expected_schema_objects: Optional[Tuple[Tuple[str, str, str, str], ...]] = (
     None
@@ -2591,6 +2611,9 @@ _task_fence_expected_v2_schema_objects: Optional[
     Tuple[Tuple[str, str, str, str], ...]
 ] = None
 _task_fence_expected_v3_schema_objects: Optional[
+    Tuple[Tuple[str, str, str, str], ...]
+] = None
+_task_fence_expected_v4_schema_objects: Optional[
     Tuple[Tuple[str, str, str, str], ...]
 ] = None
 _task_fence_expected_schema_objects_lock = threading.Lock()
@@ -2678,6 +2701,17 @@ def _expected_task_fence_v3_schema_objects() -> Tuple[Tuple[str, str, str, str],
                 TASK_FENCE_SCHEMA_V3_SQL
             )
         return _task_fence_expected_v3_schema_objects
+
+
+def _expected_task_fence_v4_schema_objects() -> Tuple[Tuple[str, str, str, str], ...]:
+    """Lazily build the exact pre-delivery migration signature."""
+    global _task_fence_expected_v4_schema_objects
+    with _task_fence_expected_schema_objects_lock:
+        if _task_fence_expected_v4_schema_objects is None:
+            _task_fence_expected_v4_schema_objects = _task_fence_schema_objects_for_sql(
+                TASK_FENCE_SCHEMA_V4_SQL
+            )
+        return _task_fence_expected_v4_schema_objects
 
 
 def _expected_task_fence_schema_objects() -> Tuple[Tuple[str, str, str, str], ...]:
@@ -5138,7 +5172,7 @@ class SessionDB:
 
         self._execute_task_fence_schema_sql(
             cursor,
-            TASK_FENCE_SCHEMA_V4_EXTENSION_SQL,
+            TASK_FENCE_SCHEMA_V5_EXTENSION_SQL,
         )
         updated_tasks = cursor.execute(
             "UPDATE main.task_fence_tasks SET store_schema_version = ? "
@@ -5178,6 +5212,233 @@ class SessionDB:
             raise sqlite3.DatabaseError("Task Fence v3 migration foreign key mismatch")
         return True
 
+    def _task_fence_v4_is_migratable_unlocked(
+        self,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        if schema_objects != _expected_task_fence_v4_schema_objects():
+            return False
+        metadata = self._conn.execute(
+            "SELECT singleton, store_schema_version, control_protocol_version, "
+            "runtime_epoch, mode_generation, ever_enforced, "
+            "tested_artifact_commit, tested_artifact_checksum, "
+            "dependency_lock_fingerprint "
+            "FROM main.task_fence_control ORDER BY singleton LIMIT 2"
+        ).fetchall()
+        if len(metadata) != 1 or tuple(metadata[0]) != (
+            1,
+            4,
+            TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+        ):
+            return False
+
+        remaining_rows = _TASK_FENCE_MAX_V4_MIGRATION_ROWS
+        for object_type, table_name, _table, _sql in schema_objects:
+            if object_type != "table":
+                continue
+            if _TASK_FENCE_TABLE_NAME_RE.fullmatch(table_name) is None:
+                raise sqlite3.DatabaseError("invalid trusted Task Fence table name")
+            safe_table = table_name.replace('"', '""')
+            count = self._conn.execute(
+                f'SELECT COUNT(*) FROM (SELECT 1 FROM main."{safe_table}" LIMIT ?)',
+                (remaining_rows + 1,),
+            ).fetchone()[0]
+            if type(count) is not int or count > remaining_rows:
+                return False
+            remaining_rows -= count
+
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM main.task_fence_cohorts "
+                "WHERE mode != 'audit' OR activation_state != 'inactive' "
+                "OR mode_generation != 0 OR audit_degraded != 0 LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM main.task_fence_tasks "
+                "WHERE store_schema_version != 4 "
+                "OR control_protocol_version != ? LIMIT 1",
+                (TASK_FENCE_CONTROL_PROTOCOL_VERSION,),
+            ).fetchone()
+            is not None
+        ):
+            return False
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM main.task_fence_acceptance_snapshots "
+                "WHERE task_store_schema_version IS NOT NULL "
+                "AND task_store_schema_version NOT IN (2, 3, 4) LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM main.task_fence_dispatch_permits "
+                "WHERE audience NOT IN ('model', 'tool') LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+        return self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            schema_objects,
+        )
+
+    def _migrate_task_fence_v4_to_current_unlocked(
+        self,
+        cursor: sqlite3.Cursor,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        if not self._task_fence_v4_is_migratable_unlocked(schema_objects):
+            return False
+
+        task_count = cursor.execute(
+            "SELECT COUNT(*) FROM main.task_fence_tasks"
+        ).fetchone()[0]
+        decision_count = cursor.execute(
+            "SELECT COUNT(*) FROM main.task_fence_policy_decisions"
+        ).fetchone()[0]
+        if type(task_count) is not int or type(decision_count) is not int:
+            return False
+        max_decision_order = cursor.execute(
+            "SELECT COALESCE(MAX(decision_order), 0) "
+            "FROM main.task_fence_policy_decisions"
+        ).fetchone()[0]
+        sequence_rows = cursor.execute(
+            "SELECT seq FROM main.sqlite_sequence "
+            "WHERE name = 'task_fence_policy_decisions' LIMIT 2"
+        ).fetchall()
+        if (
+            type(max_decision_order) is not int
+            or max_decision_order < 0
+            or len(sequence_rows) > 1
+        ):
+            return False
+        decision_sequence = sequence_rows[0][0] if sequence_rows else None
+        if (
+            decision_sequence is not None
+            and (
+                type(decision_sequence) is not int
+                or decision_sequence < max_decision_order
+            )
+        ) or (decision_count > 0 and decision_sequence is None):
+            return False
+
+        for trigger_name in (
+            "task_fence_policy_decisions_no_replace",
+            "task_fence_policy_decisions_no_update",
+            "task_fence_policy_decisions_no_delete",
+        ):
+            cursor.execute(f"DROP TRIGGER main.{trigger_name}")
+        cursor.execute(
+            "DROP INDEX main.idx_task_fence_policy_decisions_invocation"
+        )
+        cursor.execute(
+            "ALTER TABLE main.task_fence_policy_decisions "
+            "RENAME TO task_fence_policy_decisions_v4"
+        )
+        self._execute_task_fence_schema_sql(
+            cursor,
+            TASK_FENCE_SCHEMA_V5_EXTENSION_SQL,
+        )
+        columns = (
+            "decision_order, decision_id, decision_point, outcome, reason_code, "
+            "policy_version, candidate_task_id, candidate_authority_event_id, "
+            "candidate_run_id, candidate_generation_id, candidate_intent_epoch, "
+            "candidate_control_revision, candidate_runtime_epoch, cohort_key, "
+            "mode_generation, operation_invocation_id, envelope_invocation_id, "
+            "operation_kind, adapter, invocation_fingerprint, "
+            "causal_binding_fingerprint, permit_id, attempt_id, decided_at"
+        )
+        cursor.execute(
+            f"INSERT INTO main.task_fence_policy_decisions ({columns}) "
+            f"SELECT {columns} FROM main.task_fence_policy_decisions_v4 "
+            "ORDER BY decision_order"
+        )
+        copied_count = cursor.execute(
+            "SELECT COUNT(*) FROM main.task_fence_policy_decisions"
+        ).fetchone()[0]
+        if copied_count != decision_count:
+            raise sqlite3.DatabaseError(
+                "Task Fence v4 migration decision journal changed"
+            )
+        cursor.execute("DROP TABLE main.task_fence_policy_decisions_v4")
+        if decision_sequence is not None:
+            updated_sequence = cursor.execute(
+                "UPDATE main.sqlite_sequence SET seq = ? "
+                "WHERE name = 'task_fence_policy_decisions'",
+                (decision_sequence,),
+            )
+            if updated_sequence.rowcount == 0:
+                cursor.execute(
+                    "INSERT INTO main.sqlite_sequence(name, seq) "
+                    "VALUES ('task_fence_policy_decisions', ?)",
+                    (decision_sequence,),
+                )
+            elif updated_sequence.rowcount != 1:
+                raise sqlite3.DatabaseError(
+                    "Task Fence v4 migration decision sequence changed"
+                )
+            migrated_sequence = cursor.execute(
+                "SELECT seq FROM main.sqlite_sequence "
+                "WHERE name = 'task_fence_policy_decisions'"
+            ).fetchall()
+            if (
+                len(migrated_sequence) != 1
+                or migrated_sequence[0][0] != decision_sequence
+            ):
+                raise sqlite3.DatabaseError(
+                    "Task Fence v4 migration decision sequence mismatch"
+                )
+
+        updated_tasks = cursor.execute(
+            "UPDATE main.task_fence_tasks SET store_schema_version = ? "
+            "WHERE store_schema_version = 4",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        if updated_tasks.rowcount != task_count:
+            raise sqlite3.DatabaseError("Task Fence v4 migration task metadata changed")
+        updated_control = cursor.execute(
+            "UPDATE main.task_fence_control "
+            "SET store_schema_version = ?, "
+            "updated_at = CAST(strftime('%s', 'now') AS REAL) "
+            "WHERE singleton = 1 AND store_schema_version = 4 "
+            "AND control_protocol_version = ? AND runtime_epoch = 0 "
+            "AND mode_generation = 0 AND ever_enforced = 0 "
+            "AND tested_artifact_commit IS NULL "
+            "AND tested_artifact_checksum IS NULL "
+            "AND dependency_lock_fingerprint IS NULL",
+            (
+                TASK_FENCE_STORE_SCHEMA_VERSION,
+                TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+            ),
+        )
+        if updated_control.rowcount != 1:
+            raise sqlite3.DatabaseError(
+                "Task Fence v4 migration control metadata changed"
+            )
+        if (
+            _read_task_fence_schema_objects(self._conn)
+            != _expected_task_fence_schema_objects()
+        ):
+            raise sqlite3.DatabaseError("Task Fence v4 migration schema mismatch")
+        if not self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            _expected_task_fence_schema_objects(),
+        ):
+            raise sqlite3.DatabaseError("Task Fence v4 migration foreign key mismatch")
+        return True
+
     def _init_task_fence_schema(self) -> None:
         """Create current Task Fence schema or migrate an exact older shadow.
 
@@ -5210,7 +5471,13 @@ class SessionDB:
             expected_v1 = _expected_task_fence_v1_schema_objects()
             expected_v2 = _expected_task_fence_v2_schema_objects()
             expected_v3 = _expected_task_fence_v3_schema_objects()
-            if observed and observed not in {expected_v1, expected_v2, expected_v3}:
+            expected_v4 = _expected_task_fence_v4_schema_objects()
+            if observed and observed not in {
+                expected_v1,
+                expected_v2,
+                expected_v3,
+                expected_v4,
+            }:
                 return
 
             cursor = self._conn.cursor()
@@ -5280,6 +5547,18 @@ class SessionDB:
                         "Task Fence exact v3 shadow state is not safely "
                         "migratable; automatic current migration was refused and "
                         "legacy dispatch behavior is unchanged."
+                    )
+                    return
+            elif observed == expected_v4:
+                if not self._migrate_task_fence_v4_to_current_unlocked(
+                    cursor,
+                    observed,
+                ):
+                    self._conn.rollback()
+                    logger.warning(
+                        "Task Fence exact v4 shadow state is not safely "
+                        "migratable; automatic current migration was refused "
+                        "and legacy dispatch behavior is unchanged."
                     )
                     return
             else:
@@ -8535,7 +8814,7 @@ class SessionDB:
             permit["tool_name"] is not None
             or permit["method"] is not None
             or permit["parent_attempt_id"] is not None
-            or permit["audience"] not in {"model", "tool"}
+            or permit["audience"] not in {"model", "tool", "delivery"}
         ):
             return False
         if (

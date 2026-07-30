@@ -34,6 +34,9 @@ _TASK_FENCE_V2_DDL_SHA256 = (
 _TASK_FENCE_V3_DDL_SHA256 = (
     "f6e4c0a1bd7b586a7793ced62cd2f9eb6f54ac2acebb50d780e509d00fe10d72"
 )
+_TASK_FENCE_V4_DDL_SHA256 = (
+    "d1e4a16d592224a9e56f859fc75efd601bb2b83d6bcaf7d5ff310da7b811c76a"
+)
 
 
 def _hash(payload: str) -> str:
@@ -412,6 +415,15 @@ def test_archived_v3_migration_source_is_frozen() -> None:
             hermes_state.TASK_FENCE_SCHEMA_V3_SQL.encode("utf-8")
         ).hexdigest()
         == _TASK_FENCE_V3_DDL_SHA256
+    )
+
+
+def test_archived_v4_migration_source_is_frozen() -> None:
+    assert (
+        hashlib.sha256(
+            hermes_state.TASK_FENCE_SCHEMA_V4_SQL.encode("utf-8")
+        ).hexdigest()
+        == _TASK_FENCE_V4_DDL_SHA256
     )
 
 
@@ -1727,10 +1739,10 @@ def test_v3_migration_fault_rolls_back_exact_state(
     if failure_stage == "extension":
         monkeypatch.setattr(
             hermes_state,
-            "TASK_FENCE_SCHEMA_V4_EXTENSION_SQL",
-            hermes_state.TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
-            + "CREATE TABLE task_fence_v4_partial (value INTEGER);"
-            + "INVALID TASK FENCE V4;",
+            "TASK_FENCE_SCHEMA_V5_EXTENSION_SQL",
+            hermes_state.TASK_FENCE_SCHEMA_V5_EXTENSION_SQL
+            + "CREATE TABLE task_fence_v5_partial (value INTEGER);"
+            + "INVALID TASK FENCE V5;",
         )
         failed = SessionDB(path)
         try:

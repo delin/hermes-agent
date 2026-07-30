@@ -21,7 +21,7 @@ from typing import Iterator, Mapping, Protocol
 
 
 CONTROL_PROTOCOL_VERSION = 1
-TASK_FENCE_STORE_SCHEMA_VERSION = 4
+TASK_FENCE_STORE_SCHEMA_VERSION = 5
 
 _MAX_SOURCE_BYTES = 256
 _MAX_IDENTIFIER_BYTES = 512
@@ -88,6 +88,7 @@ class TerminalReason(str, Enum):
 class OperationKind(str, Enum):
     MODEL = "model"
     TOOL = "tool"
+    DELIVERY = "delivery"
 
 
 class DecisionOutcome(str, Enum):
