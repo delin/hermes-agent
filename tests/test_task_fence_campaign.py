@@ -36,6 +36,7 @@ _CODEX_APP_SERVER_ROUTE = "provider:codex.app_server"
 _CODEX_ROUTE = "provider:openai.responses.create"
 _COPILOT_ACP_ROUTE = "provider:copilot.acp"
 _GEMINI_ROUTE = "provider:gemini.generateContent"
+_GENERIC_AUXILIARY_ROUTE = "runtime:generic-auxiliary"
 _MOA_ONE_SHOT_ROUTE = "runtime:moa-one-shot"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
 
@@ -1350,6 +1351,215 @@ def test_campaign_excludes_moa_one_shot_at_real_aggregator_create(
         assert current_causal_envelope() is None
         assert current_task_fence_policy() is None
     finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_campaign_excludes_sync_goal_judge_at_real_auxiliary_create(
+    tmp_path,
+    monkeypatch,
+):
+    from typing import Any
+
+    from agent import auxiliary_client
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource, build_session_key
+    from hermes_cli import goals
+    from hermes_state import AsyncSessionDB
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        user_id="U-CAMPAIGN",
+        chat_id="C-CAMPAIGN",
+        user_name="campaign",
+        chat_type="channel",
+        thread_id="1718600000.000100",
+    )
+    conversation_id = build_session_key(source)
+    session_id = "campaign-goal-session"
+    goal = "finish the bounded generic auxiliary campaign"
+    final_response = "campaign work is incomplete"
+    judge_reason = "one concrete campaign step remains"
+
+    db = SessionDB(home / "state.db")
+    conn = db._conn
+    assert conn is not None
+    acceptance = db.accept_task_fence_ingress(
+        IngressEnvelope(
+            source="gateway:slack",
+            source_event_id="campaign-goal-parent",
+            conversation_id=conversation_id,
+            action=TASK_FENCE_ACTIONS["initial_submit"],
+            payload_hash=_hash("campaign-goal-parent"),
+            opaque_payload_ref="slack:campaign-goal-parent",
+        )
+    )
+    parent_generation = db.reserve_task_fence_generation(acceptance)
+    assert db.finish_task_fence_generation(
+        parent_generation,
+        state="committed",
+    )
+
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    notices = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        notices.append((chat_id, content, metadata))
+        return SimpleNamespace(success=True)
+
+    adapter = SimpleNamespace(_pending_messages={}, send=send)
+    runner: Any = object.__new__(GatewayRunner)
+    runner.config = {"goals": {"max_turns": 2}}
+    runner._queued_events = {}
+    runner.adapters = {Platform.SLACK: adapter}
+    runner.session_store = SimpleNamespace(
+        _generate_session_key=lambda _source: conversation_id,
+    )
+    runner._session_db = AsyncSessionDB(db)
+    session_entry = SimpleNamespace(session_id=session_id)
+
+    physical = []
+
+    def counts():
+        with db._lock:
+            return tuple(
+                conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+
+    def create(**kwargs):
+        with db._lock:
+            generation = conn.execute(
+                "SELECT generation_id, task_id, state "
+                "FROM task_fence_model_generations"
+            ).fetchone()
+        physical.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                tuple(generation),
+                counts(),
+            )
+        )
+        return SimpleNamespace(
+            id="chatcmpl-goal-judge-campaign",
+            model="campaign-goal-judge-model",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"verdict":"continue","reason":'
+                            f'"{judge_reason}"}}'
+                        )
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        ),
+    )
+
+    try:
+        goals.GoalManager(session_id).set(goal, max_turns=2)
+        baseline_counts = counts()
+        with (
+            patch.object(
+                auxiliary_client,
+                "_get_cached_client",
+                return_value=(client, "campaign-goal-judge-model"),
+            ) as get_client,
+            patch(
+                "task_fence.TaskFencePolicy",
+                side_effect=TaskFencePolicy,
+            ) as policy_factory,
+        ):
+            await runner._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=source,
+                final_response=final_response,
+                task_fence_parent_generation=parent_generation,
+            )
+
+        assert baseline_counts == (1, 0, 0, 0)
+        get_client.assert_called_once()
+        assert get_client.call_args.kwargs.get("async_mode", False) is False
+        policy_factory.assert_not_called()
+
+        assert len(physical) == 1
+        (
+            model_kwargs,
+            envelope,
+            policy,
+            generation,
+            physical_counts,
+        ) = physical[0]
+        assert envelope is None
+        assert policy is None
+        assert generation == (
+            parent_generation.generation_id,
+            acceptance.task_id,
+            "committed",
+        )
+        assert physical_counts == baseline_counts
+        assert not any(key.startswith("_task_fence_") for key in model_kwargs)
+        judge_prompt = str(model_kwargs["messages"])
+        assert goal in judge_prompt
+        assert final_response in judge_prompt
+
+        goal_state = goals.load_goal(session_id)
+        assert goal_state is not None
+        assert goal_state.last_verdict == "continue"
+        assert goal_state.last_reason == judge_reason
+        assert goal_state.consecutive_parse_failures == 0
+        assert goal_state.consecutive_transport_failures == 0
+
+        assert len(notices) == 1
+        assert notices[0][0] == source.chat_id
+        assert judge_reason in notices[0][1]
+        continuation = adapter._pending_messages[conversation_id]
+        assert goal in continuation.text
+        continuation_acceptance = continuation.task_fence_acceptance
+        assert continuation_acceptance is not None
+        assert continuation_acceptance.task_id == acceptance.task_id
+        assert continuation_acceptance.event_id != acceptance.event_id
+        recorded = conn.execute(
+            "SELECT source, causal_parent_generation_id "
+            "FROM task_fence_ingress WHERE event_id = ?",
+            (continuation_acceptance.event_id,),
+        ).fetchone()
+        assert tuple(recorded) == (
+            "runtime:goal_continuation",
+            parent_generation.generation_id,
+        )
+        assert counts() == baseline_counts
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        goal_db = goals._DB_CACHE.pop(str(home), None)
+        if goal_db is not None:
+            goal_db.close()
         db.close()
 
 
