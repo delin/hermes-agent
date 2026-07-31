@@ -2917,6 +2917,322 @@ def test_campaign_excludes_sync_xai_tts_tags_at_real_tool_handoff(
         db.close()
 
 
+def test_campaign_masks_tool_policy_at_native_anthropic_aux_stream(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from agent import auxiliary_client
+    from agent.auxiliary_client import AnthropicAuxiliaryClient
+    import model_tools
+    from task_fence import bind_task_fence_policy
+    import tools.tts_tool  # noqa: F401 - import registers the real handler
+
+    session_id = "campaign-conversation"
+    resource_task_id = "campaign-anthropic-tts-task"
+    spoken_text = "Read this through the native Anthropic tag adapter."
+    tagged_text = (
+        "[soft]Read this through the native Anthropic tag adapter.[/soft]"
+    )
+    audio_bytes = b"bounded-anthropic-xai-audio"
+    output_path = tmp_path / "bounded-anthropic-xai.mp3"
+    auxiliary_model = "claude-campaign-tags"
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_KEY", session_id)
+    monkeypatch.setenv("XAI_API_KEY", "campaign-xai-key")
+    (tmp_path / "config.yaml").write_text(
+        "tts:\n"
+        "  provider: xai\n"
+        "  xai:\n"
+        "    auto_speech_tags: true\n"
+        "auxiliary:\n"
+        "  tts_audio_tags:\n"
+        "    provider: anthropic\n"
+        f"    model: {auxiliary_model}\n",
+        encoding="utf-8",
+    )
+
+    db, generation = _live_model_lane(
+        tmp_path / "state.db"
+    )
+    conn = db._conn
+    assert conn is not None
+    assert db.finish_task_fence_generation(
+        generation,
+        state="committed",
+    )
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    policy = TaskFencePolicy(db)
+    stream_factories = []
+    stream_entries = []
+    stream_finals = []
+    xai_posts = []
+
+    def snapshot():
+        with db._lock:
+            counts = tuple(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+            generation_row = tuple(
+                conn.execute(
+                    "SELECT task_id, generation_id, state "
+                    "FROM task_fence_model_generations"
+                ).fetchone()
+            )
+            decisions = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT decision_point, outcome, reason_code, "
+                    "operation_kind, adapter, operation_invocation_id "
+                    "FROM task_fence_policy_decisions "
+                    "ORDER BY decision_order"
+                )
+            ]
+            attempts = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT d.operation_kind, d.adapter, a.state "
+                    "FROM task_fence_policy_decisions AS d "
+                    "JOIN task_fence_attempts AS a "
+                    "ON a.attempt_id = d.attempt_id "
+                    "WHERE d.decision_point = 'authorization'"
+                )
+            ]
+        return counts, generation_row, decisions, attempts
+
+    final_message = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=tagged_text)],
+        stop_reason="end_turn",
+        usage=None,
+    )
+
+    class NativeStream:
+        def __init__(self, kwargs):
+            self._kwargs = dict(kwargs)
+
+        def __enter__(self):
+            stream_entries.append(
+                (
+                    dict(self._kwargs),
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    snapshot(),
+                )
+            )
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_final_message(self):
+            stream_finals.append(
+                (
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    snapshot(),
+                )
+            )
+            return final_message
+
+    messages_create = MagicMock(
+        side_effect=AssertionError(
+            "native Anthropic success leaf must not fall back"
+        )
+    )
+
+    class Messages:
+        def stream(self, **kwargs):
+            stream_factories.append(
+                (
+                    dict(kwargs),
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    snapshot(),
+                )
+            )
+            return NativeStream(kwargs)
+
+        create = messages_create
+
+    native_client = AnthropicAuxiliaryClient(
+        SimpleNamespace(messages=Messages(), close=lambda: None),
+        auxiliary_model,
+        "campaign-anthropic-key",
+        "https://api.anthropic.com",
+    )
+
+    class XaiResponse:
+        content = audio_bytes
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    def xai_post(url, headers, json, timeout):
+        xai_posts.append(
+            (
+                url,
+                dict(json),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                snapshot(),
+            )
+        )
+        return XaiResponse()
+
+    get_client = MagicMock(
+        return_value=(native_client, auxiliary_model)
+    )
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_client)
+    monkeypatch.setattr("requests.post", xai_post)
+
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+        ):
+            raw_result = model_tools.handle_function_call(
+                "text_to_speech",
+                {
+                    "text": spoken_text,
+                    "output_path": str(output_path),
+                },
+                task_id=resource_task_id,
+                session_id=session_id,
+                user_task="exercise the native Anthropic auxiliary membrane",
+            )
+
+        get_client.assert_called_once()
+        assert get_client.call_args.args[:2] == (
+            "anthropic",
+            auxiliary_model,
+        )
+        messages_create.assert_not_called()
+        assert len(stream_factories) == 1
+        assert len(stream_entries) == 1
+        assert len(stream_finals) == 1
+
+        (
+            stream_kwargs,
+            stream_envelope,
+            stream_policy,
+            stream_snapshot,
+        ) = stream_factories[0]
+        (
+            entered_kwargs,
+            entered_envelope,
+            entered_policy,
+            entered_snapshot,
+        ) = stream_entries[0]
+        assert entered_kwargs == stream_kwargs
+        assert entered_envelope is stream_envelope
+        assert stream_envelope is not None
+        assert stream_envelope.task_id == generation.task_id
+        assert stream_envelope.generation_id == generation.generation_id
+        assert stream_envelope.invocation_id is not None
+        assert stream_envelope.parent_invocation_id is not None
+        assert (
+            stream_envelope.parent_invocation_id
+            != stream_envelope.invocation_id
+        )
+        assert stream_policy is None
+        assert entered_policy is None
+        assert entered_snapshot == stream_snapshot
+        assert stream_finals[0] == (
+            stream_envelope,
+            None,
+            stream_snapshot,
+        )
+        assert stream_kwargs["model"] == auxiliary_model
+        assert not any(
+            key.startswith("_task_fence_") for key in stream_kwargs
+        )
+        assert "TRANSCRIPT TO TAG" in str(stream_kwargs["messages"])
+        assert spoken_text in str(stream_kwargs["messages"])
+
+        (
+            edge_counts,
+            edge_generation,
+            edge_decisions,
+            edge_attempts,
+        ) = stream_snapshot
+        assert edge_counts == (1, 1, 2, 1, 1)
+        assert edge_generation == (
+            generation.task_id,
+            generation.generation_id,
+            "committed",
+        )
+        assert [row[:5] for row in edge_decisions] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:text_to_speech",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:text_to_speech",
+            ),
+        ]
+        assert [row[5] for row in edge_decisions] == [
+            stream_envelope.invocation_id,
+            stream_envelope.invocation_id,
+        ]
+        assert edge_attempts == [
+            (
+                OperationKind.TOOL.value,
+                "registry:text_to_speech",
+                "STARTED",
+            )
+        ]
+
+        assert len(xai_posts) == 1
+        (
+            post_url,
+            post_payload,
+            post_envelope,
+            post_policy,
+            post_snapshot,
+        ) = xai_posts[0]
+        assert post_url == "https://api.x.ai/v1/tts"
+        assert post_payload["text"] == tagged_text
+        assert post_envelope is stream_envelope
+        assert post_policy is policy
+        assert post_snapshot == stream_snapshot
+        assert output_path.read_bytes() == audio_bytes
+
+        result = json.loads(raw_result)
+        assert result["success"] is True
+        assert result["provider"] == "xai"
+        assert result["file_path"] == str(output_path)
+        assert snapshot() == stream_snapshot
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        native_client.close()
+        db.close()
+
+
 def test_campaign_probe_records_real_openai_handoff_before_sdk_entry(tmp_path):
     db, generation = _live_model_lane(tmp_path / "state.db")
     probe = _campaign_probe(TaskFencePolicy(db))
