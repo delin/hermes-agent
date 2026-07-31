@@ -2472,6 +2472,451 @@ def test_campaign_excludes_sync_smart_approval_at_real_terminal_handoff(
         db.close()
 
 
+def test_campaign_excludes_sync_xai_tts_tags_at_real_tool_handoff(
+    campaign_summary_agent,
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from agent import auxiliary_client
+    import task_fence as task_fence_module
+    import tools.tts_tool as tts_module
+
+    session_id = "campaign-conversation"
+    resource_task_id = "campaign-xai-tts-task"
+    spoken_text = (
+        "Welcome to the bounded TTS campaign. "
+        "This is the exact auxiliary leaf."
+    )
+    tagged_text = (
+        "[soft]Welcome to the bounded TTS campaign.[/soft] "
+        "[laugh] This is the exact auxiliary leaf."
+    )
+    audio_bytes = b"bounded-xai-audio"
+    output_path = tmp_path / "bounded-xai.mp3"
+    main_text = "xAI TTS campaign completed"
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_KEY", session_id)
+    monkeypatch.setenv("XAI_API_KEY", "campaign-xai-key")
+    (tmp_path / "config.yaml").write_text(
+        "tts:\n"
+        "  provider: xai\n"
+        "  xai:\n"
+        "    auto_speech_tags: true\n",
+        encoding="utf-8",
+    )
+
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    conn = db._conn
+    assert conn is not None
+    db.create_session(
+        session_id,
+        source="gateway",
+        system_prompt="You are helpful.",
+    )
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    policy_constructions = []
+    main_physical = []
+    auxiliary_physical = []
+    xai_posts = []
+
+    def counts():
+        with db._lock:
+            return tuple(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+
+    def edge_snapshot():
+        with db._lock:
+            edge_counts = tuple(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+            audit_rows = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT decision_point, outcome, reason_code, "
+                    "operation_kind, adapter, "
+                    "operation_invocation_id "
+                    "FROM task_fence_policy_decisions "
+                    "ORDER BY decision_order"
+                )
+            ]
+            generation = tuple(
+                conn.execute(
+                    "SELECT task_id, state "
+                    "FROM task_fence_model_generations"
+                ).fetchone()
+            )
+            attempts = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT d.operation_kind, d.adapter, a.state "
+                    "FROM task_fence_policy_decisions AS d "
+                    "JOIN task_fence_attempts AS a "
+                    "ON a.attempt_id = d.attempt_id "
+                    "WHERE d.decision_point = 'authorization' "
+                    "ORDER BY d.decision_order"
+                )
+            ]
+        return edge_counts, audit_rows, generation, attempts
+
+    def response(content, tool_calls=None):
+        return SimpleNamespace(
+            id="chatcmpl-xai-tts",
+            model="campaign-main-model",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=content,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                    ),
+                    finish_reason=(
+                        "tool_calls" if tool_calls else "stop"
+                    ),
+                )
+            ],
+        )
+
+    main_responses = iter(
+        (
+            response(
+                None,
+                tool_calls=[
+                    SimpleNamespace(
+                        id="call-campaign-xai-tts",
+                        type="function",
+                        function=SimpleNamespace(
+                            name="text_to_speech",
+                            arguments=json.dumps(
+                                {
+                                    "text": spoken_text,
+                                    "output_path": str(output_path),
+                                }
+                            ),
+                        ),
+                    )
+                ],
+            ),
+            response(main_text),
+        )
+    )
+
+    def main_create(**kwargs):
+        main_physical.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                counts(),
+                len(policy_constructions),
+            )
+        )
+        return next(main_responses)
+
+    def auxiliary_create(**kwargs):
+        auxiliary_physical.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                edge_snapshot(),
+                len(policy_constructions),
+            )
+        )
+        return SimpleNamespace(
+            id="chatcmpl-xai-tts-auxiliary",
+            model="campaign-tts-tags-model",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=tagged_text),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    auxiliary_client_instance = _openai_client(auxiliary_create)
+    auxiliary_client_instance.base_url = "https://openrouter.ai/api/v1"
+
+    class XaiResponse:
+        content = audio_bytes
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    def xai_post(url, headers, json, timeout):
+        xai_posts.append(
+            (
+                url,
+                dict(json),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                edge_snapshot(),
+            )
+        )
+        return XaiResponse()
+
+    class TrackedTaskFencePolicy(TaskFencePolicy):
+        def __init__(self, store):
+            assert store is db
+            super().__init__(store)
+            policy_constructions.append(self)
+
+    agent = campaign_summary_agent
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = session_id
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.model = "campaign-main-model"
+    agent.client.base_url = agent.base_url
+    agent.client.api_key = "campaign-main-key"
+    agent.client.chat.completions.create.side_effect = main_create
+    agent._disable_streaming = True
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    agent.max_iterations = 2
+    agent.tools = [
+        {
+            "type": "function",
+            "function": tts_module.TTS_SCHEMA,
+        }
+    ]
+    agent.valid_tool_names = {"text_to_speech"}
+
+    get_client = MagicMock(
+        return_value=(
+            auxiliary_client_instance,
+            "campaign-tts-tags-model",
+        )
+    )
+    monkeypatch.setattr(
+        task_fence_module,
+        "TaskFencePolicy",
+        TrackedTaskFencePolicy,
+    )
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_client)
+    monkeypatch.setattr("requests.post", xai_post)
+    for name in (
+        "_persist_session",
+        "_save_trajectory",
+        "_cleanup_task_resources",
+    ):
+        monkeypatch.setattr(agent, name, MagicMock())
+
+    try:
+        result = agent.run_conversation(
+            "exercise the bounded xAI TTS tag path",
+            task_id=resource_task_id,
+            task_fence_acceptance=acceptance,
+        )
+
+        get_client.assert_called_once()
+        assert len(auxiliary_physical) == 1
+        (
+            auxiliary_kwargs,
+            auxiliary_envelope,
+            auxiliary_policy,
+            auxiliary_snapshot,
+            auxiliary_policy_count,
+        ) = auxiliary_physical[0]
+        assert auxiliary_envelope is not None
+        assert auxiliary_envelope.task_id == acceptance.task_id
+        assert (
+            auxiliary_envelope.generation_id
+            == main_physical[0][1].generation_id
+        )
+        assert auxiliary_envelope.invocation_id is not None
+        assert auxiliary_envelope.parent_invocation_id is not None
+        assert auxiliary_policy is policy_constructions[1]
+        (
+            auxiliary_counts,
+            auxiliary_rows,
+            auxiliary_generation,
+            auxiliary_attempts,
+        ) = auxiliary_snapshot
+        assert auxiliary_counts == (1, 1, 4, 2, 2)
+        assert auxiliary_generation == (acceptance.task_id, "committed")
+        assert auxiliary_attempts == [
+            (OperationKind.MODEL.value, _OPENAI_ROUTE, "SUCCEEDED"),
+            (
+                OperationKind.TOOL.value,
+                "registry:text_to_speech",
+                "STARTED",
+            ),
+        ]
+        assert [row[:5] for row in auxiliary_rows] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.MODEL.value,
+                _OPENAI_ROUTE,
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.MODEL.value,
+                _OPENAI_ROUTE,
+            ),
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:text_to_speech",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:text_to_speech",
+            ),
+        ]
+        assert [row[5] for row in auxiliary_rows] == [
+            main_physical[0][1].invocation_id,
+            main_physical[0][1].invocation_id,
+            auxiliary_envelope.invocation_id,
+            auxiliary_envelope.invocation_id,
+        ]
+        assert auxiliary_policy_count == 2
+        assert auxiliary_kwargs["model"] == "campaign-tts-tags-model"
+        assert not auxiliary_kwargs.get("stream", False)
+        assert not any(
+            key.startswith("_task_fence_")
+            for key in auxiliary_kwargs
+        )
+        auxiliary_prompt = auxiliary_kwargs["messages"][1]["content"]
+        assert "TRANSCRIPT TO TAG" in auxiliary_prompt
+        assert "Welcome to the bounded TTS campaign." in auxiliary_prompt
+        assert "[pause]" in auxiliary_prompt
+
+        assert len(xai_posts) == 1
+        (
+            post_url,
+            post_payload,
+            post_envelope,
+            post_policy,
+            post_snapshot,
+        ) = xai_posts[0]
+        assert post_url == "https://api.x.ai/v1/tts"
+        assert post_payload["text"] == tagged_text
+        assert post_envelope is auxiliary_envelope
+        assert post_policy is auxiliary_policy
+        assert post_snapshot == auxiliary_snapshot
+        assert output_path.read_bytes() == audio_bytes
+
+        assert len(main_physical) == 2
+        first_main = main_physical[0]
+        second_main = main_physical[1]
+        assert first_main[2] is None
+        assert first_main[3] == (1, 1, 2, 1, 1)
+        assert first_main[4] == 1
+        assert second_main[2] is None
+        assert second_main[3] == (1, 2, 6, 3, 3)
+        assert second_main[4] == 3
+
+        second_main_tool_messages = [
+            message
+            for message in second_main[0]["messages"]
+            if message.get("role") == "tool"
+            and message.get("name") == "text_to_speech"
+        ]
+        assert len(second_main_tool_messages) == 1
+        second_main_tool_result = json.loads(
+            second_main_tool_messages[0]["content"]
+        )
+
+        tool_messages = [
+            message
+            for message in result["messages"]
+            if message.get("role") == "tool"
+            and message.get("name") == "text_to_speech"
+        ]
+        assert len(tool_messages) == 1
+        tool_result = json.loads(tool_messages[0]["content"])
+        assert tool_result == second_main_tool_result
+        assert tool_result["success"] is True
+        assert tool_result["provider"] == "xai"
+        assert tool_result["file_path"] == str(output_path)
+
+        assert result["completed"] is True
+        assert result["final_response"] == main_text
+        assert len(policy_constructions) == 3
+        assert counts() == (1, 2, 6, 3, 3)
+        with db._lock:
+            generations = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT task_id, state "
+                    "FROM task_fence_model_generations "
+                    "ORDER BY opened_at, generation_id"
+                )
+            ]
+            attempts = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT d.operation_kind, d.adapter, a.state "
+                    "FROM task_fence_policy_decisions AS d "
+                    "JOIN task_fence_attempts AS a "
+                    "ON a.attempt_id = d.attempt_id "
+                    "WHERE d.decision_point = 'authorization' "
+                    "ORDER BY d.decision_order"
+                )
+            ]
+        assert generations == [
+            (acceptance.task_id, "committed"),
+            (acceptance.task_id, "committed"),
+        ]
+        assert attempts == [
+            (OperationKind.MODEL.value, _OPENAI_ROUTE, "SUCCEEDED"),
+            (
+                OperationKind.TOOL.value,
+                "registry:text_to_speech",
+                "STARTED",
+            ),
+            (OperationKind.MODEL.value, _OPENAI_ROUTE, "SUCCEEDED"),
+        ]
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
 def test_campaign_probe_records_real_openai_handoff_before_sdk_entry(tmp_path):
     db, generation = _live_model_lane(tmp_path / "state.db")
     probe = _campaign_probe(TaskFencePolicy(db))
