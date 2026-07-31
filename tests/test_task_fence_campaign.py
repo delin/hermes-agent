@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError, asdict, dataclass
 import hashlib
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -28,6 +29,10 @@ from task_fence import (
 
 
 _MAX_CAMPAIGN_DECISION_RECORDS = 64
+_ANTHROPIC_CREATE_ROUTE = "provider:anthropic.messages.create"
+_ANTHROPIC_STREAM_ROUTE = "provider:anthropic.messages.stream"
+_CODEX_ROUTE = "provider:openai.responses.create"
+_GEMINI_ROUTE = "provider:gemini.generateContent"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
 
 
@@ -158,6 +163,20 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _live_summary_lane(path):
+    db = SessionDB(path)
+    acceptance = db.accept_task_fence_ingress(
+        IngressEnvelope(
+            source="gateway:test:campaign",
+            source_event_id="campaign-summary",
+            conversation_id="campaign-conversation",
+            action=TASK_FENCE_ACTIONS["initial_submit"],
+            payload_hash=_hash("campaign-summary"),
+        )
+    )
+    return db, acceptance
+
+
 def _live_model_lane(path):
     db = SessionDB(path)
     acceptance = db.accept_task_fence_ingress(
@@ -190,11 +209,438 @@ def _openai_client(create):
     )
 
 
-def _campaign_probe(policy: TaskFencePolicy) -> _CampaignPolicyProbe:
+@pytest.fixture
+def campaign_summary_agent():
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="campaign-test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.max_iterations = 1
+    return agent
+
+
+def _campaign_probe(
+    policy: TaskFencePolicy,
+    *,
+    route_id: str = _OPENAI_ROUTE,
+) -> _CampaignPolicyProbe:
     return _CampaignPolicyProbe(
         policy,
-        route_id=_OPENAI_ROUTE,
+        route_id=route_id,
     )
+
+
+def _campaign_probe_factory(
+    *,
+    route_id: str,
+    store: SessionDB,
+    probes: list[_CampaignPolicyProbe],
+):
+    def factory(candidate_store):
+        assert candidate_store is store
+        probe = _campaign_probe(
+            TaskFencePolicy(candidate_store),
+            route_id=route_id,
+        )
+        probes.append(probe)
+        return probe
+
+    return factory
+
+
+def _assert_summary_physical_entry(
+    *,
+    db: SessionDB,
+    probes: list[_CampaignPolicyProbe],
+    route_id: str,
+) -> CausalEnvelope:
+    assert len(probes) == 1
+    records = probes[0].records
+    assert [record.route_id for record in records] == [route_id, route_id]
+    assert [record.decision_point for record in records] == [
+        "admission",
+        "authorization",
+    ]
+    assert [record.outcome for record in records] == [
+        DecisionOutcome.WOULD_RESERVE.value,
+        DecisionOutcome.WOULD_ALLOW.value,
+    ]
+    assert {record.reason_code for record in records} == {
+        DecisionReason.CURRENT_AUTHORITY.value
+    }
+    assert all(record.decision_id is not None for record in records)
+    envelope = current_causal_envelope()
+    assert envelope is not None
+    assert {record.invocation_id for record in records} == {
+        envelope.invocation_id
+    }
+    assert {record.task_id for record in records} == {envelope.task_id}
+    assert {record.generation_id for record in records} == {
+        envelope.generation_id
+    }
+    attempt = db._conn.execute(
+        "SELECT a.state FROM task_fence_attempts AS a "
+        "JOIN task_fence_dispatch_permits AS p ON p.permit_id = a.permit_id "
+        "WHERE p.invocation_envelope_id = ?",
+        (envelope.invocation_id,),
+    ).fetchone()
+    assert attempt["state"] == "STARTED"
+    assert current_task_fence_policy() is None
+    return envelope
+
+
+def _run_campaign_summary(
+    *,
+    agent,
+    acceptance,
+    db: SessionDB,
+    route_id: str,
+    probes: list[_CampaignPolicyProbe],
+):
+    agent._session_db = db
+    generations = []
+    with patch(
+        "task_fence.TaskFencePolicy",
+        new=_campaign_probe_factory(
+            route_id=route_id,
+            store=db,
+            probes=probes,
+        ),
+    ):
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "summarize campaign work"}],
+            1,
+            _task_fence_acceptance=acceptance,
+            _task_fence_generation_out=generations,
+        )
+    assert current_causal_envelope() is None
+    assert current_task_fence_policy() is None
+    return result, generations
+
+
+def test_campaign_probe_records_gemini_iteration_summary_at_http_entry(
+    campaign_summary_agent,
+    tmp_path,
+):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    probes = []
+    physical = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "gemini campaign summary"}]
+                        },
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 2,
+                },
+            }
+
+    class HTTP:
+        def post(self, url, *, json, headers, timeout):
+            envelope = _assert_summary_physical_entry(
+                db=db,
+                probes=probes,
+                route_id=_GEMINI_ROUTE,
+            )
+            physical.append((url, json, headers, timeout, envelope))
+            return Response()
+
+        def close(self):
+            return None
+
+    endpoint = "https://generativelanguage.googleapis.com/v1beta"
+    client = GeminiNativeClient(
+        api_key="campaign-gemini-key",
+        base_url=endpoint,
+        http_client=HTTP(),
+    )
+    agent = campaign_summary_agent
+    agent.api_mode = "chat_completions"
+    agent.provider = "gemini"
+    agent.model = "gemini-2.5-flash"
+    agent.base_url = endpoint
+    agent._base_url_lower = endpoint.lower()
+    agent._base_url_hostname = "generativelanguage.googleapis.com"
+    try:
+        with patch.object(
+            agent,
+            "_ensure_primary_openai_client",
+            return_value=client,
+        ) as ensure_client:
+            result, generations = _run_campaign_summary(
+                agent=agent,
+                acceptance=acceptance,
+                db=db,
+                route_id=_GEMINI_ROUTE,
+                probes=probes,
+            )
+
+        assert result == "gemini campaign summary"
+        ensure_client.assert_called_once_with(reason="iteration_limit_summary")
+        assert len(physical) == 1
+        assert physical[0][0].endswith(
+            "/models/gemini-2.5-flash:generateContent"
+        )
+        assert len(generations) == 1
+        assert (
+            generations[0].generation_id
+            == physical[0][4].generation_id
+        )
+        assert len(probes) == 1
+        probes[0].assert_complete()
+    finally:
+        client.close()
+        db.close()
+
+
+def test_campaign_probe_records_anthropic_iteration_summary_at_stream_open(
+    campaign_summary_agent,
+    tmp_path,
+):
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    probes = []
+    physical = []
+    calls = []
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text="anthropic stream campaign summary",
+            )
+        ],
+        stop_reason="end_turn",
+        usage=None,
+    )
+
+    class Stream:
+        response = SimpleNamespace(headers={})
+
+        def __enter__(self):
+            physical.append(
+                _assert_summary_physical_entry(
+                    db=db,
+                    probes=probes,
+                    route_id=_ANTHROPIC_STREAM_ROUTE,
+                )
+            )
+            return self
+
+        def __iter__(self):
+            return iter(())
+
+        def get_final_message(self):
+            return response
+
+        def __exit__(self, *_args):
+            return False
+
+    class Messages:
+        def stream(self, **kwargs):
+            assert "_task_fence_model_policy" not in kwargs
+            calls.append(("stream", dict(kwargs)))
+            return Stream()
+
+        def create(self, **_kwargs):
+            pytest.fail("stream summary must not use messages.create")
+
+    agent = campaign_summary_agent
+    agent.api_mode = "anthropic_messages"
+    agent.provider = "anthropic"
+    agent.model = "claude-test"
+    agent.base_url = "https://api.anthropic.com"
+    agent._base_url_lower = agent.base_url.lower()
+    agent._base_url_hostname = "api.anthropic.com"
+    agent._anthropic_base_url = agent.base_url
+    agent._anthropic_api_key = "campaign-anthropic-key"
+    agent._anthropic_client = SimpleNamespace(messages=Messages())
+    agent._is_anthropic_oauth = False
+    agent._disable_streaming = False
+    try:
+        result, generations = _run_campaign_summary(
+            agent=agent,
+            acceptance=acceptance,
+            db=db,
+            route_id=_ANTHROPIC_STREAM_ROUTE,
+            probes=probes,
+        )
+
+        assert result == "anthropic stream campaign summary"
+        assert [call[0] for call in calls] == ["stream"]
+        assert len(physical) == 1
+        assert len(generations) == 1
+        assert generations[0].generation_id == physical[0].generation_id
+        assert len(probes) == 1
+        probes[0].assert_complete()
+    finally:
+        db.close()
+
+
+def test_campaign_probe_records_anthropic_iteration_summary_at_messages_create(
+    campaign_summary_agent,
+    tmp_path,
+):
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    probes = []
+    physical = []
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text="anthropic create campaign summary",
+            )
+        ],
+        stop_reason="end_turn",
+        usage=None,
+    )
+
+    class Messages:
+        def stream(self, **_kwargs):
+            pytest.fail("non-stream summary must not use messages.stream")
+
+        def create(self, **kwargs):
+            assert "_task_fence_model_policy" not in kwargs
+            envelope = _assert_summary_physical_entry(
+                db=db,
+                probes=probes,
+                route_id=_ANTHROPIC_CREATE_ROUTE,
+            )
+            physical.append((dict(kwargs), envelope))
+            return response
+
+    agent = campaign_summary_agent
+    agent.api_mode = "anthropic_messages"
+    agent.provider = "anthropic"
+    agent.model = "claude-test"
+    agent.base_url = "https://api.anthropic.com"
+    agent._base_url_lower = agent.base_url.lower()
+    agent._base_url_hostname = "api.anthropic.com"
+    agent._anthropic_base_url = agent.base_url
+    agent._anthropic_api_key = "campaign-anthropic-key"
+    agent._anthropic_client = SimpleNamespace(messages=Messages())
+    agent._is_anthropic_oauth = False
+    agent._disable_streaming = True
+    try:
+        result, generations = _run_campaign_summary(
+            agent=agent,
+            acceptance=acceptance,
+            db=db,
+            route_id=_ANTHROPIC_CREATE_ROUTE,
+            probes=probes,
+        )
+
+        assert result == "anthropic create campaign summary"
+        assert len(physical) == 1
+        assert len(generations) == 1
+        assert generations[0].generation_id == physical[0][1].generation_id
+        assert len(probes) == 1
+        probes[0].assert_complete()
+    finally:
+        db.close()
+
+
+def test_campaign_probe_records_codex_iteration_summary_at_responses_create(
+    campaign_summary_agent,
+    tmp_path,
+):
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    probes = []
+    physical = []
+    lifecycle = []
+    events = [
+        SimpleNamespace(
+            type="response.output_text.delta",
+            delta="codex campaign summary",
+        ),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                status="completed",
+                usage=None,
+                id="resp-campaign-summary",
+            ),
+        ),
+    ]
+
+    class EventStream:
+        def __iter__(self):
+            lifecycle.append("iterate")
+            return iter(events)
+
+        def close(self):
+            lifecycle.append("close")
+
+    class Responses:
+        def create(self, **kwargs):
+            assert kwargs["stream"] is True
+            assert "tools" not in kwargs
+            envelope = _assert_summary_physical_entry(
+                db=db,
+                probes=probes,
+                route_id=_CODEX_ROUTE,
+            )
+            physical.append((dict(kwargs), envelope))
+            return EventStream()
+
+    agent = campaign_summary_agent
+    agent.api_mode = "codex_responses"
+    agent.provider = "openai-codex"
+    agent.model = "gpt-test-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent._base_url_lower = agent.base_url.lower()
+    agent._base_url_hostname = "chatgpt.com"
+    agent._disable_streaming = False
+    client = SimpleNamespace(responses=Responses())
+    try:
+        with patch.object(
+            agent,
+            "_ensure_primary_openai_client",
+            return_value=client,
+        ) as ensure_client:
+            result, generations = _run_campaign_summary(
+                agent=agent,
+                acceptance=acceptance,
+                db=db,
+                route_id=_CODEX_ROUTE,
+                probes=probes,
+            )
+
+        assert result == "codex campaign summary"
+        ensure_client.assert_called_once_with(reason="codex_stream_direct")
+        assert len(physical) == 1
+        assert lifecycle == ["iterate", "close"]
+        assert len(generations) == 1
+        assert generations[0].generation_id == physical[0][1].generation_id
+        assert len(probes) == 1
+        probes[0].assert_complete()
+    finally:
+        db.close()
 
 
 def test_campaign_probe_records_real_openai_handoff_before_sdk_entry(tmp_path):
