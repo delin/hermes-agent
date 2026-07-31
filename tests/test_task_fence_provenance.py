@@ -308,6 +308,12 @@ def test_generation_reservation_is_durable_and_exact(tmp_path):
             generation.snapshot_event_id,
             "started",
         )
+        started = db.inspect_task_fence_conversation("conversation-1")
+        assert started.compatible is True
+        assert started.current_generation is not None
+        assert started.current_generation.generation_id == generation.generation_id
+        assert started.current_generation.state == "started"
+        assert started.current_generation.reserved_permit_ids == ()
         assert db.finish_task_fence_generation(
             generation,
             state="committed",
@@ -318,6 +324,14 @@ def test_generation_reservation_is_durable_and_exact(tmp_path):
             (generation.generation_id,),
         ).fetchone()
         assert tuple(committed) == ("committed", None)
+        committed_projection = db.inspect_task_fence_conversation("conversation-1")
+        assert committed_projection.compatible is True
+        assert committed_projection.current_generation is not None
+        assert (
+            committed_projection.current_generation.generation_id
+            == generation.generation_id
+        )
+        assert committed_projection.current_generation.state == "committed"
         assert db._conn.execute(
             "SELECT state FROM task_fence_task_inputs WHERE task_id = ?",
             (generation.task_id,),
@@ -330,6 +344,15 @@ def test_generation_reservation_is_durable_and_exact(tmp_path):
         task = reopened.inspect_task_fence_task(generation.task_id)
         assert task.task is not None
         assert task.task.current_generation_id == generation.generation_id
+        reopened_projection = reopened.inspect_task_fence_conversation(
+            "conversation-1"
+        )
+        assert reopened_projection.compatible is True
+        assert reopened_projection.current_generation is not None
+        assert (
+            reopened_projection.current_generation.generation_id
+            == generation.generation_id
+        )
         state = reopened._conn.execute(
             "SELECT state, closed_at FROM task_fence_model_generations "
             "WHERE generation_id = ?",
@@ -342,6 +365,11 @@ def test_generation_reservation_is_durable_and_exact(tmp_path):
         )
         assert held.task_projection is not None
         assert held.task_projection.current_generation_id is None
+        held_projection = reopened.inspect_task_fence_conversation(
+            "conversation-1"
+        )
+        assert held_projection.compatible is True
+        assert held_projection.current_generation is None
         closed = reopened._conn.execute(
             "SELECT state, closed_at FROM task_fence_model_generations "
             "WHERE generation_id = ?",

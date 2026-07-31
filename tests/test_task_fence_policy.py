@@ -234,6 +234,10 @@ def test_real_policy_lane_conversation_inspection_is_read_only(tmp_path):
     assert inspection.active_run is not None
     assert inspection.active_run.run_id == acceptance.opened_run_id
     assert inspection.active_run.authority_event_id == acceptance.event_id
+    assert inspection.current_generation is not None
+    assert inspection.current_generation.generation_id == envelope.generation_id
+    assert inspection.current_generation.state == "committed"
+    assert inspection.current_generation.reserved_permit_ids == ()
     assert inspection.pending_input_ids == ()
     assert inspection.pending_inputs_truncated is False
     assert len(inspection.started_attempts) == 1
@@ -255,6 +259,7 @@ def test_real_policy_lane_conversation_inspection_is_read_only(tmp_path):
     assert unknown.task is None
     assert unknown.cohort is None
     assert unknown.active_run is None
+    assert unknown.current_generation is None
     assert unknown.pending_input_ids == ()
     assert unknown.pending_inputs_truncated is False
     assert unknown.started_attempts == ()
@@ -408,6 +413,15 @@ def test_admission_reserves_without_consuming_then_authorization_starts(tmp_path
         assert "post-default-operation" not in "|".join(
             "" if value is None else str(value) for value in permit
         )
+        reserved = db.inspect_task_fence_conversation("policy-conversation")
+        assert reserved.compatible is True
+        assert reserved.current_generation is not None
+        assert reserved.current_generation.generation_id == envelope.generation_id
+        assert reserved.current_generation.state == "committed"
+        assert reserved.current_generation.reserved_permit_ids == (
+            admitted.permit_id,
+        )
+        assert reserved.started_attempts == ()
 
         started = policy.authorize_and_start(
             envelope,
@@ -445,8 +459,245 @@ def test_admission_reserves_without_consuming_then_authorization_starts(tmp_path
                 (started.attempt_id,),
             ).fetchone()
         ) == (None, "STARTED", "would_allow")
+        consumed = db.inspect_task_fence_conversation("policy-conversation")
+        assert consumed.compatible is True
+        assert consumed.current_generation is not None
+        assert consumed.current_generation.reserved_permit_ids == ()
+        assert tuple(
+            attempt.attempt_id for attempt in consumed.started_attempts
+        ) == (started.attempt_id,)
     finally:
         db.close()
+
+
+def test_current_generation_reserved_permits_are_exact_bounded_and_indexed(
+    tmp_path,
+):
+    db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    permit_ids = []
+    limit = hermes_state._TASK_FENCE_MAX_CURRENT_GENERATION_RESERVED_PERMITS
+    try:
+        for index in range(limit):
+            invocation_id = f"tfiv-current-generation-permit-{index:02d}"
+            invocation = envelope.for_invocation(invocation_id)
+            candidate = replace(
+                operation,
+                invocation_id=invocation_id,
+                invocation_fingerprint=_hash(invocation_id),
+            )
+            admitted = policy.admit_operation(invocation, candidate)
+            permit_ids.append(admitted.permit_id)
+
+        complete = db.inspect_task_fence_conversation("policy-conversation")
+        explain_query = (
+            "EXPLAIN QUERY PLAN "
+            + hermes_state._TASK_FENCE_CURRENT_GENERATION_RESERVED_PERMITS_SQL
+        )
+        query_plan = tuple(
+            row[-1]
+            for row in db._conn.execute(
+                explain_query,
+                (envelope.generation_id, limit + 1),
+            )
+        )
+
+        overflow_invocation_id = "tfiv-current-generation-permit-overflow"
+        overflow_invocation = envelope.for_invocation(overflow_invocation_id)
+        overflow_operation = replace(
+            operation,
+            invocation_id=overflow_invocation_id,
+            invocation_fingerprint=_hash(overflow_invocation_id),
+        )
+        overflow_permit = policy.admit_operation(
+            overflow_invocation,
+            overflow_operation,
+        )
+        overflow = db.inspect_task_fence_conversation("policy-conversation")
+    finally:
+        db.close()
+
+    assert complete.compatible is True
+    assert complete.current_generation is not None
+    assert complete.current_generation.reserved_permit_ids == tuple(
+        sorted(permit_ids)
+    )
+    assert any(
+        "idx_task_fence_permits_generation_state" in detail
+        for detail in query_plan
+    )
+    assert all("USE TEMP B-TREE" not in detail for detail in query_plan)
+    assert overflow.compatible is False
+    assert overflow.reason == "current_generation_reserved_permit_limit_exceeded"
+    assert overflow.task is None
+    assert overflow.active_run is None
+    assert overflow.current_generation is None
+    assert overflow.pending_input_ids == ()
+    assert overflow.started_attempts == ()
+    assert overflow.open_incident is None
+    assert overflow.terminal_open_incidents == ()
+    assert overflow_permit.permit_id not in repr(overflow)
+
+
+def test_current_generation_and_reserved_permit_corruption_fail_without_partial(
+    tmp_path,
+):
+    db, _acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    try:
+        original_manifest = envelope.input_manifest_hash
+        db._conn.execute(
+            "UPDATE task_fence_model_generations SET input_manifest_hash = ? "
+            "WHERE generation_id = ?",
+            (_hash("forged-generation-manifest"), envelope.generation_id),
+        )
+        malformed_generation = db.inspect_task_fence_conversation(
+            "policy-conversation"
+        )
+        db._conn.execute(
+            "UPDATE task_fence_model_generations SET input_manifest_hash = ? "
+            "WHERE generation_id = ?",
+            (original_manifest, envelope.generation_id),
+        )
+
+        admitted = policy.admit_operation(envelope, operation)
+        db._conn.execute(
+            "UPDATE task_fence_dispatch_permits "
+            "SET control_revision = control_revision + 1 WHERE permit_id = ?",
+            (admitted.permit_id,),
+        )
+        malformed_permit = db.inspect_task_fence_conversation(
+            "policy-conversation"
+        )
+    finally:
+        db.close()
+
+    assert malformed_generation.compatible is False
+    assert malformed_generation.reason == "incompatible_current_generation_projection"
+    assert malformed_generation.task is None
+    assert malformed_generation.current_generation is None
+    assert malformed_permit.compatible is False
+    assert (
+        malformed_permit.reason
+        == "incompatible_current_generation_reserved_permit_projection"
+    )
+    assert malformed_permit.task is None
+    assert malformed_permit.active_run is None
+    assert malformed_permit.current_generation is None
+    assert admitted.permit_id not in repr(malformed_permit)
+
+
+def test_inspection_excludes_old_generation_reserved_permits_without_expiry_policy(
+    tmp_path,
+):
+    db, acceptance, envelope, operation = _live_lane(tmp_path / "state.db")
+    policy = TaskFencePolicy(db)
+    try:
+        admitted = policy.admit_operation(envelope, operation)
+        db._conn.execute(
+            "UPDATE task_fence_dispatch_permits "
+            "SET reserved_at = 1.0, expires_at = 2.0 WHERE permit_id = ?",
+            (admitted.permit_id,),
+        )
+        expired_by_clock = db.inspect_task_fence_conversation(
+            "policy-conversation"
+        )
+
+        replacement = db.reserve_task_fence_generation(acceptance)
+        assert db.finish_task_fence_generation(replacement, state="committed")
+        superseded = db.inspect_task_fence_conversation("policy-conversation")
+        old_permit_state = db._conn.execute(
+            "SELECT generation_id, state FROM task_fence_dispatch_permits "
+            "WHERE permit_id = ?",
+            (admitted.permit_id,),
+        ).fetchone()
+    finally:
+        db.close()
+
+    assert expired_by_clock.compatible is True
+    assert expired_by_clock.current_generation is not None
+    assert expired_by_clock.current_generation.reserved_permit_ids == (
+        admitted.permit_id,
+    )
+    assert superseded.compatible is True
+    assert superseded.current_generation is not None
+    assert superseded.current_generation.generation_id == replacement.generation_id
+    assert superseded.current_generation.state == "committed"
+    assert superseded.current_generation.reserved_permit_ids == ()
+    assert tuple(old_permit_state) == (envelope.generation_id, "reserved")
+
+
+def test_reserved_permit_and_started_attempt_share_one_inspection_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "state.db"
+    owner, _acceptance, envelope, operation = _live_lane(path)
+    admitted = TaskFencePolicy(owner).admit_operation(envelope, operation)
+    owner.close()
+
+    reader = SessionDB(path, read_only=True)
+    store_read = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    decisions = []
+    original_inspect = reader._inspect_task_fence_store_unlocked
+
+    def pause_after_store(*, include_counts):
+        inspected = original_inspect(include_counts=include_counts)
+        store_read.set()
+        if not writer_done.wait(timeout=5):
+            raise RuntimeError("concurrent permit authorization timed out")
+        return inspected
+
+    def authorize_permit():
+        try:
+            if not store_read.wait(timeout=5):
+                raise RuntimeError("inspection did not establish its snapshot")
+            writer = SessionDB(path)
+            try:
+                decisions.append(
+                    TaskFencePolicy(writer).authorize_and_start(
+                        envelope,
+                        operation,
+                        admitted.permit_id,
+                    )
+                )
+            finally:
+                writer.close()
+        except Exception as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    monkeypatch.setattr(
+        reader,
+        "_inspect_task_fence_store_unlocked",
+        pause_after_store,
+    )
+    writer_thread = threading.Thread(target=authorize_permit)
+    writer_thread.start()
+    try:
+        before = reader.inspect_task_fence_conversation("policy-conversation")
+        writer_thread.join(timeout=5)
+        after = reader.inspect_task_fence_conversation("policy-conversation")
+    finally:
+        reader.close()
+
+    assert writer_thread.is_alive() is False
+    assert writer_errors == []
+    assert len(decisions) == 1
+    assert decisions[0].attempt_id is not None
+    assert before.compatible is True
+    assert before.current_generation is not None
+    assert before.current_generation.reserved_permit_ids == (admitted.permit_id,)
+    assert before.started_attempts == ()
+    assert after.compatible is True
+    assert after.current_generation is not None
+    assert after.current_generation.reserved_permit_ids == ()
+    assert tuple(attempt.attempt_id for attempt in after.started_attempts) == (
+        decisions[0].attempt_id,
+    )
 
 
 def test_delivery_kind_uses_committed_generation_and_persists_exactly(tmp_path):

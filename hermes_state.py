@@ -349,6 +349,7 @@ _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
 _TASK_FENCE_MAX_PROCESS_CHECKPOINT_OPERATIONS = 64
 _TASK_FENCE_MAX_INSPECTION_ITEMS = 64
 _TASK_FENCE_MAX_TERMINAL_OPEN_INCIDENTS = 64
+_TASK_FENCE_MAX_CURRENT_GENERATION_RESERVED_PERMITS = 64
 _TASK_FENCE_MAX_INSPECTION_WORK = 8_192
 _TASK_FENCE_ACTIVE_INCIDENT_TASK_STATUSES = frozenset({"incident"})
 _TASK_FENCE_TERMINAL_TASK_STATUSES = frozenset({"stopped", "done"})
@@ -401,6 +402,16 @@ _TASK_FENCE_TERMINAL_OPEN_INCIDENT_SCAN_SQL = (
     "LEFT JOIN main.task_fence_tasks AS task ON task.task_id = incident.task_id "
     "WHERE incident.state = 'open' "
     "ORDER BY incident.task_id LIMIT ?"
+)
+_TASK_FENCE_CURRENT_GENERATION_RESERVED_PERMITS_SQL = (
+    "SELECT permit_id, task_id, authority_event_id, run_id, "
+    "generation_id, intent_epoch, control_revision, runtime_epoch, "
+    "invocation_envelope_id, invocation_fingerprint, executor, "
+    "tool_name, method, audience, parent_attempt_id, policy_decision, "
+    "policy_version, expires_at, state, reserved_at, consumed_at "
+    "FROM main.task_fence_dispatch_permits "
+    "INDEXED BY idx_task_fence_permits_generation_state "
+    "WHERE generation_id = ? AND state = 'reserved' LIMIT ?"
 )
 _TASK_FENCE_POLICY_DECISION_SELECT_COLUMNS = (
     "decision_order, decided_at, decision_id, decision_point, outcome, "
@@ -544,6 +555,15 @@ class TaskFenceActiveRunProjection:
 
 
 @dataclass(frozen=True)
+class TaskFenceCurrentGenerationProjection:
+    """Current generation and its exact durable reserved-permit records."""
+
+    generation_id: str
+    state: str
+    reserved_permit_ids: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class TaskFenceStartedAttemptProjection:
     """Current effect-bearing attempt without arguments or evidence."""
 
@@ -581,6 +601,7 @@ class TaskFenceConversationInspection:
     cohort: Optional[TaskFenceCohortProjection]
     task: Optional[TaskFenceConversationTaskProjection]
     active_run: Optional[TaskFenceActiveRunProjection]
+    current_generation: Optional[TaskFenceCurrentGenerationProjection]
     pending_input_ids: Tuple[str, ...]
     pending_inputs_truncated: bool
     started_attempts: Tuple[TaskFenceStartedAttemptProjection, ...]
@@ -8306,6 +8327,144 @@ class SessionDB:
             None,
         )
 
+    def _task_fence_current_generation_projection_unlocked(
+        self,
+        task: sqlite3.Row,
+        active_run: Optional[TaskFenceActiveRunProjection],
+    ) -> Tuple[
+        Optional[TaskFenceCurrentGenerationProjection],
+        Optional[str],
+    ]:
+        generation_id = task["current_generation_id"]
+        if generation_id is None:
+            return None, None
+        if (
+            active_run is None
+            or not _task_fence_v2_identifier_compatible(generation_id)
+        ):
+            return None, "incompatible_current_generation_projection"
+
+        generation = self._conn.execute(
+            "SELECT generation.generation_id, generation.task_id, "
+            "generation.run_id, generation.intent_epoch, "
+            "generation.control_revision, generation.runtime_epoch, "
+            "generation.input_manifest_hash, generation.snapshot_event_id, "
+            "generation.state, generation.opened_at, generation.closed_at, "
+            "run.bound_input_hash AS run_bound_input_hash, "
+            "run.opened_at AS run_opened_at, "
+            "event.task_id AS snapshot_event_task_id, "
+            "event.accepted_order AS snapshot_accepted_order, "
+            "snapshot.task_id AS snapshot_task_id, "
+            "snapshot.task_status AS snapshot_task_status, "
+            "snapshot.task_store_schema_version AS snapshot_store_schema_version, "
+            "snapshot.task_control_protocol_version "
+            "AS snapshot_control_protocol_version, "
+            "snapshot.task_active_authority_event_id "
+            "AS snapshot_authority_event_id, "
+            "snapshot.task_active_execution_run_id AS snapshot_run_id, "
+            "snapshot.task_intent_epoch AS snapshot_intent_epoch, "
+            "snapshot.task_control_revision AS snapshot_control_revision, "
+            "snapshot.task_current_runtime_epoch AS snapshot_runtime_epoch, "
+            "snapshot.task_last_accepted_order "
+            "AS snapshot_task_accepted_order "
+            "FROM main.task_fence_model_generations AS generation "
+            "LEFT JOIN main.task_fence_execution_runs AS run "
+            "ON run.run_id = generation.run_id "
+            "LEFT JOIN main.task_fence_ingress AS event "
+            "ON event.event_id = generation.snapshot_event_id "
+            "LEFT JOIN main.task_fence_acceptance_snapshots AS snapshot "
+            "ON snapshot.event_id = generation.snapshot_event_id "
+            "WHERE generation.generation_id = ?",
+            (generation_id,),
+        ).fetchone()
+
+        def finite_number(value: object) -> bool:
+            return type(value) in {int, float} and math.isfinite(float(value))
+
+        if (
+            generation is None
+            or generation["generation_id"] != generation_id
+            or generation["task_id"] != task["task_id"]
+            or generation["run_id"] != active_run.run_id
+            or generation["intent_epoch"] != task["intent_epoch"]
+            or generation["control_revision"] != task["control_revision"]
+            or generation["runtime_epoch"] != task["current_runtime_epoch"]
+            or not isinstance(generation["input_manifest_hash"], str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", generation["input_manifest_hash"]
+            )
+            is None
+            or generation["input_manifest_hash"]
+            != generation["run_bound_input_hash"]
+            or not _task_fence_v2_identifier_compatible(
+                generation["snapshot_event_id"]
+            )
+            or generation["state"] not in {"reserved", "started", "committed"}
+            or not finite_number(generation["opened_at"])
+            or not finite_number(generation["run_opened_at"])
+            or generation["opened_at"] < generation["run_opened_at"]
+            or generation["closed_at"] is not None
+            or generation["snapshot_event_task_id"] != task["task_id"]
+            or type(generation["snapshot_accepted_order"]) is not int
+            or generation["snapshot_accepted_order"] < 1
+            or generation["snapshot_accepted_order"] > task["last_accepted_order"]
+            or generation["snapshot_task_id"] != task["task_id"]
+            or generation["snapshot_task_status"] != "running"
+            or generation["snapshot_store_schema_version"]
+            != task["store_schema_version"]
+            or generation["snapshot_control_protocol_version"]
+            != task["control_protocol_version"]
+            or generation["snapshot_authority_event_id"]
+            != active_run.authority_event_id
+            or generation["snapshot_run_id"] != active_run.run_id
+            or generation["snapshot_intent_epoch"] != task["intent_epoch"]
+            or generation["snapshot_control_revision"]
+            != task["control_revision"]
+            or generation["snapshot_runtime_epoch"]
+            != task["current_runtime_epoch"]
+            or generation["snapshot_task_accepted_order"]
+            != generation["snapshot_accepted_order"]
+        ):
+            return None, "incompatible_current_generation_projection"
+
+        permits = self._conn.execute(
+            _TASK_FENCE_CURRENT_GENERATION_RESERVED_PERMITS_SQL,
+            (
+                generation_id,
+                _TASK_FENCE_MAX_CURRENT_GENERATION_RESERVED_PERMITS + 1,
+            ),
+        ).fetchall()
+        if len(permits) > _TASK_FENCE_MAX_CURRENT_GENERATION_RESERVED_PERMITS:
+            return None, "current_generation_reserved_permit_limit_exceeded"
+        if any(
+            not self._task_fence_policy_permit_storage_compatible_unlocked(
+                self._conn,
+                permit,
+            )
+            or permit["task_id"] != task["task_id"]
+            or permit["authority_event_id"] != active_run.authority_event_id
+            or permit["run_id"] != active_run.run_id
+            or permit["generation_id"] != generation_id
+            or permit["intent_epoch"] != task["intent_epoch"]
+            or permit["control_revision"] != task["control_revision"]
+            or permit["runtime_epoch"] != task["current_runtime_epoch"]
+            for permit in permits
+        ):
+            return (
+                None,
+                "incompatible_current_generation_reserved_permit_projection",
+            )
+        return (
+            TaskFenceCurrentGenerationProjection(
+                generation_id=generation_id,
+                state=generation["state"],
+                reserved_permit_ids=tuple(
+                    sorted(permit["permit_id"] for permit in permits)
+                ),
+            ),
+            None,
+        )
+
     def _task_fence_pending_projection_unlocked(
         self,
         task_id: str,
@@ -8616,6 +8775,9 @@ class SessionDB:
                     cohort: Optional[TaskFenceCohortProjection] = None,
                     task: Optional[TaskFenceConversationTaskProjection] = None,
                     active_run: Optional[TaskFenceActiveRunProjection] = None,
+                    current_generation: Optional[
+                        TaskFenceCurrentGenerationProjection
+                    ] = None,
                     pending_input_ids: Tuple[str, ...] = (),
                     pending_inputs_truncated: bool = False,
                     started_attempts: Tuple[
@@ -8637,6 +8799,7 @@ class SessionDB:
                         cohort=cohort,
                         task=task,
                         active_run=active_run,
+                        current_generation=current_generation,
                         pending_input_ids=pending_input_ids,
                         pending_inputs_truncated=pending_inputs_truncated,
                         started_attempts=started_attempts,
@@ -8798,6 +8961,14 @@ class SessionDB:
                 )
                 if failure is not None:
                     return result(compatible=False, reason=failure)
+                current_generation, failure = (
+                    self._task_fence_current_generation_projection_unlocked(
+                        task_row,
+                        active_run,
+                    )
+                )
+                if failure is not None:
+                    return result(compatible=False, reason=failure)
                 pending_input_ids, pending_truncated, failure = (
                     self._task_fence_pending_projection_unlocked(
                         task_row["task_id"]
@@ -8823,6 +8994,7 @@ class SessionDB:
                     cohort=cohort,
                     task=task,
                     active_run=active_run,
+                    current_generation=current_generation,
                     pending_input_ids=pending_input_ids,
                     pending_inputs_truncated=pending_truncated,
                     started_attempts=started_attempts,
@@ -8852,6 +9024,7 @@ class SessionDB:
                 cohort=None,
                 task=None,
                 active_run=None,
+                current_generation=None,
                 pending_input_ids=(),
                 pending_inputs_truncated=False,
                 started_attempts=(),

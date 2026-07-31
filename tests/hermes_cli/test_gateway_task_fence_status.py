@@ -41,13 +41,22 @@ def _ingress(
     )
 
 
-def _started_lane(path, conversation_id: str, marker: str):
+def _committed_lane(path, conversation_id: str, marker: str):
     db = SessionDB(path)
     accepted = db.accept_task_fence_ingress(
         _ingress(conversation_id, "initial_submit", f"{marker}-initial")
     )
     generation = db.reserve_task_fence_generation(accepted)
     assert db.finish_task_fence_generation(generation, state="committed")
+    return db, accepted, generation
+
+
+def _started_lane(path, conversation_id: str, marker: str):
+    db, accepted, generation = _committed_lane(
+        path,
+        conversation_id,
+        marker,
+    )
     invocation = generation.for_invocation(f"tfiv-{marker}")
     operation = OperationDescriptor(
         invocation_id=invocation.invocation_id,
@@ -193,6 +202,8 @@ def test_gateway_status_renders_bounded_current_profile_without_writes_or_leaks(
     assert expected.pending_input_ids[0] == held[0].event_id
     assert held[0].event_id in output
     assert "showing first 64; truncated" in output
+    assert "Current model generation: none" in output
+    assert "Reserved permits for current generation: none" in output
     assert "Open incident for active task: none" in output
     assert (
         "Open incidents on terminal tasks in configured conversation: none"
@@ -207,6 +218,165 @@ def test_gateway_status_renders_bounded_current_profile_without_writes_or_leaks(
     assert "status-secret-held" not in output
     assert "healthy" not in output.lower()
     assert "safe" not in output.lower()
+    assert _db_identity(db_path) == before
+
+
+def test_gateway_status_renders_only_current_generation_reserved_permits(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _stub_manual_status(monkeypatch)
+    conversation_id = "profile-generation:raw-secret-lane"
+    _write_shadow_config(tmp_path, conversation_id)
+    db, _accepted, generation = _committed_lane(
+        tmp_path / "state.db",
+        conversation_id,
+        "status-generation-secret-source",
+    )
+    policy = TaskFencePolicy(db)
+
+    consumed_invocation = generation.for_invocation(
+        "tfiv-status-consumed-secret"
+    )
+    consumed_operation = OperationDescriptor(
+        invocation_id=consumed_invocation.invocation_id,
+        kind=OperationKind.TOOL,
+        adapter="registry:status-consumed-secret-adapter",
+        invocation_fingerprint=_hash("status-consumed-secret-fingerprint"),
+    )
+    consumed_permit = policy.admit_operation(
+        consumed_invocation,
+        consumed_operation,
+    )
+    started = policy.authorize_and_start(
+        consumed_invocation,
+        consumed_operation,
+        consumed_permit.permit_id,
+    )
+    assert started.attempt_id is not None
+
+    reserved_invocation = generation.for_invocation(
+        "tfiv-status-reserved-secret"
+    )
+    reserved_operation = OperationDescriptor(
+        invocation_id=reserved_invocation.invocation_id,
+        kind=OperationKind.TOOL,
+        adapter="registry:status-reserved-secret-adapter",
+        invocation_fingerprint=_hash("status-reserved-secret-fingerprint"),
+    )
+    reserved_permit = policy.admit_operation(
+        reserved_invocation,
+        reserved_operation,
+    )
+    expected = db.inspect_task_fence_conversation(conversation_id)
+    assert expected.current_generation is not None
+    assert expected.current_generation.reserved_permit_ids == (
+        reserved_permit.permit_id,
+    )
+    reserved_before = tuple(
+        db._conn.execute(
+            "SELECT generation_id, state, expires_at, policy_decision, "
+            "consumed_at FROM task_fence_dispatch_permits WHERE permit_id = ?",
+            (reserved_permit.permit_id,),
+        ).fetchone()
+    )
+    db.close()
+    db_path = tmp_path / "state.db"
+    before = _db_identity(db_path)
+
+    _run_status(tmp_path)
+
+    output = capsys.readouterr().out
+    assert (
+        f"Current model generation: {generation.generation_id}, state=committed"
+        in output
+    )
+    assert (
+        "Reserved permits for current generation: "
+        f"{reserved_permit.permit_id}" in output
+    )
+    assert started.attempt_id in output
+    assert consumed_permit.permit_id not in output
+    assert conversation_id not in output
+    assert "status-generation-secret-source" not in output
+    assert reserved_invocation.invocation_id not in output
+    assert reserved_operation.adapter not in output
+    assert reserved_operation.invocation_fingerprint not in output
+    assert reserved_before[3] not in output
+    assert str(reserved_before[2]) not in output
+    assert "do not establish model liveness or dispatch authorization" in output
+    assert "eligibility and expiry are not evaluated" in output
+    assert (
+        "non-current-generation and consumed/revoked/expired permit history"
+        in output
+    )
+    assert _db_identity(db_path) == before
+
+    read_only = SessionDB(db_path, read_only=True)
+    try:
+        reserved_after = tuple(
+            read_only._conn.execute(
+                "SELECT generation_id, state, expires_at, policy_decision, "
+                "consumed_at FROM task_fence_dispatch_permits "
+                "WHERE permit_id = ?",
+                (reserved_permit.permit_id,),
+            ).fetchone()
+        )
+    finally:
+        read_only.close()
+    assert reserved_after == reserved_before
+
+
+def test_gateway_status_reserved_permit_overflow_is_reason_only(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _stub_manual_status(monkeypatch)
+    conversation_id = "profile-generation-overflow:raw-secret-lane"
+    _write_shadow_config(tmp_path, conversation_id)
+    db, accepted, generation = _committed_lane(
+        tmp_path / "state.db",
+        conversation_id,
+        "status-generation-overflow-secret-source",
+    )
+    policy = TaskFencePolicy(db)
+    permit_ids = []
+    for index in range(2):
+        invocation_id = f"tfiv-status-overflow-secret-{index}"
+        invocation = generation.for_invocation(invocation_id)
+        operation = OperationDescriptor(
+            invocation_id=invocation_id,
+            kind=OperationKind.TOOL,
+            adapter=f"registry:status-overflow-secret-adapter-{index}",
+            invocation_fingerprint=_hash(invocation_id),
+        )
+        permit_ids.append(
+            policy.admit_operation(invocation, operation).permit_id
+        )
+    db.close()
+    db_path = tmp_path / "state.db"
+    before = _db_identity(db_path)
+    monkeypatch.setattr(
+        hermes_state,
+        "_TASK_FENCE_MAX_CURRENT_GENERATION_RESERVED_PERMITS",
+        1,
+    )
+
+    _run_status(tmp_path)
+
+    output = capsys.readouterr().out
+    assert (
+        "State: inspection unavailable "
+        "(current_generation_reserved_permit_limit_exceeded)"
+        in output
+    )
+    assert accepted.task_id not in output
+    assert generation.generation_id not in output
+    assert all(permit_id not in output for permit_id in permit_ids)
+    assert "Current model generation:" not in output
+    assert "Reserved permits for current generation:" not in output
     assert _db_identity(db_path) == before
 
 
@@ -255,6 +425,8 @@ def test_gateway_status_scopes_incident_and_terminal_history_honestly(
     terminal_output = capsys.readouterr().out
     assert "Inspection: no_active_task" in terminal_output
     assert "Active task: none" in terminal_output
+    assert "Current model generation:" not in terminal_output
+    assert "Reserved permits for current generation:" not in terminal_output
     assert (
         "Open incidents on terminal tasks in configured conversation: 1"
         in terminal_output
@@ -320,6 +492,8 @@ def test_gateway_status_incompatible_store_is_nonfatal_without_partial_state(
     assert "State: inspection unavailable (unsupported_store_schema)" in output
     assert accepted.task_id not in output
     assert conversation_id not in output
+    assert "Current model generation:" not in output
+    assert "Reserved permits for current generation:" not in output
 
 
 def test_gateway_status_system_scope_adopts_unit_pinned_profile(

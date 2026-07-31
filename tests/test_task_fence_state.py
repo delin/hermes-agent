@@ -2371,6 +2371,7 @@ def test_real_ingress_conversation_inspection_tracks_run_then_pending(tmp_path):
     assert running.active_run is not None
     assert running.active_run.run_id == accepted.opened_run_id
     assert running.active_run.authority_event_id == accepted.event_id
+    assert running.current_generation is None
     assert running.pending_input_ids == ()
     assert running.pending_inputs_truncated is False
     assert running.started_attempts == ()
@@ -2429,6 +2430,7 @@ def test_real_ingress_conversation_inspection_tracks_run_then_pending(tmp_path):
     assert paused.task is not None
     assert paused.task.status == "paused"
     assert paused.active_run is None
+    assert paused.current_generation is None
     assert paused.pending_input_ids == (accepted.event_id, held.event_id)
     assert paused.pending_inputs_truncated is False
     assert conversation_id not in repr(running)
@@ -2454,6 +2456,7 @@ def test_real_ingress_conversation_inspection_tracks_run_then_pending(tmp_path):
     assert malformed_run.reason == "incompatible_active_run_projection"
     assert malformed_run.task is None
     assert malformed_run.active_run is None
+    assert malformed_run.current_generation is None
 
     conn = sqlite3.connect(path)
     try:

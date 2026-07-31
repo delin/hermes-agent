@@ -1480,13 +1480,23 @@ def _print_task_fence_shadow_status() -> None:
                 f"attempts={attempt_ids}"
             )
 
+    def print_scope() -> None:
+        print(
+            "  Scope: generation and reserved-permit records do not establish "
+            "model liveness or dispatch authorization; eligibility and expiry "
+            "are not evaluated."
+        )
+        print(
+            "  Scope: resolved incidents and other terminal/history state are "
+            "not inspected; non-current-generation and consumed/revoked/expired "
+            "permit history is also not inspected."
+        )
+
     task = inspection.task
     if task is None:
         print("  Active task: none")
         print_terminal_open_incidents()
-        print(
-            "  Scope: resolved incidents and other terminal/history state are not inspected."
-        )
+        print_scope()
         return
 
     cohort = inspection.cohort
@@ -1517,6 +1527,19 @@ def _print_task_fence_shadow_status() -> None:
             f"{inspection.active_run.run_id}, "
             f"authority_event={inspection.active_run.authority_event_id}"
         )
+
+    current_generation = inspection.current_generation
+    if current_generation is None:
+        print("  Current model generation: none")
+        print("  Reserved permits for current generation: none")
+    else:
+        print(
+            "  Current model generation: "
+            f"{current_generation.generation_id}, "
+            f"state={current_generation.state}"
+        )
+        permits = ", ".join(current_generation.reserved_permit_ids) or "none"
+        print(f"  Reserved permits for current generation: {permits}")
 
     pending = ", ".join(inspection.pending_input_ids) or "none"
     pending_suffix = (
@@ -1552,9 +1575,7 @@ def _print_task_fence_shadow_status() -> None:
             f"attempts={attempt_ids}"
         )
     print_terminal_open_incidents()
-    print(
-        "  Scope: resolved incidents and other terminal/history state are not inspected."
-    )
+    print_scope()
 
 
 def _print_other_profiles_gateway_status() -> None:
