@@ -31,6 +31,7 @@ from task_fence import (
 _MAX_CAMPAIGN_DECISION_RECORDS = 64
 _ANTHROPIC_CREATE_ROUTE = "provider:anthropic.messages.create"
 _ANTHROPIC_STREAM_ROUTE = "provider:anthropic.messages.stream"
+_BEDROCK_ANTHROPIC_ROUTE = "provider:bedrock.anthropic_messages"
 _CODEX_ROUTE = "provider:openai.responses.create"
 _GEMINI_ROUTE = "provider:gemini.generateContent"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
@@ -639,6 +640,155 @@ def test_campaign_probe_records_codex_iteration_summary_at_responses_create(
         assert generations[0].generation_id == physical[0][1].generation_id
         assert len(probes) == 1
         probes[0].assert_complete()
+    finally:
+        db.close()
+
+
+def test_campaign_excludes_bedrock_anthropic_main_route_at_real_fallback_edges(
+    campaign_summary_agent,
+    tmp_path,
+):
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    policy_constructions = []
+    calls = []
+    physical = []
+    request_secret = "raw-bedrock-anthropic-campaign-secret"
+    model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    endpoint = "https://bedrock-runtime.us-east-1.amazonaws.com"
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text="bedrock anthropic legacy response",
+            )
+        ],
+        stop_reason="end_turn",
+        usage=None,
+    )
+
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _BEDROCK_ANTHROPIC_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    def inspect_physical_entry(stage, kwargs):
+        envelope = current_causal_envelope()
+        assert envelope is not None
+        assert envelope.task_id == acceptance.task_id
+        assert envelope.invocation_id is None
+        assert current_task_fence_policy() is None
+        assert not any(key.startswith("_task_fence_") for key in kwargs)
+        with db._lock:
+            counts = tuple(
+                db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+        assert counts == (0, 0, 0)
+        physical.append((stage, dict(kwargs), envelope))
+
+    class UnavailableStream:
+        def __init__(self, kwargs):
+            self._kwargs = kwargs
+
+        def __enter__(self):
+            calls.append("stream_enter")
+            inspect_physical_entry("stream_enter", self._kwargs)
+            raise RuntimeError(
+                "not authorized to perform: "
+                "bedrock:InvokeModelWithResponseStream"
+            )
+
+        def __exit__(self, *_args):
+            return False
+
+    class Messages:
+        @staticmethod
+        def stream(**kwargs):
+            calls.append("stream_factory")
+            assert not any(key.startswith("_task_fence_") for key in kwargs)
+            return UnavailableStream(dict(kwargs))
+
+        @staticmethod
+        def create(**kwargs):
+            calls.append("create")
+            inspect_physical_entry("create", kwargs)
+            return response
+
+    def tracked_policy(*args, **kwargs):
+        policy_constructions.append((args, kwargs))
+        return TaskFencePolicy(*args, **kwargs)
+
+    agent = campaign_summary_agent
+    agent._session_db = db
+    agent.api_mode = "anthropic_messages"
+    agent.provider = "bedrock"
+    agent.model = model
+    agent.base_url = endpoint
+    agent._base_url_lower = endpoint.lower()
+    agent._base_url_hostname = "bedrock-runtime.us-east-1.amazonaws.com"
+    agent._anthropic_base_url = endpoint
+    agent._anthropic_api_key = "aws-sdk"
+    agent._is_anthropic_oauth = False
+    agent._disable_streaming = False
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    request_client = SimpleNamespace(messages=Messages())
+    try:
+        with (
+            patch(
+                "task_fence.TaskFencePolicy",
+                side_effect=tracked_policy,
+            ),
+            patch.object(
+                agent,
+                "_create_request_anthropic_client",
+                return_value=request_client,
+            ) as make_client,
+            patch.object(agent, "_close_request_anthropic_client"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "bedrock anthropic legacy response"
+        assert calls == ["stream_factory", "stream_enter", "create"]
+        assert [entry[0] for entry in physical] == ["stream_enter", "create"]
+        assert len({entry[2].generation_id for entry in physical}) == 1
+        make_client.assert_called_once_with(reason="anthropic_messages_request")
+        assert policy_constructions == []
+        generation = db._conn.execute(
+            "SELECT generation_id, task_id, state, closed_at "
+            "FROM task_fence_model_generations"
+        ).fetchone()
+        assert generation is not None
+        assert tuple(generation) == (
+            physical[0][2].generation_id,
+            acceptance.task_id,
+            "committed",
+            None,
+        )
+        for table in (
+            "task_fence_policy_decisions",
+            "task_fence_dispatch_permits",
+            "task_fence_attempts",
+        ):
+            assert db._conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+        assert request_secret not in "\n".join(db._conn.iterdump())
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
     finally:
         db.close()
 
