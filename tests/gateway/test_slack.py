@@ -387,7 +387,7 @@ class TestSlashCommandSessionIsolation:
 
 class TestTaskFenceIngressSidecar:
     @pytest.mark.asyncio
-    async def test_raw_dm_accepts_durably_before_real_adapter_handler(
+    async def test_raw_dm_accepts_but_native_slash_stays_outside_real_writer(
         self,
         adapter,
         tmp_path,
@@ -411,24 +411,37 @@ class TestTaskFenceIngressSidecar:
         )
         runner._session_db = AsyncSessionDB(db)
         runner._update_prompt_pending = {}
-        runner._is_user_authorized = lambda _source: True
+        runner._is_user_authorized = lambda source: source is not None
         adapter.handle_message = BasePlatformAdapter.handle_message.__get__(
             adapter,
             type(adapter),
         )
-        adapter.set_task_fence_ingress_handler(
-            runner._accept_task_fence_gateway_ingress
-        )
+        hook_calls = []
+
+        async def ingress_handler(event, candidate_session_key):
+            hook_calls.append((event, candidate_session_key))
+            await runner._accept_task_fence_gateway_ingress(
+                event,
+                candidate_session_key,
+            )
+
+        adapter.set_task_fence_ingress_handler(ingress_handler)
         handled = asyncio.Event()
-        observation = None
+        handled_events = []
+        snapshots = []
+        total_changes = []
 
         async def handler(event):
-            nonlocal observation
             with db._lock:
-                observation = db._conn.execute(
+                conn = db._conn
+                assert conn is not None
+                snapshot = conn.execute(
                     "SELECT COUNT(*), MIN(intent), MIN(execution) "
                     "FROM task_fence_ingress"
                 ).fetchone()
+                total_changes.append(conn.total_changes)
+            handled_events.append(event)
+            snapshots.append(tuple(snapshot))
             handled.set()
             return None
 
@@ -446,10 +459,43 @@ class TestTaskFenceIngressSidecar:
             )
             await asyncio.wait_for(handled.wait(), timeout=1)
             await adapter.cancel_background_tasks()
+            handled.clear()
+
+            await adapter._handle_slash_command(
+                {
+                    "command": "/model",
+                    "text": "qwen --provider openrouter",
+                    "user_id": "U123",
+                    "channel_id": "D123",
+                    "team_id": "T123",
+                    "thread_ts": ts,
+                    "trigger_id": "1337.42",
+                }
+            )
+            await asyncio.wait_for(handled.wait(), timeout=1)
         finally:
+            await adapter.cancel_background_tasks()
             db.close()
 
-        assert tuple(observation) == (1, "replace", "run")
+        assert [event.text for event in handled_events] == [
+            "real adapter path",
+            "/model qwen --provider openrouter",
+        ]
+        assert [event for event, _key in hook_calls] == handled_events
+        assert [key for _event, key in hook_calls] == [
+            session_key,
+            session_key,
+        ]
+        assert handled_events[0].task_fence_ingress is not None
+        assert handled_events[0].task_fence_acceptance is not None
+        assert handled_events[1].task_fence_ingress is None
+        assert handled_events[1].task_fence_acceptance is None
+        assert handled_events[1].task_fence_acceptance_attempted is False
+        assert snapshots == [
+            (1, "replace", "run"),
+            (1, "replace", "run"),
+        ]
+        assert total_changes[1] == total_changes[0]
 
     @pytest.mark.asyncio
     async def test_plain_dm_emits_typed_secret_free_sidecar(self, adapter):
