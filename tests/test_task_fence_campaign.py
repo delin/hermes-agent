@@ -32,6 +32,7 @@ _MAX_CAMPAIGN_DECISION_RECORDS = 64
 _ANTHROPIC_CREATE_ROUTE = "provider:anthropic.messages.create"
 _ANTHROPIC_STREAM_ROUTE = "provider:anthropic.messages.stream"
 _BEDROCK_ANTHROPIC_ROUTE = "provider:bedrock.anthropic_messages"
+_CODEX_APP_SERVER_ROUTE = "provider:codex.app_server"
 _CODEX_ROUTE = "provider:openai.responses.create"
 _GEMINI_ROUTE = "provider:gemini.generateContent"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
@@ -790,6 +791,99 @@ def test_campaign_excludes_bedrock_anthropic_main_route_at_real_fallback_edges(
         assert current_causal_envelope() is None
         assert current_task_fence_policy() is None
     finally:
+        db.close()
+
+
+def test_campaign_excludes_codex_app_server_at_real_session_handoff(
+    campaign_summary_agent,
+    tmp_path,
+):
+    from agent.transports.codex_app_server_session import (
+        CodexAppServerSession,
+        TurnResult,
+    )
+
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    policy_constructions = []
+    physical = []
+    request_secret = "raw-codex-app-server-campaign-secret"
+    response_text = "codex app-server legacy response"
+
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _CODEX_APP_SERVER_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    def run_turn(*, user_input):
+        assert user_input == request_secret
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+        with db._lock:
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM task_fence_ingress"
+            ).fetchone()[0] == 1
+            counts = tuple(
+                db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+        assert counts == (0, 0, 0, 0)
+        physical.append(user_input)
+        return TurnResult(
+            final_text=response_text,
+            projected_messages=[],
+            tool_iterations=0,
+            turn_id="turn-task-fence-campaign",
+            thread_id="thread-task-fence-campaign",
+        )
+
+    def tracked_policy(*args, **kwargs):
+        policy_constructions.append((args, kwargs))
+        return TaskFencePolicy(*args, **kwargs)
+
+    agent = campaign_summary_agent
+    agent._session_db = db
+    agent.api_mode = "codex_app_server"
+    agent.provider = "openai-codex"
+    session = CodexAppServerSession(cwd=str(tmp_path))
+    agent._codex_session = session
+    try:
+        with (
+            patch.object(session, "run_turn", side_effect=run_turn),
+            patch(
+                "task_fence.TaskFencePolicy",
+                side_effect=tracked_policy,
+            ),
+            patch.object(agent, "_persist_session"),
+        ):
+            result = agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert physical == [request_secret]
+        assert result["completed"] is True
+        assert result["final_response"] == response_text
+        assert policy_constructions == []
+        for table in (
+            "task_fence_model_generations",
+            "task_fence_policy_decisions",
+            "task_fence_dispatch_permits",
+            "task_fence_attempts",
+        ):
+            assert db._conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+        assert request_secret not in "\n".join(db._conn.iterdump())
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        session.close()
         db.close()
 
 
