@@ -36,6 +36,7 @@ _CODEX_APP_SERVER_ROUTE = "provider:codex.app_server"
 _CODEX_ROUTE = "provider:openai.responses.create"
 _COPILOT_ACP_ROUTE = "provider:copilot.acp"
 _GEMINI_ROUTE = "provider:gemini.generateContent"
+_MOA_ONE_SHOT_ROUTE = "runtime:moa-one-shot"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
 
 
@@ -1120,6 +1121,235 @@ def test_campaign_excludes_copilot_acp_at_real_session_prompt_write(tmp_path):
         assert current_task_fence_policy() is None
     finally:
         agent.close()
+        db.close()
+
+
+def test_campaign_excludes_moa_one_shot_at_real_aggregator_create(
+    campaign_summary_agent,
+    tmp_path,
+):
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    probes = []
+    factories = []
+    physical = []
+    main_calls = []
+    request_secret = "raw-moa-one-shot-campaign-secret"
+    reference_advice = "bounded campaign reference advice"
+    aggregate_guidance = "bounded campaign aggregate guidance"
+    main_text = "one-shot legacy main response"
+
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _MOA_ONE_SHOT_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    def response(content, *, model, response_id):
+        return SimpleNamespace(
+            id=response_id,
+            model=model,
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=content,
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    def aggregator_create(**kwargs):
+        with db._lock:
+            ingress_task_id = db._conn.execute(
+                "SELECT task_id FROM task_fence_ingress"
+            ).fetchone()["task_id"]
+            counts = tuple(
+                db._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+        physical.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                ingress_task_id,
+                counts,
+                len(probes),
+            )
+        )
+        return response(
+            aggregate_guidance,
+            model="campaign-aggregator-model",
+            response_id="chatcmpl-moa-one-shot-aggregate",
+        )
+
+    auxiliary_client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="campaign-aux-key",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=aggregator_create),
+        ),
+    )
+
+    def get_cached_client(provider, model, **kwargs):
+        factories.append(
+            (
+                provider,
+                model,
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+            )
+        )
+        return auxiliary_client, model
+
+    def main_create(**kwargs):
+        envelope = _assert_summary_physical_entry(
+            db=db,
+            probes=probes,
+            route_id=_OPENAI_ROUTE,
+        )
+        with db._lock:
+            state = db._conn.execute(
+                "SELECT state FROM task_fence_model_generations "
+                "WHERE generation_id = ?",
+                (envelope.generation_id,),
+            ).fetchone()["state"]
+        main_calls.append((dict(kwargs), envelope, state))
+        return response(
+            main_text,
+            model="campaign-main-model",
+            response_id="chatcmpl-moa-one-shot-main",
+        )
+
+    moa_config = {
+        "reference_models": [
+            {
+                "provider": "openrouter",
+                "model": "campaign-reference-model",
+                "enabled": True,
+            }
+        ],
+        "aggregator": {
+            "provider": "openrouter",
+            "model": "campaign-aggregator-model",
+        },
+        "reference_temperature": None,
+        "aggregator_temperature": None,
+        "degraded_reference_policy": "loud",
+    }
+
+    agent = campaign_summary_agent
+    agent._session_db = db
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.model = "campaign-main-model"
+    agent.client.base_url = agent.base_url
+    agent.client.api_key = "campaign-main-key"
+    agent.client.chat.completions.create.side_effect = main_create
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    try:
+        with (
+            patch(
+                "agent.moa_loop._run_references_parallel",
+                return_value=[
+                    (
+                        "openrouter:campaign-reference-model",
+                        reference_advice,
+                        None,
+                    )
+                ],
+            ) as fanout,
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                side_effect=get_cached_client,
+            ),
+            patch(
+                "task_fence.TaskFencePolicy",
+                new=_campaign_probe_factory(
+                    route_id=_OPENAI_ROUTE,
+                    store=db,
+                    probes=probes,
+                ),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                request_secret,
+                moa_config=moa_config,
+                task_fence_acceptance=acceptance,
+            )
+
+        fanout.assert_called_once()
+        assert len(factories) == 1
+        assert factories[0][0:2] == (
+            "openrouter",
+            "campaign-aggregator-model",
+        )
+        assert factories[0][3:] == (None, None)
+
+        assert len(physical) == 1
+        (
+            aggregator_kwargs,
+            aggregator_envelope,
+            aggregator_policy,
+            ingress_task_id,
+            aggregator_counts,
+            probe_count,
+        ) = physical[0]
+        assert aggregator_envelope is None
+        assert aggregator_policy is None
+        assert ingress_task_id == acceptance.task_id
+        assert aggregator_counts == (0, 0, 0, 0)
+        assert probe_count == 0
+        assert not any(
+            key.startswith("_task_fence_") for key in aggregator_kwargs
+        )
+        synthesis_prompt = str(aggregator_kwargs["messages"])
+        assert request_secret in synthesis_prompt
+        assert reference_advice in synthesis_prompt
+
+        assert len(main_calls) == 1
+        main_kwargs, main_envelope, main_state = main_calls[0]
+        assert main_envelope.task_id == acceptance.task_id
+        assert main_envelope.invocation_id is not None
+        assert main_envelope.parent_invocation_id is None
+        assert main_state == "started"
+        assert aggregate_guidance in str(main_kwargs["messages"])
+
+        assert result["completed"] is True
+        assert result["final_response"] == main_text
+        assert len(probes) == 1
+        probes[0].assert_complete()
+        generation = db._conn.execute(
+            "SELECT generation_id, task_id, state, closed_at "
+            "FROM task_fence_model_generations"
+        ).fetchone()
+        assert tuple(generation) == (
+            main_envelope.generation_id,
+            acceptance.task_id,
+            "committed",
+            None,
+        )
+        assert request_secret not in "\n".join(db._conn.iterdump())
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
         db.close()
 
 
