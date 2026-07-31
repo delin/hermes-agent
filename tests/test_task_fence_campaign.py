@@ -3233,6 +3233,231 @@ def test_campaign_masks_tool_policy_at_native_anthropic_aux_stream(
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_campaign_preserves_tool_authority_at_async_vision_create(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import threading
+
+    from agent import auxiliary_client
+    import model_tools
+    from task_fence import bind_task_fence_policy
+    import tools.vision_tools  # noqa: F401 - import registers the real handler
+
+    session_id = "campaign-conversation"
+    resource_task_id = "campaign-async-vision-task"
+    auxiliary_model = "campaign-async-vision-model"
+    question = "What is visible in this image?"
+    analysis = "A single bounded campaign pixel is visible."
+    image_data_url = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_KEY", session_id)
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n"
+        "  image_input_mode: text\n"
+        "auxiliary:\n"
+        "  vision:\n"
+        "    provider: openrouter\n"
+        f"    model: {auxiliary_model}\n",
+        encoding="utf-8",
+    )
+
+    db, generation = _live_model_lane(tmp_path / "state.db")
+    conn = db._conn
+    assert conn is not None
+    assert db.finish_task_fence_generation(
+        generation,
+        state="committed",
+    )
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    policy = TaskFencePolicy(db)
+    physical = []
+
+    def snapshot():
+        with db._lock:
+            counts = tuple(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+            generation_row = tuple(
+                conn.execute(
+                    "SELECT task_id, generation_id, state "
+                    "FROM task_fence_model_generations"
+                ).fetchone()
+            )
+            decisions = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT decision_point, outcome, reason_code, "
+                    "operation_kind, adapter, operation_invocation_id "
+                    "FROM task_fence_policy_decisions "
+                    "ORDER BY decision_order"
+                )
+            ]
+            attempts = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT d.operation_kind, d.adapter, a.state "
+                    "FROM task_fence_policy_decisions AS d "
+                    "JOIN task_fence_attempts AS a "
+                    "ON a.attempt_id = d.attempt_id "
+                    "WHERE d.decision_point = 'authorization'"
+                )
+            ]
+        return counts, generation_row, decisions, attempts
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=analysis),
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    class AsyncCompletions:
+        async def create(self, **kwargs):
+            physical.append(
+                (
+                    dict(kwargs),
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    threading.get_ident(),
+                    snapshot(),
+                )
+            )
+            return response
+
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        chat=SimpleNamespace(
+            completions=AsyncCompletions(),
+        ),
+    )
+    resolve_client = MagicMock(
+        return_value=("openrouter", client, auxiliary_model)
+    )
+    monkeypatch.setattr(
+        auxiliary_client,
+        "resolve_vision_provider_client",
+        resolve_client,
+    )
+
+    main_thread_id = threading.get_ident()
+
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+        ):
+            raw_result = model_tools.handle_function_call(
+                "vision_analyze",
+                {
+                    "image_url": image_data_url,
+                    "question": question,
+                },
+                task_id=resource_task_id,
+                session_id=session_id,
+                user_task="exercise async auxiliary tool authority",
+            )
+
+        resolve_client.assert_called_once()
+        assert resolve_client.call_args.kwargs["async_mode"] is True
+        assert len(physical) == 1
+        (
+            request_kwargs,
+            edge_envelope,
+            edge_policy,
+            worker_thread_id,
+            edge_snapshot,
+        ) = physical[0]
+
+        assert edge_envelope is not None
+        assert edge_envelope.task_id == generation.task_id
+        assert edge_envelope.generation_id == generation.generation_id
+        assert edge_envelope.invocation_id is not None
+        assert edge_envelope.parent_invocation_id is not None
+        assert edge_envelope.parent_invocation_id != edge_envelope.invocation_id
+        assert edge_policy is policy
+        assert worker_thread_id != main_thread_id
+        assert request_kwargs["model"] == auxiliary_model
+        assert not any(
+            key.startswith("_task_fence_") for key in request_kwargs
+        )
+        request_content = request_kwargs["messages"][0]["content"]
+        assert question in request_content[0]["text"]
+        assert request_content[1]["image_url"]["url"] == image_data_url
+
+        (
+            edge_counts,
+            edge_generation,
+            edge_decisions,
+            edge_attempts,
+        ) = edge_snapshot
+        assert edge_counts == (1, 1, 2, 1, 1)
+        assert edge_generation == (
+            generation.task_id,
+            generation.generation_id,
+            "committed",
+        )
+        assert [row[:5] for row in edge_decisions] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:vision_analyze",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:vision_analyze",
+            ),
+        ]
+        assert [row[5] for row in edge_decisions] == [
+            edge_envelope.invocation_id,
+            edge_envelope.invocation_id,
+        ]
+        assert edge_attempts == [
+            (
+                OperationKind.TOOL.value,
+                "registry:vision_analyze",
+                "STARTED",
+            )
+        ]
+
+        result = json.loads(raw_result)
+        assert result["success"] is True
+        assert result["analysis"] == analysis
+        assert snapshot() == edge_snapshot
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
 def test_campaign_probe_records_real_openai_handoff_before_sdk_entry(tmp_path):
     db, generation = _live_model_lane(tmp_path / "state.db")
     probe = _campaign_probe(TaskFencePolicy(db))
