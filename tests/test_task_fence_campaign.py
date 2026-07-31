@@ -2052,6 +2052,426 @@ def test_campaign_excludes_sync_title_generation_at_real_background_create(
         db.close()
 
 
+def test_campaign_excludes_sync_smart_approval_at_real_terminal_handoff(
+    campaign_summary_agent,
+    tmp_path,
+    monkeypatch,
+):
+    import json
+
+    from agent import auxiliary_client
+    import task_fence as task_fence_module
+    import tools.approval as approval_module
+    import tools.terminal_tool as terminal_module
+
+    session_id = "campaign-conversation"
+    resource_task_id = "campaign-smart-approval-task"
+    command = 'python -c "print(\'bounded-smart-approval\')"'
+    main_text = "smart approval campaign completed"
+    execution_output = "bounded smart approval executed"
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setenv("HERMES_SESSION_KEY", session_id)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    for name in (
+        "HERMES_INTERACTIVE",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_CRON_SESSION",
+        "HERMES_YOLO_MODE",
+        "_HERMES_GATEWAY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "approvals:\n"
+        "  mode: smart\n"
+        "security:\n"
+        "  tirith_enabled: false\n",
+        encoding="utf-8",
+    )
+
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    conn = db._conn
+    assert conn is not None
+    db.create_session(
+        session_id,
+        source="gateway",
+        system_prompt="You are helpful.",
+    )
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+    dangerous, _, _ = approval_module.detect_dangerous_command(command)
+    assert dangerous is True
+
+    policy_constructions = []
+    main_physical = []
+    approval_physical = []
+    executions = []
+
+    def counts():
+        with db._lock:
+            return tuple(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+
+    def audit_rows():
+        with db._lock:
+            return [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT decision_point, outcome, reason_code, "
+                    "operation_kind, adapter, "
+                    "operation_invocation_id "
+                    "FROM task_fence_policy_decisions "
+                    "ORDER BY decision_order"
+                )
+            ]
+
+    def edge_snapshot():
+        with db._lock:
+            generation = tuple(
+                conn.execute(
+                    "SELECT task_id, state "
+                    "FROM task_fence_model_generations"
+                ).fetchone()
+            )
+            attempts = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT d.operation_kind, d.adapter, a.state "
+                    "FROM task_fence_policy_decisions AS d "
+                    "JOIN task_fence_attempts AS a "
+                    "ON a.attempt_id = d.attempt_id "
+                    "WHERE d.decision_point = 'authorization' "
+                    "ORDER BY d.decision_order"
+                )
+            ]
+        return counts(), audit_rows(), generation, attempts
+
+    def response(content, tool_calls=None):
+        return SimpleNamespace(
+            id="chatcmpl-smart-approval",
+            model="campaign-main-model",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=content,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                    ),
+                    finish_reason=(
+                        "tool_calls" if tool_calls else "stop"
+                    ),
+                )
+            ],
+        )
+
+    main_responses = iter(
+        (
+            response(
+                None,
+                tool_calls=[
+                    SimpleNamespace(
+                        id="call-smart-approval-terminal",
+                        type="function",
+                        function=SimpleNamespace(
+                            name="terminal",
+                            arguments=json.dumps({"command": command}),
+                        ),
+                    )
+                ],
+            ),
+            response(main_text),
+        )
+    )
+
+    def main_create(**kwargs):
+        main_physical.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                counts(),
+                len(policy_constructions),
+            )
+        )
+        return next(main_responses)
+
+    def approval_create(**kwargs):
+        envelope = current_causal_envelope()
+        policy = current_task_fence_policy()
+        approval_physical.append(
+            (
+                dict(kwargs),
+                envelope,
+                policy,
+                edge_snapshot(),
+                len(policy_constructions),
+            )
+        )
+        return SimpleNamespace(
+            id="chatcmpl-smart-approval-auxiliary",
+            model="campaign-approval-model",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="APPROVE"),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    approval_client = _openai_client(approval_create)
+    approval_client.base_url = "https://openrouter.ai/api/v1"
+
+    class Environment:
+        cwd = str(tmp_path)
+
+        @staticmethod
+        def execute(executed_command, **_kwargs):
+            executions.append(
+                (
+                    executed_command,
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    edge_snapshot(),
+                )
+            )
+            return {
+                "output": execution_output,
+                "returncode": 0,
+            }
+
+    class TrackedTaskFencePolicy(TaskFencePolicy):
+        def __init__(self, store):
+            assert store is db
+            super().__init__(store)
+            policy_constructions.append(self)
+
+    agent = campaign_summary_agent
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = session_id
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.model = "campaign-main-model"
+    agent.client.base_url = agent.base_url
+    agent.client.api_key = "campaign-main-key"
+    agent.client.chat.completions.create.side_effect = main_create
+    agent._disable_streaming = True
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    agent.max_iterations = 2
+    agent.tools = [
+        {
+            "type": "function",
+            "function": terminal_module.TERMINAL_SCHEMA,
+        }
+    ]
+    agent.valid_tool_names = {"terminal"}
+
+    get_client = MagicMock(
+        return_value=(approval_client, "campaign-approval-model")
+    )
+    monkeypatch.setattr(
+        task_fence_module,
+        "TaskFencePolicy",
+        TrackedTaskFencePolicy,
+    )
+    monkeypatch.setattr(auxiliary_client, "_get_cached_client", get_client)
+    for name, value in (
+        ("_YOLO_MODE_FROZEN", False),
+        ("_session_approved", {}),
+        ("_session_yolo", set()),
+        ("_permanent_approved", set()),
+    ):
+        monkeypatch.setattr(approval_module, name, value)
+    for name, value in (
+        ("_start_cleanup_thread", MagicMock()),
+        ("_task_env_overrides", {}),
+        ("_session_cwd", {}),
+        ("_active_environments", {"default": Environment()}),
+        ("_last_activity", {}),
+    ):
+        monkeypatch.setattr(terminal_module, name, value)
+    for name in (
+        "_persist_session",
+        "_save_trajectory",
+        "_cleanup_task_resources",
+    ):
+        monkeypatch.setattr(agent, name, MagicMock())
+
+    try:
+        result = agent.run_conversation(
+            "exercise the bounded smart approval path",
+            task_id=resource_task_id,
+            task_fence_acceptance=acceptance,
+        )
+
+        get_client.assert_called_once()
+        assert len(approval_physical) == 1
+        (
+            approval_kwargs,
+            approval_envelope,
+            approval_policy,
+            approval_snapshot,
+            approval_policy_count,
+        ) = approval_physical[0]
+        (
+            approval_counts,
+            approval_rows,
+            approval_generation,
+            approval_attempts,
+        ) = approval_snapshot
+        assert approval_envelope is not None
+        assert approval_envelope.task_id == acceptance.task_id
+        assert approval_envelope.generation_id == main_physical[0][1].generation_id
+        assert approval_envelope.invocation_id is not None
+        assert approval_envelope.parent_invocation_id is not None
+        assert approval_policy is policy_constructions[1]
+        assert approval_counts == (1, 1, 4, 2, 2)
+        assert approval_generation == (acceptance.task_id, "committed")
+        assert approval_attempts == [
+            (OperationKind.MODEL.value, _OPENAI_ROUTE, "SUCCEEDED"),
+            (OperationKind.TOOL.value, "registry:terminal", "STARTED"),
+        ]
+        assert approval_policy_count == 2
+        assert [row[:5] for row in approval_rows] == [
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.MODEL.value,
+                _OPENAI_ROUTE,
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.MODEL.value,
+                _OPENAI_ROUTE,
+            ),
+            (
+                "admission",
+                DecisionOutcome.WOULD_RESERVE.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:terminal",
+            ),
+            (
+                "authorization",
+                DecisionOutcome.WOULD_ALLOW.value,
+                DecisionReason.CURRENT_AUTHORITY.value,
+                OperationKind.TOOL.value,
+                "registry:terminal",
+            ),
+        ]
+        assert [row[5] for row in approval_rows] == [
+            main_physical[0][1].invocation_id,
+            main_physical[0][1].invocation_id,
+            approval_envelope.invocation_id,
+            approval_envelope.invocation_id,
+        ]
+        assert approval_kwargs["model"] == "campaign-approval-model"
+        assert not approval_kwargs.get("stream", False)
+        assert not any(
+            key.startswith("_task_fence_") for key in approval_kwargs
+        )
+        approval_prompt = approval_kwargs["messages"][1]["content"]
+        assert command in approval_prompt
+
+        assert len(executions) == 1
+        (
+            executed_command,
+            execute_envelope,
+            execute_policy,
+            execute_snapshot,
+        ) = executions[0]
+        assert executed_command == command
+        assert execute_envelope is approval_envelope
+        assert execute_policy is approval_policy
+        assert execute_snapshot == approval_snapshot
+
+        assert len(main_physical) == 2
+        first_main = main_physical[0]
+        second_main = main_physical[1]
+        assert first_main[2] is None
+        assert first_main[3] == (1, 1, 2, 1, 1)
+        assert first_main[4] == 1
+        assert second_main[2] is None
+        assert second_main[3] == (1, 2, 6, 3, 3)
+        assert second_main[4] == 3
+        assert execution_output in str(second_main[0]["messages"])
+
+        tool_messages = [
+            message
+            for message in result["messages"]
+            if message.get("role") == "tool"
+            and message.get("name") == "terminal"
+        ]
+        assert len(tool_messages) == 1
+        tool_result = json.loads(tool_messages[0]["content"])
+        assert tool_result["output"] == execution_output
+        assert tool_result["exit_code"] == 0
+        assert "auto-approved by smart approval" in tool_result["approval"]
+
+        assert result["completed"] is True
+        assert result["final_response"] == main_text
+        assert len(policy_constructions) == 3
+        assert counts() == (1, 2, 6, 3, 3)
+        with db._lock:
+            generations = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT task_id, state "
+                    "FROM task_fence_model_generations "
+                    "ORDER BY opened_at, generation_id"
+                )
+            ]
+            attempts = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT d.operation_kind, d.adapter, a.state "
+                    "FROM task_fence_policy_decisions AS d "
+                    "JOIN task_fence_attempts AS a "
+                    "ON a.attempt_id = d.attempt_id "
+                    "WHERE d.decision_point = 'authorization' "
+                    "ORDER BY d.decision_order"
+                )
+            ]
+        assert generations == [
+            (acceptance.task_id, "committed"),
+            (acceptance.task_id, "committed"),
+        ]
+        assert attempts == [
+            (OperationKind.MODEL.value, _OPENAI_ROUTE, "SUCCEEDED"),
+            (OperationKind.TOOL.value, "registry:terminal", "STARTED"),
+            (OperationKind.MODEL.value, _OPENAI_ROUTE, "SUCCEEDED"),
+        ]
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
 def test_campaign_probe_records_real_openai_handoff_before_sdk_entry(tmp_path):
     db, generation = _live_model_lane(tmp_path / "state.db")
     probe = _campaign_probe(TaskFencePolicy(db))
