@@ -37,6 +37,7 @@ _CODEX_ROUTE = "provider:openai.responses.create"
 _COPILOT_ACP_ROUTE = "provider:copilot.acp"
 _GEMINI_ROUTE = "provider:gemini.generateContent"
 _GENERIC_AUXILIARY_ROUTE = "runtime:generic-auxiliary"
+_INTERNAL_RETRIES_ROUTE = "runtime:internal-retries"
 _MOA_ONE_SHOT_ROUTE = "runtime:moa-one-shot"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
 
@@ -3234,9 +3235,15 @@ def test_campaign_masks_tool_policy_at_native_anthropic_aux_stream(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transient_retry",
+    (False, True),
+    ids=("first-success", "transient-retry"),
+)
 async def test_campaign_preserves_tool_authority_at_async_vision_create(
     tmp_path,
     monkeypatch,
+    transient_retry,
 ):
     import json
     import threading
@@ -3281,6 +3288,12 @@ async def test_campaign_preserves_tool_authority_at_async_vision_create(
         for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
         if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
     ) is TaskFenceCapabilityState.UNSUPPORTED
+    if transient_retry:
+        assert next(
+            declaration.state
+            for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+            if declaration.capability_id == _INTERNAL_RETRIES_ROUTE
+        ) is TaskFenceCapabilityState.UNSUPPORTED
 
     policy = TaskFencePolicy(db)
     physical = []
@@ -3335,6 +3348,9 @@ async def test_campaign_preserves_tool_authority_at_async_vision_create(
         ]
     )
 
+    class TransientError(Exception):
+        status_code = 503
+
     class AsyncCompletions:
         async def create(self, **kwargs):
             physical.append(
@@ -3346,6 +3362,8 @@ async def test_campaign_preserves_tool_authority_at_async_vision_create(
                     snapshot(),
                 )
             )
+            if transient_retry and len(physical) == 1:
+                raise TransientError("bounded upstream failure")
             return response
 
     client = SimpleNamespace(
@@ -3383,7 +3401,7 @@ async def test_campaign_preserves_tool_authority_at_async_vision_create(
 
         resolve_client.assert_called_once()
         assert resolve_client.call_args.kwargs["async_mode"] is True
-        assert len(physical) == 1
+        assert len(physical) == (2 if transient_retry else 1)
         (
             request_kwargs,
             edge_envelope,
@@ -3447,6 +3465,18 @@ async def test_campaign_preserves_tool_authority_at_async_vision_create(
                 "STARTED",
             )
         ]
+        for retry_physical in physical[1:]:
+            (
+                retry_kwargs,
+                retry_envelope,
+                retry_policy,
+                _retry_thread_id,
+                retry_snapshot,
+            ) = retry_physical
+            assert retry_kwargs == request_kwargs
+            assert retry_envelope is edge_envelope
+            assert retry_policy is edge_policy
+            assert retry_snapshot == edge_snapshot
 
         result = json.loads(raw_result)
         assert result["success"] is True
