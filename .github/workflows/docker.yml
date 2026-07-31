@@ -458,6 +458,39 @@ jobs:
               dependency_lock_fingerprint: $lock
             }' > "/tmp/tested-artifact/${{ matrix.arch }}.json"
 
+      - name: Run receipt-bound Task Fence shadow campaign
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          RECEIPT_PATH: /tmp/tested-artifact/${{ matrix.arch }}.json
+          REPORT_PATH: /tmp/task-fence-campaign/${{ matrix.arch }}.json
+        run: |
+          set -Eeuo pipefail
+          mkdir --parents /tmp/task-fence-campaign
+          docker run --rm --pull never \
+            --network none \
+            --read-only \
+            --user 10000:10000 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            --tmpfs /opt/data:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=10000,gid=10000 \
+            --mount "type=bind,source=${RECEIPT_PATH},target=/run/task-fence-receipt.json,readonly" \
+            --entrypoint /opt/hermes/.venv/bin/python \
+            "$IMAGE_REF" \
+            -m scripts.task_fence_campaign \
+            --receipt /run/task-fence-receipt.json \
+            > "$REPORT_PATH"
+          test -s "$REPORT_PATH"
+          jq --exit-status --slurp \
+            --slurpfile receipt "$RECEIPT_PATH" '
+              length == 1 and
+              .[0].schema == "hermes.task-fence.campaign-report/v1" and
+              .[0].execution_complete == true and
+              .[0].cohort_complete == false and
+              .[0].artifact_binding.in_image_commit_lock_platform_verified == true and
+              .[0].receipt == $receipt[0]
+            ' "$REPORT_PATH" > /dev/null
+
       - name: Upload tested artifact receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -465,6 +498,24 @@ jobs:
           path: /tmp/tested-artifact/${{ matrix.arch }}.json
           if-no-files-found: error
           retention-days: 90
+
+      - name: Upload Task Fence campaign report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: task-fence-campaign-${{ matrix.arch }}
+          path: /tmp/task-fence-campaign/${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Gate Task Fence campaign conformance
+        env:
+          REPORT_PATH: /tmp/task-fence-campaign/${{ matrix.arch }}.json
+        run: |
+          set -Eeuo pipefail
+          jq --exit-status --slurp '
+            length == 1 and
+            .[0].scenario_contracts_match == true
+          ' "$REPORT_PATH" > /dev/null
 
   # ---------------------------------------------------------------------------
   # The maintained fork has no mutable release image tag. Its release event

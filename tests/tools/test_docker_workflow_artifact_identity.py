@@ -379,6 +379,130 @@ def test_private_ghcr_credentials_end_before_exact_tests() -> None:
     assert receipt["run"] == upstream_receipt["run"]
 
 
+def test_fork_campaign_is_receipt_bound_isolated_and_separately_retained() -> None:
+    steps = _fork_publish_steps()
+    exact_test = _fork_step_where(
+        lambda step: "HERMES_TEST_IMAGE" in step.get("env", {})
+    )
+    receipt_export = _fork_step_where(
+        lambda step: "ARTIFACT_DIGEST" in step.get("env", {})
+    )
+    campaign = _fork_step_where(
+        lambda step: step.get("name")
+        == "Run receipt-bound Task Fence shadow campaign"
+    )
+    receipt_upload = _fork_step_where(
+        lambda step: step.get("with", {}).get("name")
+        == "tested-artifact-${{ matrix.arch }}"
+    )
+    report_upload = _fork_step_where(
+        lambda step: step.get("with", {}).get("name")
+        == "task-fence-campaign-${{ matrix.arch }}"
+    )
+    conformance_gate = _fork_step_where(
+        lambda step: step.get("name")
+        == "Gate Task Fence campaign conformance"
+    )
+
+    assert steps.index(exact_test) < steps.index(receipt_export)
+    assert steps.index(receipt_export) < steps.index(campaign)
+    assert steps.index(campaign) < steps.index(receipt_upload)
+    assert steps.index(receipt_upload) < steps.index(report_upload)
+    assert steps.index(report_upload) < steps.index(conformance_gate)
+
+    immutable_ref = "${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+    assert campaign["env"] == {
+        "IMAGE_REF": immutable_ref,
+        "RECEIPT_PATH": "/tmp/tested-artifact/${{ matrix.arch }}.json",
+        "REPORT_PATH": "/tmp/task-fence-campaign/${{ matrix.arch }}.json",
+    }
+    script = campaign["run"]
+    for fragment in (
+        "set -Eeuo pipefail",
+        "docker run --rm --pull never",
+        "--network none",
+        "--read-only",
+        "--user 10000:10000",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m",
+        (
+            "--tmpfs /opt/data:rw,noexec,nosuid,nodev,size=32m,"
+            "mode=0700,uid=10000,gid=10000"
+        ),
+        "source=${RECEIPT_PATH}",
+        "target=/run/task-fence-receipt.json,readonly",
+        "--entrypoint /opt/hermes/.venv/bin/python",
+        '"$IMAGE_REF"',
+        "-m scripts.task_fence_campaign",
+        "--receipt /run/task-fence-receipt.json",
+        '> "$REPORT_PATH"',
+        'test -s "$REPORT_PATH"',
+        "jq --exit-status --slurp",
+        '--slurpfile receipt "$RECEIPT_PATH"',
+        ".[0].schema == \"hermes.task-fence.campaign-report/v1\"",
+        ".[0].execution_complete == true",
+        ".[0].cohort_complete == false",
+        (
+            ".[0].artifact_binding."
+            "in_image_commit_lock_platform_verified == true"
+        ),
+        ".[0].receipt == $receipt[0]",
+    ):
+        assert fragment in script
+
+    campaign_text = json.dumps(campaign, sort_keys=True)
+    assert "github.token" not in campaign_text
+    assert "secrets." not in campaign_text
+    assert "API_KEY" not in campaign_text
+    assert "TOKEN" not in campaign_text
+
+    uploads = [
+        step
+        for step in steps
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
+    upload_names = [step.get("with", {}).get("name") for step in uploads]
+    assert upload_names.count("tested-artifact-${{ matrix.arch }}") == 1
+    assert upload_names.count("task-fence-campaign-${{ matrix.arch }}") == 1
+    assert report_upload["with"] == {
+        "name": "task-fence-campaign-${{ matrix.arch }}",
+        "path": "/tmp/task-fence-campaign/${{ matrix.arch }}.json",
+        "if-no-files-found": "error",
+        "retention-days": 90,
+    }
+    assert "tested-artifact" not in report_upload["with"]["name"]
+    assert "tested-artifact" not in report_upload["with"]["path"]
+    assert conformance_gate["env"] == {
+        "REPORT_PATH": "/tmp/task-fence-campaign/${{ matrix.arch }}.json"
+    }
+    gate_script = conformance_gate["run"]
+    assert "set -Eeuo pipefail" in gate_script
+    assert "jq --exit-status --slurp" in gate_script
+    assert "length == 1" in gate_script
+    assert ".[0].scenario_contracts_match == true" in gate_script
+    assert '"$REPORT_PATH"' in gate_script
+    assert "github.token" not in json.dumps(conformance_gate, sort_keys=True)
+    assert "secrets." not in json.dumps(conformance_gate, sort_keys=True)
+
+    syntax = subprocess.run(
+        ["bash", "-n"],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    gate_syntax = subprocess.run(
+        ["bash", "-n"],
+        input=gate_script,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert gate_syntax.returncode == 0, gate_syntax.stderr
+
+
 def test_release_receipts_are_tag_bound_and_set_once() -> None:
     workflow = _workflow()
     archive = workflow["jobs"]["archive-release-receipts"]

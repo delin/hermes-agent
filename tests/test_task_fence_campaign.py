@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, asdict, dataclass
+from dataclasses import FrozenInstanceError, asdict
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -10,11 +10,16 @@ from agent.task_fence_provider import (
     _finish_task_fence_openai_chat_completion,
 )
 from hermes_state import SessionDB
+from scripts.task_fence_campaign import (
+    CampaignDecisionRecord as _CampaignDecisionRecord,
+    CampaignPolicyProbe as _CampaignPolicyProbe,
+    CampaignRecordOverflow as _CampaignRecordOverflow,
+    MAX_CAMPAIGN_DECISION_RECORDS as _MAX_CAMPAIGN_DECISION_RECORDS,
+)
 from task_fence import (
     CausalEnvelope,
     DecisionOutcome,
     DecisionReason,
-    DispatchDecision,
     IngressEnvelope,
     OperationDescriptor,
     OperationKind,
@@ -28,7 +33,6 @@ from task_fence import (
 )
 
 
-_MAX_CAMPAIGN_DECISION_RECORDS = 64
 _ANTHROPIC_CREATE_ROUTE = "provider:anthropic.messages.create"
 _ANTHROPIC_STREAM_ROUTE = "provider:anthropic.messages.stream"
 _BEDROCK_ANTHROPIC_ROUTE = "provider:bedrock.anthropic_messages"
@@ -40,130 +44,6 @@ _GENERIC_AUXILIARY_ROUTE = "runtime:generic-auxiliary"
 _INTERNAL_RETRIES_ROUTE = "runtime:internal-retries"
 _MOA_ONE_SHOT_ROUTE = "runtime:moa-one-shot"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
-
-
-@dataclass(frozen=True)
-class _CampaignDecisionRecord:
-    route_id: str
-    decision_point: str
-    outcome: str
-    reason_code: str
-    invocation_id: str
-    task_id: str | None
-    generation_id: str | None
-    decision_id: str | None
-
-
-class _CampaignRecordOverflow(RuntimeError):
-    pass
-
-
-class _CampaignPolicyProbe:
-    """Test-only bounded projection of real policy facade returns."""
-
-    def __init__(
-        self,
-        policy: TaskFencePolicy,
-        *,
-        route_id: str,
-    ):
-        if not isinstance(policy, TaskFencePolicy):
-            raise TypeError("invalid_campaign_policy")
-        declaration = next(
-            (
-                candidate
-                for candidate in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
-                if candidate.capability_id == route_id
-            ),
-            None,
-        )
-        if (
-            declaration is None
-            or declaration.state is not TaskFenceCapabilityState.SUPPORTED
-        ):
-            raise ValueError("unsupported_campaign_route")
-        self._policy = policy
-        self._route_id = route_id
-        self._records: list[_CampaignDecisionRecord] = []
-        self._failure_reason: str | None = None
-
-    @property
-    def records(self) -> tuple[_CampaignDecisionRecord, ...]:
-        return tuple(self._records)
-
-    def assert_complete(self) -> None:
-        if self._failure_reason == "campaign_record_limit":
-            raise _CampaignRecordOverflow(self._failure_reason)
-        if self._failure_reason is not None:
-            raise ValueError(self._failure_reason)
-
-    def _append(
-        self,
-        *,
-        decision_point: str,
-        envelope: CausalEnvelope | None,
-        operation: OperationDescriptor,
-        decision: DispatchDecision,
-    ) -> None:
-        if self._failure_reason is not None:
-            return
-        if operation.adapter != self._route_id:
-            self._failure_reason = "campaign_route_adapter_mismatch"
-            return
-        if len(self._records) >= _MAX_CAMPAIGN_DECISION_RECORDS:
-            self._failure_reason = "campaign_record_limit"
-            return
-        self._records.append(
-            _CampaignDecisionRecord(
-                route_id=self._route_id,
-                decision_point=decision_point,
-                outcome=decision.outcome.value,
-                reason_code=decision.reason.value,
-                invocation_id=operation.invocation_id,
-                task_id=None if envelope is None else envelope.task_id,
-                generation_id=(
-                    None if envelope is None else envelope.generation_id
-                ),
-                decision_id=decision.decision_id,
-            )
-        )
-
-    def admit_operation(
-        self,
-        envelope: CausalEnvelope | None,
-        operation: OperationDescriptor,
-    ) -> DispatchDecision:
-        decision = self._policy.admit_operation(envelope, operation)
-        self._append(
-            decision_point="admission",
-            envelope=envelope,
-            operation=operation,
-            decision=decision,
-        )
-        return decision
-
-    def authorize_and_start(
-        self,
-        envelope: CausalEnvelope | None,
-        operation: OperationDescriptor,
-        permit_id: str,
-    ) -> DispatchDecision:
-        decision = self._policy.authorize_and_start(
-            envelope,
-            operation,
-            permit_id,
-        )
-        self._append(
-            decision_point="authorization",
-            envelope=envelope,
-            operation=operation,
-            decision=decision,
-        )
-        return decision
-
-    def finish_attempt(self, *args, **kwargs) -> None:
-        self._policy.finish_attempt(*args, **kwargs)
-
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
