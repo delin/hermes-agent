@@ -2555,7 +2555,8 @@ def test_campaign_excludes_sync_xai_tts_tags_at_real_tool_handoff(
         def raise_for_status():
             return None
 
-    def xai_post(url, headers, json, timeout):
+    def xai_post(url, *, headers, json, timeout, stream):
+        assert stream is True
         xai_posts.append(
             (
                 url,
@@ -2965,7 +2966,8 @@ def test_campaign_masks_tool_policy_at_native_anthropic_aux_stream(
         def raise_for_status():
             return None
 
-    def xai_post(url, headers, json, timeout):
+    def xai_post(url, *, headers, json, timeout, stream):
+        assert stream is True
         xai_posts.append(
             (
                 url,

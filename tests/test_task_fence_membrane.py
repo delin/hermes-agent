@@ -34,6 +34,12 @@ def _context_carries_task_fence_authority() -> bool:
     )
 
 
+def _allowing_tool_guardrails():
+    return SimpleNamespace(
+        before_call=lambda _name, _args: SimpleNamespace(allows_execution=True)
+    )
+
+
 def _ingress(
     action: str,
     source_event_id: str,
@@ -2665,6 +2671,7 @@ def test_inline_handoff_barrier_race_is_shadow_only(tmp_path):
         session_id="inline-session",
         _current_turn_id="turn-inline",
         _current_api_request_id="request-inline",
+        _tool_guardrails=_allowing_tool_guardrails(),
     )
     try:
         with (
@@ -2678,8 +2685,9 @@ def test_inline_handoff_barrier_race_is_shadow_only(tmp_path):
                 "hermes_cli.middleware.run_tool_execution_middleware",
                 side_effect=call_next,
             ),
+            patch("agent.tool_executor._begin_tool_execution") as begin_execution,
         ):
-            result, observed_args = _run_agent_tool_execution_middleware(
+            outcome = _run_agent_tool_execution_middleware(
                 agent,
                 function_name="todo",
                 function_args={"value": 1},
@@ -2689,8 +2697,9 @@ def test_inline_handoff_barrier_race_is_shadow_only(tmp_path):
                 execute=execute,
             )
 
-        assert result == "legacy-inline-result"
-        assert observed_args == {"value": 1}
+        assert outcome.result == "legacy-inline-result"
+        assert outcome.args == {"value": 1}
+        begin_execution.assert_called_once()
         assert len(calls) == 1
         args, envelope = calls[0]
         assert args == {"value": 1}
@@ -2731,6 +2740,7 @@ def test_inline_execution_middleware_short_circuit_creates_no_attempt(tmp_path):
         session_id="inline-session",
         _current_turn_id="turn-inline",
         _current_api_request_id="request-inline",
+        _tool_guardrails=_allowing_tool_guardrails(),
     )
     try:
         with (
@@ -2739,8 +2749,9 @@ def test_inline_execution_middleware_short_circuit_creates_no_attempt(tmp_path):
                 "hermes_cli.middleware.run_tool_execution_middleware",
                 return_value="managed-inline-result",
             ),
+            patch("agent.tool_executor._begin_tool_execution") as begin_execution,
         ):
-            result, observed_args = _run_agent_tool_execution_middleware(
+            outcome = _run_agent_tool_execution_middleware(
                 agent,
                 function_name="todo",
                 function_args={"value": 2},
@@ -2752,8 +2763,9 @@ def test_inline_execution_middleware_short_circuit_creates_no_attempt(tmp_path):
                 execute=lambda args: calls.append(dict(args)),
             )
 
-        assert result == "managed-inline-result"
-        assert observed_args == {"value": 2}
+        assert outcome.result == "managed-inline-result"
+        assert outcome.args == {"value": 2}
+        begin_execution.assert_not_called()
         assert calls == []
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_policy_decisions"
@@ -2785,6 +2797,7 @@ def test_middleware_registry_detour_and_inline_next_are_siblings(tmp_path):
         session_id="inline-session",
         _current_turn_id="turn-inline",
         _current_api_request_id="request-inline",
+        _tool_guardrails=_allowing_tool_guardrails(),
     )
     try:
         with (
@@ -2797,8 +2810,9 @@ def test_middleware_registry_detour_and_inline_next_are_siblings(tmp_path):
                 "hermes_cli.middleware.run_tool_execution_middleware",
                 side_effect=middleware_detour,
             ),
+            patch("agent.tool_executor._begin_tool_execution") as begin_execution,
         ):
-            result, _ = _run_agent_tool_execution_middleware(
+            outcome = _run_agent_tool_execution_middleware(
                 agent,
                 function_name="todo",
                 function_args={},
@@ -2808,7 +2822,8 @@ def test_middleware_registry_detour_and_inline_next_are_siblings(tmp_path):
                 execute=lambda _args: capture("inline"),
             )
 
-        assert result == "inline"
+        assert outcome.result == "inline"
+        begin_execution.assert_called_once()
         assert {label for label, _envelope in envelopes} == {
             "registry",
             "inline",

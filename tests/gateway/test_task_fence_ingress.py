@@ -1115,13 +1115,12 @@ async def test_pending_uncorrelated_prompt_is_excluded_once(
     )
     db = AsyncMock()
     runner = _runner(db)
-    runner._update_prompt_pending = {
-        _session_key(): pending_kind == "update"
-    }
+    update_state = runner._session_state(_session_key()).persistent
+    update_state.update_prompt_pending = pending_kind == "update"
     event = _event("yes", "1700000000.000048")
 
     await runner._accept_task_fence_gateway_ingress(event, _session_key())
-    runner._update_prompt_pending.clear()
+    update_state.update_prompt_pending = False
     await runner._accept_task_fence_gateway_ingress(event, _session_key())
 
     assert event.task_fence_acceptance_attempted is True
@@ -1209,7 +1208,7 @@ async def test_session_closing_command_commits_before_adapter_dispatch(
     runner = _runner(AsyncSessionDB(task_fence_db))
     initial = _event("initial", "1700000000.000050")
     await runner._accept_task_fence_gateway_ingress(initial, _session_key())
-    runner._update_prompt_pending = {_session_key(): True}
+    runner._session_state(_session_key()).persistent.update_prompt_pending = True
 
     adapter = _ShadowSlackAdapter(task_fence_db)
     adapter.set_task_fence_ingress_handler(

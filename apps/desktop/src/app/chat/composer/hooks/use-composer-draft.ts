@@ -1,7 +1,8 @@
-import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
+import { useAui, useAuiState } from '@assistant-ui/react'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
+import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { type ComposerAttachment, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { isBrowsingHistory } from '@/store/composer-input-history'
 
@@ -17,10 +18,17 @@ import {
   markActiveComposer,
   onComposerFocusRequest,
   onComposerInsertRefsRequest,
-  onComposerInsertRequest
+  onComposerInsertRequest,
+  releaseActiveComposer
 } from '../focus'
 import { type InlineRefInput, insertInlineRefsIntoEditor } from '../inline-refs'
-import { composerPlainText, placeCaretEnd, REF_RE, renderComposerContents } from '../rich-editor'
+import {
+  composerPlainText,
+  normalizeComposerEditorDom,
+  placeCaretEnd,
+  REF_RE,
+  renderComposerContents
+} from '../rich-editor'
 import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
@@ -50,7 +58,6 @@ export function useComposerDraft({
   sessionId
 }: UseComposerDraftArgs) {
   const aui = useAui()
-  const composerRuntime = useComposerRuntime()
   // Which composer this is on the focus bus + which attachment set it owns.
   const { attachments: attachmentScope, target } = useComposerScope()
 
@@ -71,7 +78,7 @@ export function useComposerDraft({
   const setComposerText = useCallback(
     (value: string) => {
       try {
-        aui.composer().setText(value)
+        aui.composer.setText(value)
       } catch {
         // Composer core not bound yet — DOM/draftRef carry the text.
       }
@@ -120,7 +127,7 @@ export function useComposerDraft({
       const editor = editorRef.current
 
       if (editor) {
-        renderComposerContents(editor, next)
+        renderComposerContents(editor, next, { trailingCommitted: true })
         placeCaretEnd(editor)
       }
 
@@ -152,6 +159,15 @@ export function useComposerDraft({
       focusInput()
     }
   }, [focusInput, focusKey, focusRequestId, inputDisabled])
+
+  // The mirror of the `markActiveComposer` above: give the key back when this
+  // composer goes away (a session tile closing, a pane unmounting). Covers both
+  // claim sites for this composer — `focusInput` here and ChatBar's `onFocus` —
+  // since they mark the same scope target. Without it `'active'` keeps
+  // resolving to a dead tile and every routed focus/insert request is dropped.
+  // (Heal-to-visible in focus.ts covers the keep-alive-tab case where the pane
+  // stays mounted behind the front tab; this covers true unmounts.)
+  useEffect(() => () => releaseActiveComposer(target), [target])
 
   useEffect(() => {
     if (inputDisabled) {
@@ -227,7 +243,13 @@ export function useComposerDraft({
       return draftRef.current
     }
 
-    const text = composerPlainText(editor)
+    // Same normalize-then-sanitize the rAF flush does. An emptied editor still
+    // holds the placeholder <br> that keeps the contenteditable from collapsing
+    // to a sliver, and that serializes as "\n" — so an editor the user just
+    // cleared would otherwise stash a one-newline draft and come back non-empty.
+    normalizeComposerEditorDom(editor)
+
+    const text = sanitizeComposerInput(composerPlainText(editor))
 
     if (text !== draftRef.current) {
       draftRef.current = text
@@ -249,13 +271,13 @@ export function useComposerDraft({
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     const sync = () => {
-      const text = composerRuntime.getState().text
+      const text = aui.composer.getState().text
       draftRef.current = text
 
       const editor = editorRef.current
 
       if (editor && document.activeElement !== editor && composerPlainText(editor) !== text) {
-        renderComposerContents(editor, text)
+        renderComposerContents(editor, text, { trailingCommitted: true })
       }
 
       if (isBrowsingHistory(sessionIdRef.current) || queueEditRef.current) {
@@ -281,13 +303,13 @@ export function useComposerDraft({
       }, DRAFT_PERSIST_DEBOUNCE_MS)
     }
 
-    const unsubscribe = composerRuntime.subscribe(sync)
+    const unsubscribe = aui.subscribe(sync)
 
     return () => {
       unsubscribe()
       window.clearTimeout(draftPersistTimerRef.current)
     }
-  }, [composerRuntime, queueEditRef])
+  }, [aui, queueEditRef])
 
   const insertText = (text: string) => {
     const base = draftRef.current

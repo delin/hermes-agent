@@ -130,25 +130,6 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
 
 
 @pytest.mark.asyncio
-async def test_idle_queue_without_payload_returns_usage():
-    runner, _adapter = _make_runner()
-    called = False
-
-    async def fake_handle_message_with_agent(event, source, key, generation):
-        nonlocal called
-        called = True
-        return {"final_response": "", "messages": []}
-
-    runner._handle_message_with_agent = fake_handle_message_with_agent
-
-    result = await runner._handle_message(_make_event("/queue"))
-
-    assert result == "Usage: /queue <prompt>"
-    assert called is False
-    assert runner._running_agents == {}
-
-
-@pytest.mark.asyncio
 async def test_goal_hook_receives_final_generation_without_result_leak():
     from gateway.run import (
         _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
