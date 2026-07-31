@@ -28,6 +28,7 @@ _MAX_IDENTIFIER_BYTES = 512
 _MAX_OPAQUE_REFERENCE_BYTES = 2_048
 _MAX_CORRELATION_IDS = 64
 _MAX_EVIDENCE_REFS = 32
+_MAX_CAPABILITY_DECLARATIONS = 64
 _MAX_CAUSAL_ENVELOPE_BYTES = 16_384
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -36,6 +37,7 @@ _SHA256_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 
 TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
+TASK_FENCE_CAPABILITY_VERSION = "task-fence-capability-v1"
 TASK_FENCE_FINAL_GENERATION_KEY = "_task_fence_final_generation"
 TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER = (
     "runtime:process_checkpoint_recovery_pending"
@@ -124,6 +126,16 @@ class DecisionReason(str, Enum):
     PERMIT_OPERATION_MISMATCH = "permit_operation_mismatch"
     PERMIT_GENERATION_MISMATCH = "permit_generation_mismatch"
     PERMIT_RUNTIME_EPOCH_MISMATCH = "permit_runtime_epoch_mismatch"
+
+
+class TaskFenceCapabilityKind(str, Enum):
+    ADAPTER = "adapter"
+    RUNTIME = "runtime"
+
+
+class TaskFenceCapabilityState(str, Enum):
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
 
 
 class AttemptTerminal(str, Enum):
@@ -329,6 +341,14 @@ class TaskFenceArtifactUnavailable(RuntimeError):
         super().__init__(reason)
 
 
+class TaskFenceCapabilityUnavailable(RuntimeError):
+    """Selected-cohort declarations could not use the durable control store."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 @dataclass(frozen=True)
 class TaskFenceArtifactIdentity:
     """Canonical caller-supplied identity claim for one OCI platform artifact.
@@ -471,6 +491,128 @@ def _bounded_text(
         raise TaskFenceProtocolRejected(f"invalid_{field}") from exc
     if len(encoded) > max_bytes:
         raise TaskFenceProtocolRejected(f"{field}_too_large")
+
+
+@dataclass(frozen=True)
+class TaskFenceCapabilityDeclaration:
+    """One closed, secret-free route declaration for the selected audit cohort.
+
+    Supported records inventory intent for the shadow campaign. It is not
+    proof of liveness, conformance, authorization, or enforcement.
+    """
+
+    kind: TaskFenceCapabilityKind
+    capability_id: str
+    capability_version: str
+    state: TaskFenceCapabilityState
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, TaskFenceCapabilityKind):
+            raise TaskFenceProtocolRejected("invalid_capability_kind")
+        if not isinstance(self.state, TaskFenceCapabilityState):
+            raise TaskFenceProtocolRejected("invalid_capability_state")
+        for field in ("capability_id", "capability_version"):
+            _bounded_text(
+                getattr(self, field),
+                field=field,
+                max_bytes=_MAX_IDENTIFIER_BYTES,
+            )
+
+
+@dataclass(frozen=True)
+class TaskFenceCapabilityMaterialization:
+    """Atomic create-or-exact-replay result for the selected cohort inventory."""
+
+    declarations: tuple[TaskFenceCapabilityDeclaration, ...]
+    created: bool
+
+
+def _capability_declaration(
+    kind: TaskFenceCapabilityKind,
+    capability_id: str,
+    state: TaskFenceCapabilityState,
+) -> TaskFenceCapabilityDeclaration:
+    return TaskFenceCapabilityDeclaration(
+        kind=kind,
+        capability_id=capability_id,
+        capability_version=TASK_FENCE_CAPABILITY_VERSION,
+        state=state,
+    )
+
+
+def _canonical_capability_declarations(
+    declarations: tuple[TaskFenceCapabilityDeclaration, ...],
+) -> tuple[TaskFenceCapabilityDeclaration, ...]:
+    if not declarations or len(declarations) > _MAX_CAPABILITY_DECLARATIONS:
+        raise TaskFenceProtocolRejected("invalid_capability_declarations")
+    keys = tuple(
+        (item.kind.value, item.capability_id, item.capability_version)
+        for item in declarations
+    )
+    if len(set(keys)) != len(keys):
+        raise TaskFenceProtocolRejected("duplicate_capability_declaration")
+    if len({item.capability_id for item in declarations}) != len(declarations):
+        raise TaskFenceProtocolRejected("duplicate_capability_id")
+    return tuple(
+        sorted(
+            declarations,
+            key=lambda item: (
+                item.kind.value,
+                item.capability_id,
+                item.capability_version,
+            ),
+        )
+    )
+
+
+_SUPPORTED = TaskFenceCapabilityState.SUPPORTED
+_UNSUPPORTED = TaskFenceCapabilityState.UNSUPPORTED
+_ADAPTER = TaskFenceCapabilityKind.ADAPTER
+_RUNTIME = TaskFenceCapabilityKind.RUNTIME
+
+_SELECTED_COHORT_CAPABILITY_DEFINITIONS = (
+    (_ADAPTER, "gateway:slack:typed_ingress", _SUPPORTED),
+    (_ADAPTER, "gateway:slack:other_ingress", _UNSUPPORTED),
+    (_ADAPTER, "provider:openai.chat.completions.create", _SUPPORTED),
+    (_ADAPTER, "provider:gemini.generateContent", _SUPPORTED),
+    (_ADAPTER, "provider:gemini.streamGenerateContent", _SUPPORTED),
+    (_ADAPTER, "provider:anthropic.messages.create", _SUPPORTED),
+    (_ADAPTER, "provider:anthropic.messages.stream", _SUPPORTED),
+    (_ADAPTER, "provider:openai.responses.create", _SUPPORTED),
+    (_ADAPTER, "provider:bedrock.converse", _SUPPORTED),
+    (_ADAPTER, "provider:bedrock.converse_stream", _SUPPORTED),
+    (_ADAPTER, "provider:bedrock.anthropic_messages", _UNSUPPORTED),
+    (_ADAPTER, "provider:codex.app_server", _UNSUPPORTED),
+    (_ADAPTER, "provider:copilot.acp", _UNSUPPORTED),
+    (_ADAPTER, "provider:moa.virtual", _UNSUPPORTED),
+    (_ADAPTER, "gateway:slack:chat_post_message", _SUPPORTED),
+    (_ADAPTER, "gateway:slack:other_delivery", _UNSUPPORTED),
+    (_RUNTIME, "runtime:registered-tool-handoff", _SUPPORTED),
+    (_RUNTIME, "runtime:inline-tool-handoff", _SUPPORTED),
+    (_RUNTIME, "runtime:execute-code-rpc-descendant", _SUPPORTED),
+    (_RUNTIME, "runtime:non-json-tool-extension", _UNSUPPORTED),
+    (_RUNTIME, "runtime:iteration-summary:owned-wires", _SUPPORTED),
+    (_RUNTIME, "runtime:iteration-summary:bedrock", _UNSUPPORTED),
+    (_RUNTIME, "runtime:persistent-moa-acting", _SUPPORTED),
+    (_RUNTIME, "runtime:moa-advisor", _UNSUPPORTED),
+    (_RUNTIME, "runtime:moa-one-shot", _UNSUPPORTED),
+    (_RUNTIME, "runtime:generic-auxiliary", _UNSUPPORTED),
+    (_RUNTIME, "runtime:delegated-child-launch", _SUPPORTED),
+    (_RUNTIME, "runtime:delegation-completion", _SUPPORTED),
+    (_RUNTIME, "runtime:process-completion", _SUPPORTED),
+    (_RUNTIME, "runtime:goal-continuation", _SUPPORTED),
+    (_RUNTIME, "runtime:wake-continuation", _SUPPORTED),
+    (_RUNTIME, "runtime:foreground-terminal-retry", _SUPPORTED),
+    (_RUNTIME, "runtime:internal-retries", _UNSUPPORTED),
+    (_RUNTIME, "runtime:kanban-background-continuation", _UNSUPPORTED),
+)
+
+TASK_FENCE_SELECTED_COHORT_CAPABILITIES = _canonical_capability_declarations(
+    tuple(
+        _capability_declaration(kind, capability_id, state)
+        for kind, capability_id, state in _SELECTED_COHORT_CAPABILITY_DEFINITIONS
+    )
+)
 
 
 def _canonical_refs(

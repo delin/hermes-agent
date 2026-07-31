@@ -54,6 +54,7 @@ from task_fence import (
     TASK_FENCE_ACTIONS,
     TASK_FENCE_POLICY_VERSION,
     TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
+    TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
     TASK_FENCE_STORE_SCHEMA_VERSION,
     CorrelationKind,
     ExecutionEffect,
@@ -67,6 +68,9 @@ from task_fence import (
     TaskFenceArtifactIdentity,
     TaskFenceArtifactPin,
     TaskFenceArtifactUnavailable,
+    TaskFenceCapabilityDeclaration,
+    TaskFenceCapabilityMaterialization,
+    TaskFenceCapabilityUnavailable,
     TaskFenceIngressSidecar,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
@@ -348,6 +352,7 @@ _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS = 64
 _TASK_FENCE_MAX_RECOVERY_EVIDENCE_REFS = 32
 _TASK_FENCE_MAX_PROCESS_CHECKPOINT_OPERATIONS = 64
 _TASK_FENCE_MAX_INSPECTION_ITEMS = 64
+_TASK_FENCE_MAX_CAPABILITY_DECLARATIONS = 64
 _TASK_FENCE_MAX_TERMINAL_OPEN_INCIDENTS = 64
 _TASK_FENCE_MAX_CURRENT_GENERATION_RESERVED_PERMITS = 64
 _TASK_FENCE_MAX_INSPECTION_WORK = 8_192
@@ -510,6 +515,16 @@ class TaskFenceArtifactInspection:
     verified: bool
     reason: str
     tested_identity: Optional[TaskFenceArtifactIdentity]
+
+
+@dataclass(frozen=True)
+class TaskFenceCapabilityInspection:
+    """Exact selected-cohort route declarations from one read snapshot."""
+
+    store: TaskFenceStoreInspection
+    verified: bool
+    reason: str
+    declarations: Tuple[TaskFenceCapabilityDeclaration, ...]
 
 
 @dataclass(frozen=True)
@@ -6309,6 +6324,261 @@ class SessionDB:
             raise
         except sqlite3.DatabaseError:
             raise TaskFenceArtifactUnavailable("artifact_database_error") from None
+
+    @staticmethod
+    def _task_fence_selected_cohort_reason_unlocked(
+        conn: sqlite3.Connection,
+        store: TaskFenceStoreInspection,
+    ) -> str:
+        rows = conn.execute(
+            "SELECT mode, mode_generation, activation_state, audit_degraded "
+            "FROM main.task_fence_cohorts WHERE cohort_key = ? LIMIT 2",
+            (_TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        ).fetchall()
+        if not rows:
+            orphan = conn.execute(
+                "SELECT 1 FROM main.task_fence_cohort_capabilities "
+                "WHERE cohort_key = ? LIMIT 1",
+                (_TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+            ).fetchone()
+            if orphan is not None:
+                return "capability_declaration_conflict"
+            return "capabilities_not_materialized"
+        if len(rows) != 1:
+            return "malformed_capability_projection"
+        row = rows[0]
+        if (
+            not isinstance(row["mode"], str)
+            or type(row["mode_generation"]) is not int
+            or not isinstance(row["activation_state"], str)
+            or type(row["audit_degraded"]) is not int
+            or row["audit_degraded"] not in (0, 1)
+        ):
+            return "malformed_capability_projection"
+        if (
+            store.ever_enforced is not False
+            or row["mode"] != "audit"
+            or row["activation_state"] != "inactive"
+        ):
+            return "implicit_cohort_mismatch"
+        if row["mode_generation"] != store.mode_generation:
+            return "cohort_generation_mismatch"
+        return "verified"
+
+    @staticmethod
+    def _task_fence_selected_capability_projection_unlocked(
+        conn: sqlite3.Connection,
+    ) -> Tuple[str, Tuple[TaskFenceCapabilityDeclaration, ...]]:
+        rows = conn.execute(
+            "SELECT 1 FROM main.task_fence_cohort_capabilities "
+            "WHERE cohort_key = ? LIMIT ?",
+            (
+                _TASK_FENCE_IMPLICIT_AUDIT_COHORT,
+                _TASK_FENCE_MAX_CAPABILITY_DECLARATIONS + 1,
+            ),
+        ).fetchall()
+        if not rows:
+            return "capabilities_not_materialized", ()
+        if len(rows) > _TASK_FENCE_MAX_CAPABILITY_DECLARATIONS:
+            return "capability_declaration_limit_exceeded", ()
+        if len(rows) != len(TASK_FENCE_SELECTED_COHORT_CAPABILITIES):
+            return "capability_declaration_conflict", ()
+
+        declared_at = None
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES:
+            matches = conn.execute(
+                "SELECT CASE WHEN declaration_state = ? THEN 1 ELSE 0 END "
+                "AS state_matches, "
+                "CASE WHEN typeof(declared_at) IN ('integer', 'real') "
+                "THEN declared_at ELSE NULL END AS declared_at "
+                "FROM main.task_fence_cohort_capabilities "
+                "WHERE cohort_key = ? AND capability_kind = ? "
+                "AND capability_id = ? AND capability_version = ? LIMIT 2",
+                (
+                    declaration.state.value,
+                    _TASK_FENCE_IMPLICIT_AUDIT_COHORT,
+                    declaration.kind.value,
+                    declaration.capability_id,
+                    declaration.capability_version,
+                ),
+            ).fetchall()
+            if len(matches) != 1 or matches[0]["state_matches"] != 1:
+                return "capability_declaration_conflict", ()
+            timestamp = matches[0]["declared_at"]
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(float(timestamp))
+                or timestamp < 0
+            ):
+                return "malformed_capability_projection", ()
+            if declared_at is None:
+                declared_at = timestamp
+            elif timestamp != declared_at:
+                return "malformed_capability_projection", ()
+        return "verified", TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+
+    def inspect_task_fence_selected_cohort_capabilities(
+        self,
+    ) -> TaskFenceCapabilityInspection:
+        """Inspect one exact selected-cohort declaration set without repair."""
+
+        try:
+            with self._lock:
+                if self._conn is None:
+                    raise sqlite3.ProgrammingError("SessionDB is closed")
+                owned_snapshot = self._begin_task_fence_read_snapshot_unlocked()
+                try:
+                    store = self._inspect_task_fence_store_unlocked(
+                        include_counts=False
+                    )
+                    if not store.compatible:
+                        return TaskFenceCapabilityInspection(
+                            store,
+                            False,
+                            store.reason,
+                            (),
+                        )
+                    reason = self._task_fence_selected_cohort_reason_unlocked(
+                        self._conn,
+                        store,
+                    )
+                    if reason != "verified":
+                        return TaskFenceCapabilityInspection(
+                            store,
+                            False,
+                            reason,
+                            (),
+                        )
+                    reason, declarations = (
+                        self._task_fence_selected_capability_projection_unlocked(
+                            self._conn
+                        )
+                    )
+                    return TaskFenceCapabilityInspection(
+                        store,
+                        reason == "verified",
+                        reason,
+                        declarations,
+                    )
+                finally:
+                    self._end_task_fence_read_snapshot_unlocked(owned_snapshot)
+        except Exception as exc:
+            logger.debug("Task Fence capability inspection failed: %s", exc)
+            reason = _task_fence_inspection_failure_reason(exc)
+            return TaskFenceCapabilityInspection(
+                _failed_task_fence_store_inspection(reason),
+                False,
+                reason,
+                (),
+            )
+
+    def materialize_task_fence_selected_cohort_capabilities(
+        self,
+        *,
+        expected_runtime_epoch: int,
+        expected_mode_generation: int,
+    ) -> TaskFenceCapabilityMaterialization:
+        """Atomically create or exactly replay the closed selected-cohort set."""
+
+        if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
+        if type(expected_mode_generation) is not int or expected_mode_generation < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_mode_generation")
+        if self.read_only or self._conn is None:
+            raise TaskFenceCapabilityUnavailable("store_unavailable")
+
+        def _materialize(
+            conn: sqlite3.Connection,
+        ) -> TaskFenceCapabilityMaterialization:
+            store = self._inspect_task_fence_store_unlocked(include_counts=False)
+            if not store.compatible:
+                raise TaskFenceCapabilityUnavailable(store.reason)
+            if store.runtime_epoch != expected_runtime_epoch:
+                raise TaskFenceCapabilityUnavailable("runtime_epoch_changed")
+            if store.mode_generation != expected_mode_generation:
+                raise TaskFenceCapabilityUnavailable("mode_generation_changed")
+            if store.ever_enforced is not False:
+                raise TaskFenceCapabilityUnavailable(
+                    "capability_materialization_precondition"
+                )
+
+            cohort_reason = self._task_fence_selected_cohort_reason_unlocked(
+                conn,
+                store,
+            )
+            if cohort_reason == "capabilities_not_materialized":
+                now = time.time()
+                conn.execute(
+                    "INSERT INTO main.task_fence_cohorts ("
+                    "cohort_key, mode, mode_generation, activation_state, "
+                    "audit_degraded, created_at, updated_at"
+                    ") VALUES (?, 'audit', ?, 'inactive', 0, ?, ?)",
+                    (
+                        _TASK_FENCE_IMPLICIT_AUDIT_COHORT,
+                        expected_mode_generation,
+                        now,
+                        now,
+                    ),
+                )
+            elif cohort_reason == "capability_declaration_conflict":
+                raise TaskFenceCapabilityUnavailable(cohort_reason)
+            elif cohort_reason != "verified":
+                raise TaskFenceCapabilityUnavailable(
+                    "capability_materialization_precondition"
+                )
+
+            projection_reason, declarations = (
+                self._task_fence_selected_capability_projection_unlocked(conn)
+            )
+            if projection_reason == "verified":
+                return TaskFenceCapabilityMaterialization(
+                    declarations=declarations,
+                    created=False,
+                )
+            if projection_reason != "capabilities_not_materialized":
+                raise TaskFenceCapabilityUnavailable(
+                    "capability_declaration_conflict"
+                )
+
+            declared_at = time.time()
+            conn.executemany(
+                "INSERT INTO main.task_fence_cohort_capabilities ("
+                "cohort_key, capability_kind, capability_id, "
+                "capability_version, declaration_state, declared_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        _TASK_FENCE_IMPLICIT_AUDIT_COHORT,
+                        declaration.kind.value,
+                        declaration.capability_id,
+                        declaration.capability_version,
+                        declaration.state.value,
+                        declared_at,
+                    )
+                    for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+                ),
+            )
+            projection_reason, declarations = (
+                self._task_fence_selected_capability_projection_unlocked(conn)
+            )
+            if projection_reason != "verified":
+                raise TaskFenceCapabilityUnavailable(
+                    "capability_declaration_conflict"
+                )
+            return TaskFenceCapabilityMaterialization(
+                declarations=declarations,
+                created=True,
+            )
+
+        try:
+            return self._execute_write(_materialize)
+        except (TaskFenceProtocolRejected, TaskFenceCapabilityUnavailable):
+            raise
+        except sqlite3.DatabaseError:
+            raise TaskFenceCapabilityUnavailable(
+                "capability_database_error"
+            ) from None
 
     def recover_task_fence_state(
         self,
