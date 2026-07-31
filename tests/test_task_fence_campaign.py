@@ -1802,6 +1802,256 @@ def test_campaign_excludes_sync_compression_at_real_progress_stream_create(
         db.close()
 
 
+def test_campaign_excludes_sync_title_generation_at_real_background_create(
+    campaign_summary_agent,
+    tmp_path,
+    monkeypatch,
+):
+    import threading
+
+    from agent import auxiliary_client, title_generator
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    session_id = "campaign-conversation"
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    conn = db._conn
+    assert conn is not None
+    db.create_session(
+        session_id,
+        source="gateway",
+        system_prompt="You are helpful.",
+    )
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    probes = []
+    main_calls = []
+    title_physical = []
+    worker_threads = []
+    request_text = "prove bounded background title exclusion"
+    main_text = "the accepted campaign turn completed successfully"
+    expected_title = "Bounded Background Title Exclusion"
+
+    def counts():
+        with db._lock:
+            return tuple(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+
+    def main_create(**kwargs):
+        envelope = _assert_summary_physical_entry(
+            db=db,
+            probes=probes,
+            route_id=_OPENAI_ROUTE,
+        )
+        with db._lock:
+            state = conn.execute(
+                "SELECT state FROM task_fence_model_generations "
+                "WHERE generation_id = ?",
+                (envelope.generation_id,),
+            ).fetchone()["state"]
+        main_calls.append((dict(kwargs), envelope, state))
+        return SimpleNamespace(
+            id="chatcmpl-title-main",
+            model="campaign-main-model",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=main_text,
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    agent = campaign_summary_agent
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = session_id
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.model = "campaign-main-model"
+    agent.client.base_url = agent.base_url
+    agent.client.api_key = "campaign-main-key"
+    agent.client.chat.completions.create.side_effect = main_create
+    agent.compression_enabled = False
+
+    try:
+        with (
+            patch(
+                "task_fence.TaskFencePolicy",
+                new=_campaign_probe_factory(
+                    route_id=_OPENAI_ROUTE,
+                    store=db,
+                    probes=probes,
+                ),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                request_text,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == main_text
+        assert len(main_calls) == 1
+        main_kwargs, main_envelope, main_state = main_calls[0]
+        assert main_state == "started"
+        assert request_text in str(main_kwargs["messages"])
+        assert len(probes) == 1
+        probes[0].assert_complete()
+
+        with db._lock:
+            generation = conn.execute(
+                "SELECT generation_id, task_id, state "
+                "FROM task_fence_model_generations"
+            ).fetchone()
+            attempt = conn.execute(
+                "SELECT state FROM task_fence_attempts"
+            ).fetchone()
+        assert tuple(generation) == (
+            main_envelope.generation_id,
+            acceptance.task_id,
+            "committed",
+        )
+        assert attempt["state"] == "SUCCEEDED"
+        baseline_counts = counts()
+        assert baseline_counts == (1, 1, 2, 1, 1)
+        assert db.get_session_title(session_id) is None
+
+        caller_thread = threading.current_thread()
+        physical_called = threading.Event()
+
+        def title_create(**kwargs):
+            worker_threads.append(threading.current_thread())
+            physical_counts = counts()
+            with db._lock:
+                physical_generation = conn.execute(
+                    "SELECT generation_id, task_id, state "
+                    "FROM task_fence_model_generations"
+                ).fetchone()
+                physical_attempt = conn.execute(
+                    "SELECT state FROM task_fence_attempts"
+                ).fetchone()
+            title_physical.append(
+                (
+                    dict(kwargs),
+                    current_causal_envelope(),
+                    current_task_fence_policy(),
+                    physical_counts,
+                    tuple(physical_generation),
+                    physical_attempt["state"],
+                )
+            )
+            physical_called.set()
+            return SimpleNamespace(
+                id="chatcmpl-title-background",
+                model="campaign-title-model",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=expected_title),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+
+        title_client = _openai_client(title_create)
+        title_client.base_url = "https://openrouter.ai/api/v1"
+
+        with (
+            patch.object(
+                auxiliary_client,
+                "_get_cached_client",
+                return_value=(title_client, "campaign-title-model"),
+            ) as get_client,
+            patch(
+                "task_fence.TaskFencePolicy",
+                side_effect=TaskFencePolicy,
+            ) as title_policy_factory,
+        ):
+            title_generator.maybe_auto_title(
+                db,
+                session_id,
+                request_text,
+                main_text,
+                result["messages"],
+                main_runtime={
+                    "model": agent.model,
+                    "provider": agent.provider,
+                    "base_url": agent.base_url,
+                    "api_key": agent.client.api_key,
+                    "api_mode": agent.api_mode,
+                },
+                runtime_validator=lambda: True,
+            )
+            assert physical_called.wait(timeout=10), "auto-title create never ran"
+            assert len(worker_threads) == 1
+            for thread in worker_threads:
+                thread.join(timeout=10)
+
+        get_client.assert_called_once()
+        title_policy_factory.assert_not_called()
+        assert len(worker_threads) == 1
+        title_thread = worker_threads[0]
+        assert title_thread is not caller_thread
+        assert title_thread.daemon is True
+        assert title_thread.name == "auto-title"
+        assert not title_thread.is_alive()
+
+        assert len(title_physical) == 1
+        (
+            title_kwargs,
+            title_envelope,
+            title_policy,
+            physical_counts,
+            physical_generation,
+            physical_attempt_state,
+        ) = title_physical[0]
+        assert title_envelope is None
+        assert title_policy is None
+        assert physical_counts == baseline_counts
+        assert physical_generation == tuple(generation)
+        assert physical_attempt_state == "SUCCEEDED"
+        assert title_kwargs["model"] == "campaign-title-model"
+        assert not title_kwargs.get("stream", False)
+        assert not any(
+            key.startswith("_task_fence_") for key in title_kwargs
+        )
+        title_prompt = str(title_kwargs["messages"])
+        assert request_text in title_prompt
+        assert main_text in title_prompt
+
+        assert db.get_session_title(session_id) == expected_title
+        assert counts() == baseline_counts
+    finally:
+        for thread in worker_threads:
+            thread.join(timeout=10)
+        db.close()
+
+
 def test_campaign_probe_records_real_openai_handoff_before_sdk_entry(tmp_path):
     db, generation = _live_model_lane(tmp_path / "state.db")
     probe = _campaign_probe(TaskFencePolicy(db))
