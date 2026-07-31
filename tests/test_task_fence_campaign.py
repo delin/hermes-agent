@@ -1563,6 +1563,245 @@ async def test_campaign_excludes_sync_goal_judge_at_real_auxiliary_create(
         db.close()
 
 
+def test_campaign_excludes_sync_compression_at_real_progress_stream_create(
+    campaign_summary_agent,
+    tmp_path,
+):
+    from agent.context_compressor import ContextCompressor
+
+    session_id = "campaign-conversation"
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    conn = db._conn
+    assert conn is not None
+    db.create_session(
+        session_id,
+        source="gateway",
+        system_prompt="You are helpful.",
+    )
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _GENERIC_AUXILIARY_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    probes = []
+    physical = []
+    main_calls = []
+    stream_closed = []
+    middle_marker = "bounded-compression-middle-marker"
+    compression_summary = "bounded compression retained the campaign state"
+    request_secret = "raw-compression-campaign-request"
+    main_text = "compression campaign legacy main response"
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": (
+                f"historical turn {index} "
+                f"{middle_marker if index == 10 else ''} "
+                + ("x" * 1400)
+            ),
+        }
+        for index in range(24)
+    ]
+
+    def counts():
+        with db._lock:
+            return tuple(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "task_fence_ingress",
+                    "task_fence_model_generations",
+                    "task_fence_policy_decisions",
+                    "task_fence_dispatch_permits",
+                    "task_fence_attempts",
+                )
+            )
+
+    class Chunks:
+        def __iter__(self):
+            yield SimpleNamespace(
+                id="chatcmpl-compression-campaign",
+                model="campaign-compression-model",
+                usage=None,
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=compression_summary,
+                            reasoning=None,
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+
+        def close(self):
+            stream_closed.append(True)
+
+    def compression_create(**kwargs):
+        physical.append(
+            (
+                dict(kwargs),
+                current_causal_envelope(),
+                current_task_fence_policy(),
+                counts(),
+                len(probes),
+            )
+        )
+        return Chunks()
+
+    auxiliary_client = _openai_client(compression_create)
+    auxiliary_client.base_url = "https://openrouter.ai/api/v1"
+
+    def main_create(**kwargs):
+        envelope = _assert_summary_physical_entry(
+            db=db,
+            probes=probes,
+            route_id=_OPENAI_ROUTE,
+        )
+        with db._lock:
+            state = conn.execute(
+                "SELECT state FROM task_fence_model_generations "
+                "WHERE generation_id = ?",
+                (envelope.generation_id,),
+            ).fetchone()["state"]
+        main_calls.append((dict(kwargs), envelope, state))
+        return SimpleNamespace(
+            id="chatcmpl-compression-main",
+            model="campaign-main-model",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=main_text,
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    agent = campaign_summary_agent
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = session_id
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.model = "campaign-main-model"
+    agent.client.base_url = agent.base_url
+    agent.client.api_key = "campaign-main-key"
+    agent.client.chat.completions.create.side_effect = main_create
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = True
+    agent.compression_in_place = True
+    agent.max_compression_attempts = 1
+    agent._compression_feasibility_checked = True
+    agent.context_compressor = ContextCompressor(
+        model=agent.model,
+        threshold_percent=0.5,
+        protect_first_n=1,
+        protect_last_n=2,
+        summary_target_ratio=0.1,
+        quiet_mode=True,
+        base_url=agent.base_url,
+        api_key=agent.client.api_key,
+        config_context_length=8_000,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+
+    try:
+        with (
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(
+                    auxiliary_client,
+                    "campaign-compression-model",
+                ),
+            ) as get_client,
+            patch(
+                "task_fence.TaskFencePolicy",
+                new=_campaign_probe_factory(
+                    route_id=_OPENAI_ROUTE,
+                    store=db,
+                    probes=probes,
+                ),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                request_secret,
+                conversation_history=history,
+                task_fence_acceptance=acceptance,
+            )
+
+        get_client.assert_called_once()
+        assert get_client.call_args.kwargs.get("async_mode", False) is False
+        assert len(physical) == 1
+        (
+            compression_kwargs,
+            compression_envelope,
+            compression_policy,
+            compression_counts,
+            compression_probe_count,
+        ) = physical[0]
+        assert compression_envelope is None
+        assert compression_policy is None
+        assert compression_counts == (1, 0, 0, 0, 0)
+        assert compression_probe_count == 0
+        assert compression_kwargs["stream"] is True
+        assert compression_kwargs["stream_options"] == {
+            "include_usage": True,
+        }
+        assert not any(
+            key.startswith("_task_fence_") for key in compression_kwargs
+        )
+        assert middle_marker in str(compression_kwargs["messages"])
+        assert stream_closed == [True]
+
+        assert len(main_calls) == 1
+        main_kwargs, main_envelope, main_state = main_calls[0]
+        assert main_envelope.task_id == acceptance.task_id
+        assert main_envelope.invocation_id is not None
+        assert main_envelope.parent_invocation_id is None
+        assert main_state == "started"
+        assert compression_summary in str(main_kwargs["messages"])
+        assert request_secret in str(main_kwargs["messages"])
+
+        assert result["completed"] is True
+        assert result["final_response"] == main_text
+        assert len(probes) == 1
+        probes[0].assert_complete()
+        generation = conn.execute(
+            "SELECT generation_id, task_id, state "
+            "FROM task_fence_model_generations"
+        ).fetchone()
+        assert tuple(generation) == (
+            main_envelope.generation_id,
+            acceptance.task_id,
+            "committed",
+        )
+        attempt = conn.execute(
+            "SELECT state FROM task_fence_attempts"
+        ).fetchone()
+        assert attempt["state"] == "SUCCEEDED"
+        assert counts() == (1, 1, 2, 1, 1)
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
 def test_campaign_probe_records_real_openai_handoff_before_sdk_entry(tmp_path):
     db, generation = _live_model_lane(tmp_path / "state.db")
     probe = _campaign_probe(TaskFencePolicy(db))
