@@ -34,6 +34,7 @@ _ANTHROPIC_STREAM_ROUTE = "provider:anthropic.messages.stream"
 _BEDROCK_ANTHROPIC_ROUTE = "provider:bedrock.anthropic_messages"
 _CODEX_APP_SERVER_ROUTE = "provider:codex.app_server"
 _CODEX_ROUTE = "provider:openai.responses.create"
+_COPILOT_ACP_ROUTE = "provider:copilot.acp"
 _GEMINI_ROUTE = "provider:gemini.generateContent"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
 
@@ -884,6 +885,241 @@ def test_campaign_excludes_codex_app_server_at_real_session_handoff(
         assert current_task_fence_policy() is None
     finally:
         session.close()
+        db.close()
+
+
+def test_campaign_excludes_copilot_acp_at_real_session_prompt_write(tmp_path):
+    import io
+    import json
+    import queue
+    import threading
+
+    from run_agent import AIAgent
+
+    db, acceptance = _live_summary_lane(tmp_path / "state.db")
+    policy_constructions = []
+    methods = []
+    physical = []
+    processes = []
+    request_secret = "raw-copilot-acp-campaign-secret"
+    response_text = "copilot ACP legacy response"
+    session_id = "session-task-fence-campaign"
+    caller_thread_id = threading.get_ident()
+
+    assert next(
+        declaration.state
+        for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        if declaration.capability_id == _COPILOT_ACP_ROUTE
+    ) is TaskFenceCapabilityState.UNSUPPORTED
+
+    class Output:
+        def __init__(self):
+            self._lines = queue.Queue()
+            self.closed = False
+
+        def put(self, message):
+            self._lines.put(json.dumps(message) + "\n")
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                self._lines.put(None)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            line = self._lines.get()
+            if line is None:
+                raise StopIteration
+            return line
+
+    class Input:
+        def __init__(self, process):
+            self._process = process
+            self._buffer = ""
+
+        def write(self, data):
+            self._buffer += data
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                if line:
+                    self._process.handle(json.loads(line))
+            return len(data)
+
+        def flush(self):
+            return None
+
+    class Process:
+        def __init__(self):
+            self.stdout = Output()
+            self.stderr = io.StringIO("")
+            self.stdin = Input(self)
+            self.returncode = None
+
+        def handle(self, payload):
+            method = payload["method"]
+            methods.append(method)
+            if method == "initialize":
+                result = {}
+            elif method == "session/new":
+                result = {"sessionId": session_id}
+            elif method == "session/prompt":
+                envelope = current_causal_envelope()
+                assert threading.get_ident() != caller_thread_id
+                assert envelope is not None
+                assert envelope.task_id == acceptance.task_id
+                assert envelope.invocation_id is None
+                assert current_task_fence_policy() is None
+                assert policy_constructions == []
+                assert payload["jsonrpc"] == "2.0"
+                assert payload["params"]["sessionId"] == session_id
+                prompt = payload["params"]["prompt"]
+                assert request_secret in prompt[0]["text"]
+                assert "_task_fence_" not in json.dumps(payload)
+                with db._lock:
+                    generation = db._conn.execute(
+                        "SELECT generation_id, task_id, state "
+                        "FROM task_fence_model_generations"
+                    ).fetchone()
+                    counts = tuple(
+                        db._conn.execute(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).fetchone()[0]
+                        for table in (
+                            "task_fence_policy_decisions",
+                            "task_fence_dispatch_permits",
+                            "task_fence_attempts",
+                        )
+                    )
+                assert tuple(generation) == (
+                    envelope.generation_id,
+                    acceptance.task_id,
+                    "started",
+                )
+                assert counts == (0, 0, 0)
+                physical.append((payload, envelope, threading.get_ident()))
+                self.stdout.put(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {
+                                    "type": "text",
+                                    "text": response_text,
+                                },
+                            },
+                        },
+                    }
+                )
+                result = {"stopReason": "end_turn"}
+            else:
+                raise AssertionError(f"unexpected ACP method: {method}")
+            self.stdout.put(
+                {
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": result,
+                }
+            )
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+            self.stdout.close()
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.terminate()
+
+    def popen(*_args, **_kwargs):
+        process = Process()
+        processes.append(process)
+        return process
+
+    def tracked_policy(*args, **kwargs):
+        policy_constructions.append((args, kwargs))
+        return TaskFencePolicy(*args, **kwargs)
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+    ):
+        agent = AIAgent(
+            api_key="copilot-acp",
+            base_url="acp://copilot",
+            provider="copilot-acp",
+            api_mode="chat_completions",
+            model="copilot-campaign-model",
+            acp_command="copilot-campaign",
+            acp_args=["--acp", "--stdio"],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            max_iterations=1,
+        )
+    agent._session_db = db
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    try:
+        with (
+            patch(
+                "agent.copilot_acp_client.subprocess.Popen",
+                side_effect=popen,
+            ),
+            patch(
+                "task_fence.TaskFencePolicy",
+                side_effect=tracked_policy,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                request_secret,
+                task_fence_acceptance=acceptance,
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == response_text
+        assert methods == ["initialize", "session/new", "session/prompt"]
+        assert len(processes) == 1
+        assert len(physical) == 1
+        assert processes[0].returncode == 0
+        assert processes[0].stdout.closed is True
+        assert policy_constructions == []
+        generation = db._conn.execute(
+            "SELECT generation_id, task_id, state "
+            "FROM task_fence_model_generations"
+        ).fetchone()
+        assert tuple(generation) == (
+            physical[0][1].generation_id,
+            acceptance.task_id,
+            "committed",
+        )
+        for table in (
+            "task_fence_policy_decisions",
+            "task_fence_dispatch_permits",
+            "task_fence_attempts",
+        ):
+            assert db._conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+        assert request_secret not in "\n".join(db._conn.iterdump())
+        assert current_causal_envelope() is None
+        assert current_task_fence_policy() is None
+    finally:
+        agent.close()
         db.close()
 
 
