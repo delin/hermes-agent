@@ -12,6 +12,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "docker.yml"
+DEPLOY_SITE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "deploy-site.yml"
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -37,6 +38,13 @@ _UniqueKeyLoader.add_constructor(
 def _workflow() -> dict:
     return yaml.load(
         WORKFLOW_PATH.read_text(encoding="utf-8"),
+        Loader=_UniqueKeyLoader,
+    )
+
+
+def _deploy_site_workflow() -> dict:
+    return yaml.load(
+        DEPLOY_SITE_WORKFLOW_PATH.read_text(encoding="utf-8"),
         Loader=_UniqueKeyLoader,
     )
 
@@ -328,6 +336,18 @@ def test_maintained_fork_release_has_closed_ghcr_publish_authority() -> None:
     assert "docker/login-action@" not in archive_text
     assert "DOCKERHUB_" not in archive_text
     assert "secrets." not in archive_text
+
+
+def test_maintained_fork_release_cannot_trigger_upstream_site_deploy() -> None:
+    deploy_vercel = _deploy_site_workflow()["jobs"]["deploy-vercel"]
+    condition = " ".join(deploy_vercel["if"].split())
+
+    assert condition == (
+        "github.repository == 'NousResearch/hermes-agent' && "
+        "(github.event_name == 'release' || "
+        "github.event_name == 'workflow_dispatch')"
+    )
+    assert "VERCEL_DEPLOY_HOOK" in json.dumps(deploy_vercel, sort_keys=True)
 
 
 def test_private_ghcr_credentials_end_before_exact_tests() -> None:
