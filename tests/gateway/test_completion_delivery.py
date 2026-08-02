@@ -18,6 +18,11 @@ import pytest
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from task_fence import (
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
+)
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
@@ -47,6 +52,30 @@ def _runner(adapter, *, origins=None):
     runner._completion_deliveries_delivered = OrderedDict()
     runner._completion_delivery_retention = 2048
     return runner
+
+
+def _recording_launch_catalog(*, order=None):
+    witnesses = []
+
+    def classify_route(route):
+        witnesses.append(route)
+        if order is not None:
+            order.append(("wake_route", route.route_id))
+        return TaskFenceLaunchRouteValidation(
+            verified=True,
+            reason="verified",
+            route_id=route.route_id,
+        )
+
+    return SimpleNamespace(classify_route=classify_route), witnesses
+
+
+def _wake_route():
+    return TaskFenceLaunchRoute(
+        kind=TaskFenceCapabilityKind.RUNTIME,
+        route_id="runtime:wake-continuation",
+        capability_version="task-fence-capability-v4",
+    )
 
 
 def _async_event(delegation_id="deleg_duplicate"):
@@ -213,23 +242,19 @@ def test_process_evidence_is_observed_after_adapter_acceptance(monkeypatch):
 
     adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_accepted))
     runner = _runner(adapter)
-    from tools import async_delegation
+    launch_catalog, witnesses = _recording_launch_catalog(order=order)
+    runner._task_fence_launch_catalog = launch_catalog
     from tools import process_registry
+
+    def observe_process_completion(event, *, launch_catalog=None):
+        assert launch_catalog is runner._task_fence_launch_catalog
+        order.append(("wake_acceptance", event["session_id"]))
+        return acceptance
 
     monkeypatch.setattr(
         process_registry,
         "observe_task_fence_process_completion",
-        lambda event: order.append(
-            ("wake_acceptance", event["session_id"])
-        ) or acceptance,
-    )
-
-    monkeypatch.setattr(
-        async_delegation,
-        "complete_event_delivery",
-        lambda event, claim: order.append(
-            ("evidence", event["session_id"], claim)
-        ),
+        observe_process_completion,
     )
 
     assert asyncio.run(
@@ -241,21 +266,138 @@ def test_process_evidence_is_observed_after_adapter_acceptance(monkeypatch):
     assert order == [
         "adapter",
         ("wake_acceptance", "proc_reused"),
-        ("evidence", "proc_reused", ""),
+        ("wake_route", "runtime:wake-continuation"),
     ]
     assert delivered[0].task_fence_acceptance is acceptance
+    assert witnesses == [_wake_route()]
+
+
+def test_catalogless_process_delivery_keeps_legacy_replay(monkeypatch):
+    order = []
+    acceptance = object()
+
+    async def accepted(_event):
+        order.append("adapter")
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=accepted))
+    runner = _runner(adapter)
+    from tools import async_delegation
+    from tools import process_registry
+
+    def observe_process_completion(event, *, launch_catalog=None):
+        assert launch_catalog is None
+        order.append(("wake_acceptance", event["session_id"]))
+        return acceptance
+
+    monkeypatch.setattr(
+        process_registry,
+        "observe_task_fence_process_completion",
+        observe_process_completion,
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda event, claim: order.append(
+            ("legacy_replay", event["session_id"], claim)
+        ),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(
+            "completion",
+            _completion_event(started_at=15.0),
+        )
+    ) is True
+    assert order == [
+        "adapter",
+        ("wake_acceptance", "proc_reused"),
+        ("legacy_replay", "proc_reused", ""),
+    ]
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.task_fence_acceptance is acceptance
+
+
+def test_failed_process_push_never_resolves_acceptance_or_wake_route(monkeypatch):
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(side_effect=RuntimeError("temporary"))
+    )
+    runner = _runner(adapter)
+    launch_catalog, witnesses = _recording_launch_catalog()
+    runner._task_fence_launch_catalog = launch_catalog
+    process_observations = []
+
+    from tools import process_registry
+
+    monkeypatch.setattr(
+        process_registry,
+        "observe_task_fence_process_completion",
+        lambda *_args, **_kwargs: process_observations.append(True),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(
+            "completion",
+            _completion_event(started_at=20.0),
+        )
+    ) is False
+    adapter.handle_message.assert_awaited_once()
+    assert process_observations == []
+    assert witnesses == []
+
+
+def test_process_route_failure_has_no_catalogless_replay(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    launch_catalog, witnesses = _recording_launch_catalog()
+    runner._task_fence_launch_catalog = launch_catalog
+    observed_catalogs = []
+
+    from tools import process_registry
+
+    def reject_process_evidence(_event, *, launch_catalog=None):
+        observed_catalogs.append(launch_catalog)
+        return None
+
+    monkeypatch.setattr(
+        process_registry,
+        "observe_task_fence_process_completion",
+        reject_process_evidence,
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(
+            "completion",
+            _completion_event(started_at=30.0),
+        )
+    ) is True
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.task_fence_acceptance is None
+    assert observed_catalogs == [launch_catalog]
+    assert witnesses == []
 
 
 def test_async_claim_acceptance_reaches_only_the_winning_wake(monkeypatch):
     acceptance = object()
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)
+    launch_catalog, witnesses = _recording_launch_catalog()
+    runner._task_fence_launch_catalog = launch_catalog
     from tools import async_delegation
+
+    def claim_completion(
+        _delegation_id,
+        _claim_id,
+        *,
+        launch_catalog=None,
+    ):
+        assert launch_catalog is runner._task_fence_launch_catalog
+        return True, acceptance
 
     monkeypatch.setattr(
         async_delegation,
         "claim_completion_delivery_with_acceptance",
-        lambda _delegation_id, _claim_id: (True, acceptance),
+        claim_completion,
     )
     monkeypatch.setattr(
         async_delegation,
@@ -274,6 +416,7 @@ def test_async_claim_acceptance_reaches_only_the_winning_wake(monkeypatch):
     assert delivered.internal is True
     assert delivered.task_fence_ingress is None
     assert delivered.task_fence_acceptance is acceptance
+    assert witnesses == [_wake_route()]
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):
     import tools.process_registry as pr_module
 

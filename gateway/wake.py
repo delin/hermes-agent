@@ -29,7 +29,19 @@ import asyncio
 import logging
 from typing import Any, Callable, Optional
 
+from task_fence import (
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
+)
+
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_WAKE_CONTINUATION_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:wake-continuation",
+    capability_version="task-fence-capability-v4",
+)
 
 TASK_FENCE_WAKE_TOKEN_HEADER = "X-Hermes-Task-Fence-Wake"
 
@@ -55,6 +67,36 @@ def adapter_supports_push(adapter: Any) -> bool:
     return bool(getattr(adapter, "supports_async_delivery", True))
 
 
+def _classify_task_fence_wake(
+    launch_catalog: Any,
+    task_fence_acceptance: Any,
+) -> Any:
+    """Drop only process-local Task Fence state when a wake route drifts."""
+
+    if task_fence_acceptance is None or launch_catalog is None:
+        return task_fence_acceptance
+    try:
+        launch_validation = launch_catalog.classify_route(
+            _TASK_FENCE_WAKE_CONTINUATION_LAUNCH_ROUTE
+        )
+        if not isinstance(launch_validation, TaskFenceLaunchRouteValidation):
+            raise TypeError("invalid_wake_launch_validation")
+        if not launch_validation.verified:
+            logger.warning(
+                "Task Fence shadow wake launch route would block (%s): %s",
+                launch_validation.route_id,
+                launch_validation.reason,
+            )
+            return None
+    except Exception as exc:
+        logger.warning(
+            "Task Fence shadow wake launch route failed: %s",
+            type(exc).__name__,
+        )
+        return None
+    return task_fence_acceptance
+
+
 async def deliver_wake(
     adapter: Any,
     *,
@@ -65,6 +107,7 @@ async def deliver_wake(
     metadata: Optional[dict[str, Any]] = None,
     task_fence_acceptance: Any = None,
     task_fence_acceptance_factory: Optional[Callable[[], Any]] = None,
+    launch_catalog: Any = None,
 ) -> Optional[Any]:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -86,6 +129,10 @@ async def deliver_wake(
             raise ValueError(
                 "deliver_wake: push-capable adapter requires a SessionSource"
             )
+        task_fence_acceptance = _classify_task_fence_wake(
+            launch_catalog,
+            task_fence_acceptance,
+        )
         from gateway.platforms.base import MessageEvent, MessageType
 
         synth_event = MessageEvent(
@@ -105,6 +152,25 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
+    has_acceptance = task_fence_acceptance is not None
+    has_factory = task_fence_acceptance_factory is not None
+    if launch_catalog is not None and has_acceptance != has_factory:
+        acceptance = task_fence_acceptance
+        acceptance_factory = task_fence_acceptance_factory
+
+        def classified_acceptance_factory() -> Any:
+            candidate = (
+                acceptance
+                if acceptance_factory is None
+                else acceptance_factory()
+            )
+            return _classify_task_fence_wake(
+                launch_catalog,
+                candidate,
+            )
+
+        task_fence_acceptance = None
+        task_fence_acceptance_factory = classified_acceptance_factory
     if (
         task_fence_acceptance is None
         and task_fence_acceptance_factory is None

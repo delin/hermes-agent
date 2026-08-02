@@ -151,7 +151,11 @@ def _live_lane(path, *, conversation_id: str = "delegation-conversation"):
     return db, acceptance, generation
 
 
-def _recording_launch_policy(db: SessionDB):
+def _recording_launch_catalog(
+    *,
+    case: str = "exact",
+    fault_secret: str = "",
+):
     witnesses = []
     catalog = TaskFenceLaunchCatalog(
         conversation_fingerprint="a" * 64,
@@ -166,21 +170,46 @@ def _recording_launch_policy(db: SessionDB):
 
     def classify_route(route):
         witnesses.append(route)
+        if case == "fault":
+            raise RuntimeError(fault_secret)
+        if case == "malformed":
+            return object()
+        if case == "changed":
+            route = TaskFenceLaunchRoute(
+                kind=route.kind,
+                route_id=route.route_id,
+                capability_version="task-fence-capability-v5",
+            )
         return catalog.classify_route(route)
 
-    return (
-        TaskFencePolicy(
-            db,
-            launch_catalog=SimpleNamespace(classify_route=classify_route),
-        ),
-        witnesses,
-    )
+    return SimpleNamespace(classify_route=classify_route), witnesses
+
+
+def _recording_launch_policy(db: SessionDB):
+    catalog, witnesses = _recording_launch_catalog()
+    return TaskFencePolicy(db, launch_catalog=catalog), witnesses
 
 
 def _delegated_child_launch_route():
     return TaskFenceLaunchRoute(
         kind=TaskFenceCapabilityKind.RUNTIME,
         route_id="runtime:delegated-child-launch",
+        capability_version="task-fence-capability-v4",
+    )
+
+
+def _delegation_completion_route():
+    return TaskFenceLaunchRoute(
+        kind=TaskFenceCapabilityKind.RUNTIME,
+        route_id="runtime:delegation-completion",
+        capability_version="task-fence-capability-v4",
+    )
+
+
+def _process_completion_route():
+    return TaskFenceLaunchRoute(
+        kind=TaskFenceCapabilityKind.RUNTIME,
+        route_id="runtime:process-completion",
         capability_version="task-fence-capability-v4",
     )
 
@@ -1119,6 +1148,7 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db, acceptance, generation = _live_lane(tmp_path / "state.db")
     policy, launch_witnesses = _recording_launch_policy(db)
+    launch_catalog = getattr(policy, "_launch_catalog")
     parent_envelope = generation.for_invocation("tfiv_background_delegate_handler")
     goals = ["background-secret-alpha", "background-secret-beta"]
     observed = []
@@ -1304,11 +1334,26 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
             async_delegation.claim_completion_delivery_with_acceptance(
                 delegation_id,
                 claim_a,
+                launch_catalog=launch_catalog,
             )
         )
         assert claimed
         assert wake_acceptance is not None
-        assert async_delegation.claim_event_delivery(event, "consumer-loser") is None
+        expected_launch_witnesses = [
+            _delegated_child_launch_route(),
+            _delegated_child_launch_route(),
+            _delegation_completion_route(),
+        ]
+        assert launch_witnesses == expected_launch_witnesses
+        loser_claim = (
+            async_delegation.claim_completion_delivery_with_acceptance(
+                delegation_id,
+                "consumer-loser:wake",
+                launch_catalog=launch_catalog,
+            )
+        )
+        assert loser_claim == (False, None)
+        assert launch_witnesses == expected_launch_witnesses
 
         source_identity = json.dumps(
             (delegation_id, durable["dispatched_at"]),
@@ -1420,6 +1465,87 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
         deadline = time.monotonic() + 10.0
         while async_delegation.active_count() and time.monotonic() < deadline:
             time.sleep(0.02)
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_warning"),
+    (
+        ("none", None),
+        ("changed", "changed_reachable_route"),
+        ("fault", "RuntimeError"),
+        ("malformed", "TypeError"),
+    ),
+)
+def test_delegation_completion_launch_classification_is_bounded(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    _clean_async_registry,
+    case,
+    expected_warning,
+):
+    from tools import async_delegation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    delegation_id = f"completion-route-{case}"
+    claim_id = f"claim-{case}"
+    fault_secret = "raw-completion-classifier-secret"
+    launch_witnesses = []
+    launch_catalog = None
+    if case != "none":
+        launch_catalog, launch_witnesses = _recording_launch_catalog(
+            case=case,
+            fault_secret=fault_secret,
+        )
+    try:
+        _dispatch_completed_batch(
+            async_delegation,
+            delegation_id=delegation_id,
+            parent_generation_id=generation.generation_id,
+            parent_runtime_epoch=generation.runtime_epoch,
+        )
+        caplog.clear()
+        with caplog.at_level(
+            logging.WARNING,
+            logger="tools.async_delegation",
+        ):
+            claimed, acceptance = (
+                async_delegation.claim_completion_delivery_with_acceptance(
+                    delegation_id,
+                    claim_id,
+                    launch_catalog=launch_catalog,
+                )
+            )
+
+        assert claimed
+        assert tuple(
+            db._conn.execute(
+                "SELECT delivery_state, delivery_claim, delivery_attempts "
+                "FROM async_delegations WHERE delegation_id = ?",
+                (delegation_id,),
+            ).fetchone()
+        ) == ("pending", claim_id, 1)
+        evidence_count = db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:async_delegation'"
+        ).fetchone()[0]
+        if case == "none":
+            assert acceptance is not None
+            assert launch_witnesses == []
+            assert evidence_count == 1
+        else:
+            assert acceptance is None
+            assert launch_witnesses == [_delegation_completion_route()]
+            assert evidence_count == 0
+            assert expected_warning in caplog.text
+            assert fault_secret not in caplog.text
+        assert async_delegation.complete_completion_delivery(
+            delegation_id,
+            claim_id,
+        )
+    finally:
         db.close()
 
 
@@ -1882,6 +2008,7 @@ def test_restored_completion_uses_exact_durable_evidence(
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db, acceptance, generation = _live_lane(tmp_path / "state.db")
+    launch_catalog, launch_witnesses = _recording_launch_catalog()
     delegation_id = "feedbeef"
     try:
         live_event = _dispatch_completed_batch(
@@ -1908,11 +2035,18 @@ def test_restored_completion_uses_exact_durable_evidence(
         assert "restored" not in exact_event
         assert "causal_parent_generation_id" not in restored
         assert "causal_parent_runtime_epoch" not in restored
+        assert "launch_catalog" not in restored
+        assert "launch_route" not in restored
+        assert "runtime:delegation-completion" not in durable["event_json"]
 
         restored["causal_parent_generation_id"] = "forged-in-memory-parent"
         restored["causal_parent_runtime_epoch"] = generation.runtime_epoch + 99
-        claim_a = async_delegation.claim_event_delivery(restored, "restore-a")
+        claim_a = async_delegation.claim_event_delivery(
+            restored,
+            "restore-a",
+        )
         assert claim_a is not None
+        assert launch_witnesses == []
 
         source_identity = json.dumps(
             (delegation_id, durable["dispatched_at"]),
@@ -1941,8 +2075,18 @@ def test_restored_completion_uses_exact_durable_evidence(
         replay_queue = queue.Queue()
         assert async_delegation.restore_undelivered_completions(replay_queue) == 1
         replay_event = replay_queue.get_nowait()
-        claim_b = async_delegation.claim_event_delivery(replay_event, "restore-b")
-        assert claim_b is not None and claim_b != claim_a
+        claim_b = "restore-b:claim"
+        claimed_b, replay_acceptance = (
+            async_delegation.claim_completion_delivery_with_acceptance(
+                delegation_id,
+                claim_b,
+                launch_catalog=launch_catalog,
+            )
+        )
+        assert claimed_b
+        assert replay_acceptance is not None
+        assert claim_b != claim_a
+        assert launch_witnesses == [_delegation_completion_route()]
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_ingress "
             "WHERE source = 'runtime:async_delegation'"
@@ -3200,7 +3344,8 @@ def test_live_process_completion_records_exact_synthetic_evidence(
 
     owner_db_path = tmp_path / "owner-home" / "state.db"
     db, acceptance, generation = _live_lane(owner_db_path)
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
+    launch_catalog = getattr(policy, "_launch_catalog")
     ambient_home = tmp_path / "ambient-home"
     ambient_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(ambient_home))
@@ -3284,9 +3429,11 @@ def test_live_process_completion_records_exact_synthetic_evidence(
         claim = claim_event_delivery(delivered_event, "process-test")
         assert claim == ""
         wake_acceptance = observe_task_fence_process_completion(
-            delivered_event
+            delivered_event,
+            launch_catalog=launch_catalog,
         )
         assert wake_acceptance is not None
+        assert launch_witnesses == [_process_completion_route()]
         complete_event_delivery(delivered_event, claim)
 
         identity = json.dumps(
@@ -3399,6 +3546,107 @@ def test_live_process_completion_records_exact_synthetic_evidence(
             marker.touch(exist_ok=True)
         if session is not None and not session.exited:
             registry.kill_process(session.id)
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_warning"),
+    (
+        ("none", None),
+        ("changed", "changed_reachable_route"),
+        ("fault", "RuntimeError"),
+        ("malformed", "TypeError"),
+    ),
+)
+def test_process_completion_launch_classification_is_bounded(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    case,
+    expected_warning,
+):
+    from tools import process_registry as process_registry_module
+
+    runtime_home = tmp_path / "runtime-home"
+    runtime_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setattr(
+        process_registry_module,
+        "CHECKPOINT_PATH",
+        tmp_path / "processes.json",
+    )
+    registry = process_registry_module.ProcessRegistry()
+    monkeypatch.setattr(
+        process_registry_module,
+        "process_registry",
+        registry,
+    )
+    db_path = tmp_path / "owner-home" / "state.db"
+    db, _acceptance, generation = _live_lane(db_path)
+    session = process_registry_module.ProcessSession(
+        id=f"proc_completion_route_{case}",
+        command="legacy command remains deliverable",
+        started_at=1234.5,
+        exited=True,
+        exit_code=0,
+        completion_reason="exited",
+        termination_source="",
+        _task_fence_parent_generation_id=generation.generation_id,
+        _task_fence_parent_runtime_epoch=generation.runtime_epoch,
+        _task_fence_store_path=str(db_path.resolve()),
+    )
+    with registry._lock:
+        registry._finished[session.id] = session
+    event = {
+        "type": "completion",
+        "session_id": session.id,
+        "session_key": "process-owner-session",
+        "command": session.command,
+        "exit_code": session.exit_code,
+        "completion_reason": session.completion_reason,
+        "termination_source": session.termination_source,
+        "output": "legacy output remains deliverable",
+        "started_at": session.started_at,
+    }
+    original_event = dict(event)
+    fault_secret = "raw-process-classifier-secret"
+    launch_witnesses = []
+    launch_catalog = None
+    if case != "none":
+        launch_catalog, launch_witnesses = _recording_launch_catalog(
+            case=case,
+            fault_secret=fault_secret,
+        )
+    try:
+        caplog.clear()
+        with caplog.at_level(
+            logging.WARNING,
+            logger="tools.process_registry",
+        ):
+            acceptance = (
+                process_registry_module.observe_task_fence_process_completion(
+                    event,
+                    launch_catalog=launch_catalog,
+                )
+            )
+
+        assert event == original_event
+        assert registry._finished[session.id] is session
+        evidence_count = db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_ingress "
+            "WHERE source = 'runtime:process_completion'"
+        ).fetchone()[0]
+        if case == "none":
+            assert acceptance is not None
+            assert launch_witnesses == []
+            assert evidence_count == 1
+        else:
+            assert acceptance is None
+            assert launch_witnesses == [_process_completion_route()]
+            assert evidence_count == 0
+            assert expected_warning in caplog.text
+            assert fault_secret not in caplog.text
+    finally:
         db.close()
 
 

@@ -35,9 +35,12 @@ from hermes_constants import (
 from hermes_state import AsyncSessionDB, SessionDB
 from task_fence import (
     TASK_FENCE_ACTIONS,
+    TaskFenceCapabilityKind,
     TaskFenceIngressRejected,
     TaskFenceIngressSidecar,
     TaskFenceIngressUnavailable,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
 )
 
 
@@ -545,6 +548,107 @@ async def test_goal_continuation_drains_into_real_descendant_or_fails_open(
             ).fetchone()[0] == 1
     finally:
         await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("classification", "prompt", "expect_acceptance"),
+    [
+        ("verified", "continue the exact goal", True),
+        ("verified-unencodable", "continue \ud800", False),
+        ("changed", "continue the exact goal", False),
+        ("fault", "continue the exact goal", False),
+        ("malformed", "continue the exact goal", False),
+    ],
+)
+async def test_goal_continuation_launch_witness_is_fail_open_before_acceptance(
+    task_fence_db,
+    caplog,
+    classification,
+    prompt,
+    expect_acceptance,
+):
+    from unittest.mock import patch
+
+    from task_fence import IngressEnvelope
+
+    initial = task_fence_db.accept_task_fence_ingress(
+        IngressEnvelope(
+            source="gateway:slack",
+            source_event_id=f"goal-launch-{classification}",
+            conversation_id=_session_key(),
+            action=TASK_FENCE_ACTIONS["initial_submit"],
+            payload_hash="a" * 64,
+        )
+    )
+    parent = task_fence_db.reserve_task_fence_generation(initial)
+    assert task_fence_db.finish_task_fence_generation(
+        parent,
+        state="committed",
+    )
+
+    runner = _runner(AsyncSessionDB(task_fence_db))
+    adapter = _ShadowSlackAdapter(task_fence_db)
+    _configure_agent_run(runner, adapter)
+    witnesses = []
+    ingress_counts_at_launch = []
+
+    def classify_route(route):
+        witnesses.append(route)
+        ingress_counts_at_launch.append(
+            _count(task_fence_db, "task_fence_ingress")
+        )
+        if classification == "fault":
+            raise RuntimeError("raw-goal-launch-classifier-secret")
+        if classification == "malformed":
+            return object()
+        verified = classification.startswith("verified")
+        return TaskFenceLaunchRouteValidation(
+            verified=verified,
+            route_id=route.route_id,
+            reason=(
+                "verified"
+                if verified
+                else "changed_reachable_route"
+            ),
+        )
+
+    runner._task_fence_launch_catalog = SimpleNamespace(
+        classify_route=classify_route
+    )
+    goal_manager = MagicMock()
+    goal_manager.is_active.return_value = True
+    goal_manager.evaluate_after_turn.return_value = {
+        "should_continue": True,
+        "continuation_prompt": prompt,
+        "message": "",
+    }
+
+    with patch("hermes_cli.goals.GoalManager", return_value=goal_manager):
+        await runner._post_turn_goal_continuation(
+            session_entry=SimpleNamespace(session_id="goal-launch-session"),
+            source=_source(),
+            final_response="parent complete",
+            task_fence_parent_generation=parent,
+        )
+
+    assert witnesses == [
+        TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.RUNTIME,
+            route_id="runtime:goal-continuation",
+            capability_version="task-fence-capability-v4",
+        )
+    ]
+    assert ingress_counts_at_launch == [1]
+    queued = adapter._pending_messages[_session_key()]
+    assert queued.text == prompt
+    assert (queued.task_fence_acceptance is not None) is expect_acceptance
+    assert _count(task_fence_db, "task_fence_ingress") == (
+        2 if expect_acceptance else 1
+    )
+    if classification == "fault":
+        assert "RuntimeError" in caplog.text
+        assert "raw-goal-launch-classifier-secret" not in caplog.text
 
 
 @pytest.mark.asyncio

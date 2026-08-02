@@ -64,6 +64,15 @@ from hermes_cli.fallback_config import get_fallback_chain
 from task_fence import (
     CausalEnvelope,
     TASK_FENCE_FINAL_GENERATION_KEY,
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
+)
+
+_TASK_FENCE_GOAL_CONTINUATION_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:goal-continuation",
+    capability_version="task-fence-capability-v4",
 )
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -18404,6 +18413,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source_event_id = "tfgc_" + hashlib.sha256(
             parent_generation.generation_id.encode("utf-8")
         ).hexdigest()
+        launch_catalog = getattr(self, "_task_fence_launch_catalog", None)
+        if launch_catalog is not None:
+            try:
+                launch_validation = launch_catalog.classify_route(
+                    _TASK_FENCE_GOAL_CONTINUATION_LAUNCH_ROUTE
+                )
+                if not isinstance(
+                    launch_validation,
+                    TaskFenceLaunchRouteValidation,
+                ):
+                    raise TypeError("invalid_goal_continuation_launch_validation")
+                if not launch_validation.verified:
+                    logger.warning(
+                        "Task Fence shadow Goal continuation launch route would "
+                        "block (%s): %s",
+                        launch_validation.route_id,
+                        launch_validation.reason,
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "Task Fence shadow Goal continuation launch route failed: %s",
+                    type(exc).__name__,
+                )
+                return None
         try:
             return await session_db.accept_task_fence_goal_continuation(
                 source_event_id=source_event_id,
@@ -21396,6 +21430,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        launch_catalog = getattr(self, "_task_fence_launch_catalog", None)
         task_fence_acceptance_factory: Optional[Callable[[], Any]] = None
         if (
             task_fence_acceptance is None
@@ -21406,9 +21441,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     observe_task_fence_process_completion,
                 )
 
-                return observe_task_fence_process_completion(evt)
+                return observe_task_fence_process_completion(
+                    evt,
+                    launch_catalog=launch_catalog,
+                )
 
             task_fence_acceptance_factory = accept_process_completion
+
+        wake_launch_catalog = (
+            launch_catalog
+            if (
+                task_fence_acceptance is not None
+                or task_fence_acceptance_factory is not None
+            )
+            else None
+        )
 
         source = self._build_process_event_source(evt)
         if not source:
@@ -21442,6 +21489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             task_fence_acceptance_factory=(
                                 task_fence_acceptance_factory
                             ),
+                            launch_catalog=wake_launch_catalog,
                         )
                         return True
                     except Exception as e:
@@ -21493,6 +21541,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     task_fence_acceptance_factory=(
                         task_fence_acceptance_factory
                     ),
+                    launch_catalog=wake_launch_catalog,
                 )
                 return True
             except Exception as e:
@@ -21507,7 +21556,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
-            from gateway.wake import deliver_wake
+            from gateway.wake import _classify_task_fence_wake, deliver_wake
 
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -21522,6 +21571,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip(),
                 metadata=metadata,
                 task_fence_acceptance=task_fence_acceptance,
+                launch_catalog=wake_launch_catalog,
             )
             if (
                 task_fence_acceptance is None
@@ -21532,8 +21582,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # but its spawned handler cannot run until this coroutine next
                 # yields. Preserve WP7.3's post-adapter evidence boundary while
                 # attaching the durable snapshot before typing/model start.
-                wake_event.task_fence_acceptance = (
-                    task_fence_acceptance_factory()
+                wake_event.task_fence_acceptance = _classify_task_fence_wake(
+                    wake_launch_catalog,
+                    task_fence_acceptance_factory(),
                 )
             return True
         except Exception as e:
@@ -21629,6 +21680,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable_claim_id = ""
         durable_delegation_id = ""
         task_fence_acceptance = None
+        launch_catalog = getattr(self, "_task_fence_launch_catalog", None)
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
@@ -21642,6 +21694,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         claim_completion_delivery_with_acceptance(
                             durable_delegation_id,
                             durable_claim_id,
+                            launch_catalog=launch_catalog,
                         )
                     )
                     if not claimed:
@@ -21715,7 +21768,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return injection_result
             accepted = True
 
-            if evt.get("type") == "completion":
+            if evt.get("type") == "completion" and launch_catalog is None:
                 from tools.async_delegation import complete_event_delivery
 
                 complete_event_delivery(evt, "")

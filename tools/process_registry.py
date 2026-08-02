@@ -49,8 +49,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from task_fence import (
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
+)
 
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_PROCESS_COMPLETION_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:process-completion",
+    capability_version="task-fence-capability-v4",
+)
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -175,7 +186,11 @@ def _capture_task_fence_process_parent() -> "tuple[Optional[str], Optional[int],
         return None, None, None
 
 
-def observe_task_fence_process_completion(event: Dict[str, Any]) -> Optional[Any]:
+def observe_task_fence_process_completion(
+    event: Dict[str, Any],
+    *,
+    launch_catalog: Any = None,
+) -> Optional[Any]:
     """Accept exact process evidence and return its process-local snapshot."""
 
     if not isinstance(event, dict) or event.get("type") != "completion":
@@ -259,6 +274,31 @@ def observe_task_fence_process_completion(event: Dict[str, Any]) -> Optional[Any
             identity.encode("utf-8")
         ).hexdigest()
         payload_hash = hashlib.sha256(event_bytes).hexdigest()
+
+        if launch_catalog is not None:
+            try:
+                launch_validation = launch_catalog.classify_route(
+                    _TASK_FENCE_PROCESS_COMPLETION_LAUNCH_ROUTE
+                )
+                if not isinstance(
+                    launch_validation,
+                    TaskFenceLaunchRouteValidation,
+                ):
+                    raise TypeError("invalid launch-route validation")
+                if not launch_validation.verified:
+                    logger.warning(
+                        "Task Fence shadow process-completion launch route "
+                        "would block (%s): %s",
+                        launch_validation.route_id,
+                        launch_validation.reason,
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "Task Fence shadow process-completion launch route failed: %s",
+                    type(exc).__name__,
+                )
+                return None
 
         from pathlib import Path
 

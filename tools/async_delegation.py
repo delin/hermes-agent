@@ -49,10 +49,21 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from task_fence import (
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
+)
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_DELEGATION_COMPLETION_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:delegation-completion",
+    capability_version="task-fence-capability-v4",
+)
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
@@ -413,6 +424,7 @@ def _observe_task_fence_completion_claim(
     event_json: object,
     parent_generation_id: object,
     parent_runtime_epoch: object,
+    launch_catalog: Any = None,
 ) -> Optional[Any]:
     """Accept exact delegation evidence and return its process-local snapshot."""
 
@@ -449,6 +461,31 @@ def _observe_task_fence_completion_claim(
         ).hexdigest()
         payload_hash = hashlib.sha256(event_json.encode("utf-8")).hexdigest()
 
+        if launch_catalog is not None:
+            try:
+                launch_validation = launch_catalog.classify_route(
+                    _TASK_FENCE_DELEGATION_COMPLETION_LAUNCH_ROUTE
+                )
+                if not isinstance(
+                    launch_validation,
+                    TaskFenceLaunchRouteValidation,
+                ):
+                    raise TypeError("invalid launch-route validation")
+                if not launch_validation.verified:
+                    logger.warning(
+                        "Task Fence shadow async-completion launch route "
+                        "would block (%s): %s",
+                        launch_validation.route_id,
+                        launch_validation.reason,
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "Task Fence shadow async-completion launch route failed: %s",
+                    type(exc).__name__,
+                )
+                return None
+
         from hermes_state import SessionDB
 
         db = SessionDB(_db_path())
@@ -481,6 +518,8 @@ def _observe_task_fence_completion_claim(
 def _claim_completion_delivery(
     delegation_id: str,
     claim_id: str,
+    *,
+    launch_catalog: Any = None,
 ) -> tuple[bool, Optional[Any]]:
     """Claim once and retain any trusted Task Fence acceptance locally."""
 
@@ -521,6 +560,7 @@ def _claim_completion_delivery(
             event_json=evidence[2],
             parent_generation_id=evidence[3],
             parent_runtime_epoch=evidence[4],
+            launch_catalog=launch_catalog,
         )
     return claimed, acceptance
 
@@ -535,10 +575,16 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 def claim_completion_delivery_with_acceptance(
     delegation_id: str,
     claim_id: str,
+    *,
+    launch_catalog: Any = None,
 ) -> tuple[bool, Optional[Any]]:
     """Claim for Wake and return only the already-durable acceptance."""
 
-    return _claim_completion_delivery(delegation_id, claim_id)
+    return _claim_completion_delivery(
+        delegation_id,
+        claim_id,
+        launch_catalog=launch_catalog,
+    )
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:

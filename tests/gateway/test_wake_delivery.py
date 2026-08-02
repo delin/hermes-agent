@@ -9,6 +9,7 @@ Two strategies:
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +25,12 @@ from gateway.wake import (
     adapter_supports_push,
     deliver_wake,
 )
-from task_fence import IngressAcceptance
+from task_fence import (
+    IngressAcceptance,
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
+)
 
 
 class PushAdapter:
@@ -72,6 +78,38 @@ def _acceptance() -> IngressAcceptance:
     )
 
 
+def _wake_route() -> TaskFenceLaunchRoute:
+    return TaskFenceLaunchRoute(
+        kind=TaskFenceCapabilityKind.RUNTIME,
+        route_id="runtime:wake-continuation",
+        capability_version="task-fence-capability-v4",
+    )
+
+
+def _recording_launch_catalog(classification="verified", *, order=None):
+    witnesses = []
+
+    def classify_route(route):
+        witnesses.append(route)
+        if order is not None:
+            order.append("classify")
+        if classification == "fault":
+            raise RuntimeError("raw-wake-launch-classifier-secret")
+        if classification == "malformed":
+            return object()
+        return TaskFenceLaunchRouteValidation(
+            verified=classification == "verified",
+            route_id=route.route_id,
+            reason=(
+                "verified"
+                if classification == "verified"
+                else "changed_reachable_route"
+            ),
+        )
+
+    return SimpleNamespace(classify_route=classify_route), witnesses
+
+
 def test_adapter_supports_push_default_true():
     assert adapter_supports_push(PushAdapter()) is True
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
@@ -80,6 +118,7 @@ def test_adapter_supports_push_default_true():
 def test_deliver_wake_push_preserves_only_process_local_acceptance():
     adapter = PushAdapter()
     acceptance = _acceptance()
+    launch_catalog, witnesses = _recording_launch_catalog()
 
     returned = asyncio.run(
         deliver_wake(
@@ -87,6 +126,7 @@ def test_deliver_wake_push_preserves_only_process_local_acceptance():
             text="wake up",
             source=_source(),
             task_fence_acceptance=acceptance,
+            launch_catalog=launch_catalog,
         )
     )
 
@@ -94,6 +134,35 @@ def test_deliver_wake_push_preserves_only_process_local_acceptance():
     assert returned.internal is True
     assert returned.task_fence_ingress is None
     assert returned.task_fence_acceptance is acceptance
+    assert witnesses == [_wake_route()]
+
+
+@pytest.mark.parametrize("classification", ["changed", "fault", "malformed"])
+def test_deliver_wake_launch_failure_keeps_push_but_drops_acceptance(
+    classification,
+    caplog,
+):
+    adapter = PushAdapter()
+    launch_catalog, witnesses = _recording_launch_catalog(classification)
+
+    returned = asyncio.run(
+        deliver_wake(
+            adapter,
+            text="wake despite launch drift",
+            source=_source(),
+            task_fence_acceptance=_acceptance(),
+            launch_catalog=launch_catalog,
+        )
+    )
+
+    assert adapter.handled == [returned]
+    assert returned.task_fence_acceptance is None
+    assert witnesses == [_wake_route()]
+    if classification == "fault":
+        assert "RuntimeError" in caplog.text
+        assert "raw-wake-launch-classifier-secret" not in caplog.text
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
@@ -115,6 +184,11 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     from aiohttp import web
 
     seen = {}
+    launch_calls = []
+
+    def classify_route(route):
+        launch_calls.append(route)
+        raise AssertionError("bare wake must not classify")
 
     async def handler(request):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
@@ -126,7 +200,12 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         runner, port = await _serve(handler)
         try:
             adapter = ApiServerLikeAdapter(host="0.0.0.0", port=port, key="sekrit")
-            await deliver_wake(adapter, text="task done — wake", session_id="raw-sid-42")
+            await deliver_wake(
+                adapter,
+                text="task done — wake",
+                session_id="raw-sid-42",
+                launch_catalog=SimpleNamespace(classify_route=classify_route),
+            )
         finally:
             await runner.cleanup()
 
@@ -137,6 +216,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
     ]
+    assert launch_calls == []
 
 
 @pytest.mark.parametrize(
@@ -149,6 +229,7 @@ def test_real_api_self_post_resolves_one_use_task_fence_acceptance(
 ):
     acceptance = _acceptance()
     seen = []
+    launch_catalog, witnesses = _recording_launch_catalog()
 
     async def run():
         adapter = APIServerAdapter(
@@ -185,6 +266,7 @@ def test_real_api_self_post_resolves_one_use_task_fence_acceptance(
                 text=wake_text,
                 session_id="raw-sid-42",
                 task_fence_acceptance=acceptance,
+                launch_catalog=launch_catalog,
             )
             assert adapter._task_fence_wake_tokens == {}
         finally:
@@ -194,6 +276,7 @@ def test_real_api_self_post_resolves_one_use_task_fence_acceptance(
     assert seen == [
         (acceptance, wake_text[:MAX_NORMALIZED_TEXT_LENGTH])
     ]
+    assert witnesses == [_wake_route()]
 
 
 def test_process_completion_api_self_post_resolves_after_admission(
@@ -212,9 +295,12 @@ def test_process_completion_api_self_post_resolves_after_admission(
     }
     order = []
     seen = []
+    launch_catalog, witnesses = _recording_launch_catalog(order=order)
+    expected_launch_catalog = launch_catalog
 
-    def observe(candidate):
+    def observe(candidate, *, launch_catalog=None):
         assert candidate is event
+        assert launch_catalog is expected_launch_catalog
         order.append("observe")
         return acceptance
 
@@ -270,6 +356,7 @@ def test_process_completion_api_self_post_resolves_after_admission(
         adapter._port = port
         gateway = object.__new__(GatewayRunner)
         gateway.adapters = {Platform.API_SERVER: adapter}
+        gateway._task_fence_launch_catalog = launch_catalog
         try:
             assert await gateway._inject_watch_notification(
                 "process done — wake",
@@ -286,9 +373,62 @@ def test_process_completion_api_self_post_resolves_after_admission(
         "register",
         "admission",
         "observe",
+        "classify",
         "run",
     ]
     assert seen == [acceptance]
+    assert witnesses == [_wake_route()]
+
+
+def test_wake_launch_failure_keeps_non_push_delivery_but_drops_acceptance():
+    seen = []
+    factory_calls = []
+    launch_catalog, witnesses = _recording_launch_catalog("changed")
+
+    def acceptance_factory():
+        factory_calls.append(True)
+        return _acceptance()
+
+    async def run():
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"key": "sekrit"})
+        )
+
+        async def no_session_db():
+            return None
+
+        async def fake_run_agent(**kwargs):
+            seen.append(kwargs.get("task_fence_acceptance"))
+            return (
+                {
+                    "final_response": "legacy wake delivered",
+                    "completed": True,
+                    "session_id": kwargs["session_id"],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        adapter._ensure_session_db_async = no_session_db
+        adapter._run_agent = fake_run_agent
+        runner, port = await _serve(adapter._handle_chat_completions)
+        adapter._host = "127.0.0.1"
+        adapter._port = port
+        try:
+            await deliver_wake(
+                adapter,
+                text="wake without Task Fence carrier",
+                session_id="raw-sid-fail-open",
+                task_fence_acceptance_factory=acceptance_factory,
+                launch_catalog=launch_catalog,
+            )
+            assert adapter._task_fence_wake_tokens == {}
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert factory_calls == [True]
+    assert seen == [None]
+    assert witnesses == [_wake_route()]
 
 
 def test_real_api_rejects_mismatched_or_replayed_wake_nonce():
