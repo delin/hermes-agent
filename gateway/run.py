@@ -8579,6 +8579,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 canonical_key,
             )
             return
+        launch_route = getattr(sidecar, "launch_route", None)
+        if launch_route is not None:
+            launch_catalog = getattr(self, "_task_fence_launch_catalog", None)
+            if launch_catalog is None:
+                logger.warning(
+                    "Task Fence shadow ingress launch route would block for %s: "
+                    "launch_catalog_unavailable",
+                    canonical_key,
+                )
+                return
+            try:
+                launch_validation = launch_catalog.classify_route(launch_route)
+            except Exception as exc:
+                logger.warning(
+                    "Task Fence shadow ingress launch route failed for %s: %s",
+                    canonical_key,
+                    type(exc).__name__,
+                )
+                return
+            if not launch_validation.verified:
+                logger.warning(
+                    "Task Fence shadow ingress launch route would block for %s "
+                    "(%s): %s",
+                    canonical_key,
+                    launch_validation.route_id,
+                    launch_validation.reason,
+                )
+                return
         try:
             acceptance = await session_db.accept_task_fence_ingress_sidecar(
                 sidecar,

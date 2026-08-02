@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
@@ -33,10 +34,16 @@ from hermes_state import AsyncSessionDB, SessionDB
 from plugins.platforms.slack.adapter import SlackAdapter
 from task_fence import (
     CausalEnvelope,
+    TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchCatalog,
+    TaskFenceLaunchRoute,
     TaskFencePolicy,
     bind_task_fence_policy,
     current_causal_envelope,
     current_task_fence_policy,
+    task_fence_launch_manifest_fingerprint,
 )
 
 
@@ -83,6 +90,16 @@ def _runner(db: SessionDB) -> GatewayRunner:
         task_fence_shadow_conversation_key=session_key,
     )
     runner._session_db = AsyncSessionDB(db)
+    runner._task_fence_launch_catalog = TaskFenceLaunchCatalog(
+        conversation_fingerprint="a" * 64,
+        manifest_fingerprint=task_fence_launch_manifest_fingerprint(
+            TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+        ),
+        runtime_epoch=1,
+        mode_generation=0,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        declarations=TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    )
     runner._update_prompt_pending = {}
     runner._is_user_authorized = lambda _source: True
     return runner
@@ -284,6 +301,16 @@ async def test_real_slack_final_response_audits_every_physical_post(
     case,
 ):
     db, runner, event, session_key, parent = await _accepted_lane(tmp_path)
+    launch_witnesses = []
+    launch_catalog = runner._task_fence_launch_catalog
+
+    def classify_route(route):
+        launch_witnesses.append(route)
+        return launch_catalog.classify_route(route)
+
+    runner._task_fence_launch_catalog = SimpleNamespace(
+        classify_route=classify_route
+    )
     rich_blocks = case == "block-fallback"
     adapter, client = _slack_adapter(rich_blocks=rich_blocks)
     adapter.gateway_runner = runner
@@ -350,6 +377,13 @@ async def test_real_slack_final_response_audits_every_physical_post(
             assert len(physical_calls) > 1
         else:
             assert len(physical_calls) == expected_calls
+        assert launch_witnesses == [
+            TaskFenceLaunchRoute(
+                kind=TaskFenceCapabilityKind.ADAPTER,
+                route_id="gateway:slack:chat_post_message",
+                capability_version="task-fence-capability-v4",
+            )
+        ] * len(physical_calls)
 
         with db._lock:
             permits = db._conn.execute(
@@ -458,6 +492,81 @@ async def test_real_slack_final_response_audits_every_physical_post(
         assert not hasattr(event, TASK_FENCE_DELIVERY_CAPABILITY_ATTR)
         assert current_causal_envelope() is None
         assert current_task_fence_policy() is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("missing", "launch_catalog_unavailable"),
+        ("changed", "changed_reachable_route"),
+        ("fault", "RuntimeError"),
+    ],
+)
+async def test_slack_launch_witness_failure_keeps_physical_post(
+    tmp_path,
+    caplog,
+    case,
+    expected_reason,
+):
+    db, runner, event, session_key, parent = await _accepted_lane(tmp_path)
+    response = "launch mismatch stays shadow only"
+    _stage_capability(runner, event, session_key, response, parent)
+    adapter, client = _slack_adapter()
+    adapter.gateway_runner = runner
+    physical_calls = []
+
+    async def post_message(**kwargs):
+        physical_calls.append(dict(kwargs))
+        if len(physical_calls) == 1:
+            raise ConnectionError("connection reset")
+        return {"ts": "1710000000.000088"}
+
+    client.chat_postMessage.side_effect = post_message
+
+    route_scope = nullcontext()
+    if case == "changed":
+        route_scope = patch(
+            "gateway.task_fence_delivery."
+            "_TASK_FENCE_SLACK_CHAT_POST_MESSAGE_ROUTE",
+            TaskFenceLaunchRoute(
+                kind=TaskFenceCapabilityKind.ADAPTER,
+                route_id="gateway:slack:chat_post_message",
+                capability_version="task-fence-capability-v5",
+            ),
+        )
+    if case == "missing":
+        runner._task_fence_launch_catalog = None
+    elif case == "fault":
+        runner._task_fence_launch_catalog = MagicMock()
+        runner._task_fence_launch_catalog.classify_route.side_effect = (
+            RuntimeError("classification fault")
+        )
+
+    try:
+        caplog.set_level(
+            logging.WARNING,
+            logger="gateway.task_fence_delivery",
+        )
+        with (
+            route_scope,
+            patch("gateway.platforms.base.asyncio.sleep", new=AsyncMock()),
+        ):
+            await _run_base_final(adapter, event, session_key, response)
+
+        assert physical_calls == [
+            {
+                "channel": "D123",
+                "text": response,
+                "mrkdwn": True,
+                "thread_ts": "1700000000.000001",
+            }
+        ] * 2
+        assert _count(db, "task_fence_dispatch_permits") == 0
+        assert _count(db, "task_fence_attempts") == 0
+        assert any(expected_reason in record.message for record in caplog.records)
     finally:
         db.close()
 

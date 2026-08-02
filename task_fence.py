@@ -1098,6 +1098,7 @@ class TaskFenceIngressSidecar:
     terminal_reason: TerminalReason | None = None
     source_sequence: int | None = None
     causal_parent_generation_id: str | None = None
+    launch_route: TaskFenceLaunchRoute | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1125,6 +1126,11 @@ class TaskFenceIngressSidecar:
                 conversation_id="task-fence-sidecar-validation",
                 action=candidate,
             )
+        if self.launch_route is not None and not isinstance(
+            self.launch_route,
+            TaskFenceLaunchRoute,
+        ):
+            raise TaskFenceProtocolRejected("invalid_launch_route_type")
 
     def to_envelope(
         self,
@@ -1156,6 +1162,7 @@ def task_fence_sidecar_for_plain_text(
     source: str,
     source_event_id: str,
     payload_text: str,
+    launch_route: TaskFenceLaunchRoute | None = None,
 ) -> TaskFenceIngressSidecar:
     """Classify one trusted plain-text human submit without surface logic."""
 
@@ -1173,6 +1180,7 @@ def task_fence_sidecar_for_plain_text(
         action=TASK_FENCE_ACTIONS["initial_submit"],
         active_lane_action=TASK_FENCE_ACTIONS["comment_hold"],
         payload_hash=payload_hash,
+        launch_route=launch_route,
     )
 
 

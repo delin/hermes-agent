@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import importlib
 from importlib.machinery import PathFinder
+import logging
 import os
 import socket
 import sys
@@ -35,7 +36,29 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 from hermes_state import AsyncSessionDB, SessionDB
-from task_fence import TASK_FENCE_ACTIONS, TerminalReason
+from task_fence import (
+    TASK_FENCE_ACTIONS,
+    TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchCatalog,
+    TaskFenceLaunchRoute,
+    TerminalReason,
+    task_fence_launch_manifest_fingerprint,
+)
+
+
+def _task_fence_launch_catalog() -> TaskFenceLaunchCatalog:
+    return TaskFenceLaunchCatalog(
+        conversation_fingerprint="a" * 64,
+        manifest_fingerprint=task_fence_launch_manifest_fingerprint(
+            TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+        ),
+        runtime_epoch=1,
+        mode_generation=0,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        declarations=TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +312,7 @@ class TestTaskFenceIngressSidecar:
             task_fence_shadow_conversation_key=session_key,
         )
         runner._session_db = AsyncSessionDB(db)
+        runner._task_fence_launch_catalog = _task_fence_launch_catalog()
         runner._update_prompt_pending = {}
         runner._is_user_authorized = lambda source: source is not None
         adapter.handle_message = BasePlatformAdapter.handle_message.__get__(
@@ -366,6 +390,13 @@ class TestTaskFenceIngressSidecar:
             session_key,
         ]
         assert handled_events[0].task_fence_ingress is not None
+        assert handled_events[0].task_fence_ingress.launch_route == (
+            TaskFenceLaunchRoute(
+                kind=TaskFenceCapabilityKind.ADAPTER,
+                route_id="gateway:slack:typed_ingress",
+                capability_version="task-fence-capability-v4",
+            )
+        )
         assert handled_events[0].task_fence_acceptance is not None
         assert handled_events[1].task_fence_ingress is None
         assert handled_events[1].task_fence_acceptance is None
@@ -375,6 +406,108 @@ class TestTaskFenceIngressSidecar:
             (1, "replace", "run"),
         ]
         assert total_changes[1] == total_changes[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("case", "expected_reason"),
+        [
+            ("missing", "launch_catalog_unavailable"),
+            ("changed", "changed_reachable_route"),
+            ("fault", "RuntimeError"),
+        ],
+    )
+    async def test_raw_dm_launch_witness_failure_keeps_legacy_handler(
+        self,
+        adapter,
+        tmp_path,
+        caplog,
+        case,
+        expected_reason,
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        ts = "1700000000.123454"
+        source = adapter.build_source(
+            chat_id="D123",
+            chat_type="dm",
+            user_id="U123",
+            thread_id=ts,
+            scope_id="T123",
+        )
+        session_key = build_session_key(source)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="test")
+            },
+            task_fence_shadow_conversation_key=session_key,
+        )
+        runner._session_db = AsyncSessionDB(db)
+        runner._update_prompt_pending = {}
+        runner._is_user_authorized = lambda candidate: candidate is not None
+        runner._task_fence_launch_catalog = _task_fence_launch_catalog()
+        route_scope = contextlib.nullcontext()
+        if case == "missing":
+            runner._task_fence_launch_catalog = None
+        elif case == "changed":
+            changed_route = TaskFenceLaunchRoute(
+                kind=TaskFenceCapabilityKind.ADAPTER,
+                route_id="gateway:slack:typed_ingress",
+                capability_version="task-fence-capability-v5",
+            )
+            route_scope = patch(
+                "plugins.platforms.slack.adapter."
+                "_TASK_FENCE_SLACK_TYPED_INGRESS_ROUTE",
+                changed_route,
+            )
+        else:
+            runner._task_fence_launch_catalog = MagicMock()
+            runner._task_fence_launch_catalog.classify_route.side_effect = (
+                RuntimeError("classification fault")
+            )
+
+        adapter.handle_message = BasePlatformAdapter.handle_message.__get__(
+            adapter,
+            type(adapter),
+        )
+        adapter.set_task_fence_ingress_handler(
+            runner._accept_task_fence_gateway_ingress
+        )
+        handled = asyncio.Event()
+        handled_events = []
+
+        async def handler(event):
+            handled_events.append(event)
+            handled.set()
+            return None
+
+        adapter.set_message_handler(handler)
+        caplog.set_level(logging.WARNING, logger="gateway.run")
+        try:
+            with route_scope:
+                await adapter._handle_slack_message(
+                    {
+                        "text": "legacy dispatch survives witness mismatch",
+                        "user": "U123",
+                        "channel": "D123",
+                        "channel_type": "im",
+                        "ts": ts,
+                    },
+                    {"team_id": "T123"},
+                )
+                await asyncio.wait_for(handled.wait(), timeout=1)
+                with db._lock:
+                    ingress_count = db._conn.execute(
+                        "SELECT COUNT(*) FROM task_fence_ingress"
+                    ).fetchone()[0]
+        finally:
+            await adapter.cancel_background_tasks()
+            db.close()
+
+        assert len(handled_events) == 1
+        assert ingress_count == 0
+        assert handled_events[0].task_fence_acceptance is None
+        assert handled_events[0].task_fence_acceptance_attempted is True
+        assert any(expected_reason in record.message for record in caplog.records)
 
     @pytest.mark.asyncio
     async def test_plain_dm_emits_typed_secret_free_sidecar(self, adapter):
@@ -398,6 +531,15 @@ class TestTaskFenceIngressSidecar:
         )
         assert sidecar.action == TASK_FENCE_ACTIONS["initial_submit"]
         assert sidecar.active_lane_action == TASK_FENCE_ACTIONS["comment_hold"]
+        assert sidecar.launch_route == TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.ADAPTER,
+            route_id="gateway:slack:typed_ingress",
+            capability_version="task-fence-capability-v4",
+        )
+        assert not hasattr(
+            sidecar.to_envelope(conversation_id="agent:main:slack:dm:D123"),
+            "launch_route",
+        )
         assert len(sidecar.payload_hash or "") == 64
         assert "start the bounded task" not in repr(sidecar)
 

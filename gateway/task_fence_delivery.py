@@ -19,6 +19,8 @@ from task_fence import (
     DecisionOutcome,
     OperationDescriptor,
     OperationKind,
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
     TaskFencePolicy,
     bind_causal_envelope,
     bind_task_fence_policy,
@@ -30,6 +32,11 @@ logger = logging.getLogger(__name__)
 TASK_FENCE_DELIVERY_CAPABILITY_ATTR = "_task_fence_delivery_capability"
 _SLACK_CHAT_POST_MESSAGE_ADAPTER = "gateway:slack:chat_post_message"
 _TELEGRAM_SEND_MESSAGE_ADAPTER = "gateway:telegram:send_message"
+_TASK_FENCE_SLACK_CHAT_POST_MESSAGE_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="gateway:slack:chat_post_message",
+    capability_version="task-fence-capability-v4",
+)
 _TELEGRAM_SEND_MESSAGE_REQUEST_KEYS = frozenset(
     {
         "chat_id",
@@ -322,6 +329,7 @@ async def _task_fence_delivery_handoff(
     delivery_source: str,
     adapter: str,
     runner: Any,
+    launch_route: TaskFenceLaunchRoute | None,
     invocation_fingerprint: Callable[[], str],
     acknowledgement_ref: Callable[[Any], str | None],
     physical_call: Callable[[], Awaitable[Any]],
@@ -344,16 +352,41 @@ async def _task_fence_delivery_handoff(
         store = getattr(session_db, "_db", session_db)
         if store is None:
             raise RuntimeError("missing Task Fence delivery store")
-        policy = TaskFencePolicy(store)
-        fingerprint = invocation_fingerprint()
-        attempt_id = await asyncio.to_thread(
-            _audit_delivery_start,
-            policy,
-            child,
-            invocation_id,
-            adapter,
-            fingerprint,
-        )
+        if launch_route is not None:
+            launch_catalog = getattr(runner, "_task_fence_launch_catalog", None)
+            if launch_catalog is None:
+                logger.warning(
+                    "Task Fence shadow delivery launch route would block for %s "
+                    "(%s): launch_catalog_unavailable",
+                    adapter,
+                    launch_route.route_id,
+                )
+                policy = None
+            else:
+                launch_validation = launch_catalog.classify_route(launch_route)
+                if not launch_validation.verified:
+                    logger.warning(
+                        "Task Fence shadow delivery launch route would block for %s "
+                        "(%s): %s",
+                        adapter,
+                        launch_validation.route_id,
+                        launch_validation.reason,
+                    )
+                    policy = None
+                else:
+                    policy = TaskFencePolicy(store)
+        else:
+            policy = TaskFencePolicy(store)
+        if policy is not None:
+            fingerprint = invocation_fingerprint()
+            attempt_id = await asyncio.to_thread(
+                _audit_delivery_start,
+                policy,
+                child,
+                invocation_id,
+                adapter,
+                fingerprint,
+            )
     except Exception as exc:
         logger.warning(
             "Task Fence shadow delivery observation failed for %s: %s",
@@ -415,6 +448,7 @@ async def task_fence_slack_post_message_handoff(
         delivery_source="gateway:slack",
         adapter=_SLACK_CHAT_POST_MESSAGE_ADAPTER,
         runner=runner,
+        launch_route=_TASK_FENCE_SLACK_CHAT_POST_MESSAGE_ROUTE,
         invocation_fingerprint=lambda: _slack_post_message_fingerprint(
             team_id=team_id,
             request=request_copy,
@@ -446,6 +480,7 @@ async def task_fence_telegram_send_message_handoff(
         delivery_source="gateway:telegram",
         adapter=_TELEGRAM_SEND_MESSAGE_ADAPTER,
         runner=runner,
+        launch_route=None,
         invocation_fingerprint=lambda: _telegram_send_message_fingerprint(
             bot_id=getattr(bot, "id", None),
             request=request_copy,

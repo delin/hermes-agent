@@ -65,7 +65,11 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
     coerce_plaintext_gateway_command,
 )
-from task_fence import bind_task_fence_policy
+from task_fence import (
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    bind_task_fence_policy,
+)
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
@@ -74,6 +78,12 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_SLACK_TYPED_INGRESS_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="gateway:slack:typed_ingress",
+    capability_version="task-fence-capability-v4",
+)
 
 # User-Agent prefix for outbound Slack API calls so platform partners can
 # identify HermesAgent traffic — matching other Hermes outbound surfaces
@@ -6393,6 +6403,7 @@ class SlackAdapter(BasePlatformAdapter):
                 payload_text=(
                     command_probe_text if is_command_text else original_text
                 ),
+                launch_route=_TASK_FENCE_SLACK_TYPED_INGRESS_ROUTE,
             )
 
         if ts:
@@ -7807,6 +7818,7 @@ class SlackAdapter(BasePlatformAdapter):
                 source_event_id=(
                     f"command:{team_id or '-'}:{channel_id}:{trigger_id}"
                 ),
+                launch_route=_TASK_FENCE_SLACK_TYPED_INGRESS_ROUTE,
             )
 
         # Stash the Slack response_url so the first reply for this

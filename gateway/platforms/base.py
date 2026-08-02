@@ -556,6 +556,7 @@ from task_fence import (
     IngressAcceptance,
     TASK_FENCE_ACTIONS,
     TaskFenceIngressSidecar,
+    TaskFenceLaunchRoute,
     TaskFenceProtocolRejected,
     TerminalReason,
     task_fence_sidecar_for_plain_text,
@@ -2179,6 +2180,7 @@ def task_fence_sidecar_for_human_message(
     *,
     source_event_id: str,
     payload_text: Optional[str] = None,
+    launch_route: TaskFenceLaunchRoute | None = None,
 ) -> Optional[TaskFenceIngressSidecar]:
     """Classify one adapter event without model or free-form text inference.
 
@@ -2224,6 +2226,7 @@ def task_fence_sidecar_for_human_message(
                 source=f"gateway:{platform_name}",
                 source_event_id=source_event_id,
                 payload_text=canonical_text or "",
+                launch_route=launch_route,
             )
         message_type = getattr(
             event.message_type,
@@ -2239,6 +2242,7 @@ def task_fence_sidecar_for_human_message(
             action=action,
             payload_hash=payload_hash,
             terminal_reason=terminal_reason,
+            launch_route=launch_route,
         )
     except (TaskFenceProtocolRejected, UnicodeEncodeError):
         # Adapter metadata is untrusted until the typed value validates. In
