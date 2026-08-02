@@ -131,10 +131,25 @@ def _event(
     )
     event.task_fence_ingress = task_fence_sidecar_for_human_message(
         event,
-        source="gateway:slack",
         source_event_id=f"event:T123:D123:{event_id}",
     )
     return event
+
+
+def test_sidecar_source_is_derived_from_typed_event_platform() -> None:
+    event = _event("typed source", "1700000000.000000")
+
+    assert event.task_fence_ingress is not None
+    assert event.task_fence_ingress.source == "gateway:slack"
+
+    event.source = replace(event.source, platform="slack")
+    assert (
+        task_fence_sidecar_for_human_message(
+            event,
+            source_event_id="event:T123:D123:untyped-platform",
+        )
+        is None
+    )
 
 
 def _text_response(content: str) -> SimpleNamespace:
@@ -852,9 +867,10 @@ async def test_busy_text_coalescing_carries_latest_exact_acceptance(
 
     assert failed.task_fence_acceptance is None
     assert merged.text == "earlier\nlatest\nfailed"
-    assert merged.task_fence_ingress is failed.task_fence_ingress
+    assert merged.task_fence_ingress is None
     assert merged.task_fence_acceptance is None
     assert merged.task_fence_acceptance_attempted is True
+    assert merged._task_fence_mixed_origin is True
     assert _count(task_fence_db, "task_fence_ingress") == 3
 
     release_first.set()

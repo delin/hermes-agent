@@ -296,7 +296,6 @@ async def _accept_configured_slack_ingress(db: Any) -> tuple[Any, int]:
     )
     event.task_fence_ingress = task_fence_sidecar_for_human_message(
         event,
-        source="gateway:slack",
         source_event_id=(
             "event:T_TASK_FENCE_CAMPAIGN:D_TASK_FENCE_CAMPAIGN:"
             "1700000000.000001"

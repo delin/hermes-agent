@@ -68,7 +68,6 @@ def _event(text: str, message_id: str) -> MessageEvent:
     )
     event.task_fence_ingress = task_fence_sidecar_for_human_message(
         event,
-        source="gateway:slack",
         source_event_id=f"event:T123:D123:{message_id}",
     )
     return event

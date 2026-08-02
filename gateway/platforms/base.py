@@ -2176,7 +2176,6 @@ class MessageEvent:
 def task_fence_sidecar_for_human_message(
     event: MessageEvent,
     *,
-    source: str,
     source_event_id: str,
     payload_text: Optional[str] = None,
 ) -> Optional[TaskFenceIngressSidecar]:
@@ -2187,12 +2186,17 @@ def task_fence_sidecar_for_human_message(
     and other command paths remain outside this shadow increment.
     """
 
+    platform = getattr(getattr(event, "source", None), "platform", None)
+    platform_name = getattr(platform, "value", None)
     if (
         event.internal
         or getattr(event.source, "is_bot", False)
         or event.prompt_response is not None
         or event.media_urls
         or event.media_types
+        or not isinstance(platform, Platform)
+        or not isinstance(platform_name, str)
+        or not platform_name
         or not source_event_id
     ):
         return None
@@ -2225,7 +2229,7 @@ def task_fence_sidecar_for_human_message(
             f"{message_type}\x00{canonical_text or ''}".encode("utf-8")
         ).hexdigest()
         return TaskFenceIngressSidecar(
-            source=source,
+            source=f"gateway:{platform_name}",
             source_event_id=source_event_id,
             action=action,
             active_lane_action=active_lane_action,
@@ -2528,10 +2532,15 @@ def _carry_latest_task_fence_ingress_result(
         or getattr(incoming, "_task_fence_mixed_origin", False)
         or existing.internal
         or incoming.internal
+        or existing.task_fence_ingress is None
+        or incoming.task_fence_ingress is None
+        or existing.task_fence_acceptance is None
+        or incoming.task_fence_acceptance is None
     ):
-        # A merged prompt containing any runtime text has no single exact
-        # human/synthetic parent. Preserve the legacy merged turn, but do not
-        # let either acceptance launder authority for the combined payload.
+        # A merged prompt containing runtime, untyped, or uncommitted text has
+        # no closed exact authority chain. Preserve the legacy merged turn,
+        # but do not let either acceptance launder authority for the combined
+        # payload.
         existing.task_fence_ingress = None
         existing.task_fence_acceptance = None
         existing.task_fence_acceptance_attempted = True
@@ -3452,6 +3461,26 @@ class BasePlatformAdapter(ABC):
         """Install the default-off durable pre-dispatch acceptance hook."""
 
         self._task_fence_ingress_handler = handler
+
+    async def _invoke_task_fence_ingress_handler(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> None:
+        """Invoke the common shadow hook without changing legacy outcomes."""
+
+        task_fence_handler = getattr(self, "_task_fence_ingress_handler", None)
+        if task_fence_handler is None:
+            return
+        try:
+            await task_fence_handler(event, session_key)
+        except Exception:
+            logger.warning(
+                "[%s] Task Fence shadow ingress hook failed open for %s",
+                self.name,
+                session_key,
+                exc_info=True,
+            )
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -5701,17 +5730,7 @@ class BasePlatformAdapter(ABC):
         # the adapter busy queue/bypass paths and cold-path typing/start hooks.
         # Audit is observation-only: an unavailable/rejected shadow write is
         # logged by the runner but the legacy outcome remains unchanged.
-        task_fence_handler = getattr(self, "_task_fence_ingress_handler", None)
-        if task_fence_handler is not None:
-            try:
-                await task_fence_handler(event, session_key)
-            except Exception:
-                logger.warning(
-                    "[%s] Task Fence shadow ingress hook failed open for %s",
-                    self.name,
-                    session_key,
-                    exc_info=True,
-                )
+        await self._invoke_task_fence_ingress_handler(event, session_key)
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:

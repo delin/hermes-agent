@@ -270,6 +270,52 @@ def test_merge_preserves_incoming_mixed_origin_taint():
     assert merged.task_fence_ingress is None
     assert merged.task_fence_acceptance is None
     assert merged.task_fence_acceptance_attempted is True
+
+
+@pytest.mark.parametrize("unaccepted_first", [False, True])
+def test_merge_with_unaccepted_human_event_cannot_carry_authority(
+    unaccepted_first,
+):
+    """A later acceptance cannot cover another uncommitted human input."""
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+    accepted = MessageEvent(
+        text="accepted",
+        message_type=MessageType.TEXT,
+        source=source,
+        task_fence_ingress=object(),
+        task_fence_acceptance=object(),
+    )
+    unaccepted = MessageEvent(
+        text="unaccepted",
+        message_type=MessageType.TEXT,
+        source=source,
+        task_fence_ingress=object(),
+        task_fence_acceptance_attempted=True,
+    )
+    first, second = (
+        (unaccepted, accepted) if unaccepted_first else (accepted, unaccepted)
+    )
+    expected_text = f"{first.text}\n{second.text}"
+    pending = {}
+
+    merge_pending_message_event(pending, session_key, first, merge_text=True)
+    merge_pending_message_event(pending, session_key, second, merge_text=True)
+
+    merged = pending[session_key]
+    assert merged.text == expected_text
+    assert merged.task_fence_ingress is None
+    assert merged.task_fence_acceptance is None
+    assert merged.task_fence_acceptance_attempted is True
+    assert merged._task_fence_mixed_origin is True
+
+
 @pytest.mark.asyncio
 async def test_recent_telegram_followups_append_in_pending_queue():
     runner = _make_runner()

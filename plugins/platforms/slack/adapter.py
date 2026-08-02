@@ -6387,7 +6387,6 @@ class SlackAdapter(BasePlatformAdapter):
             coerce_plaintext_gateway_command(msg_event)
             msg_event.task_fence_ingress = task_fence_sidecar_for_human_message(
                 msg_event,
-                source="gateway:slack",
                 source_event_id=(
                     f"event:{team_id or '-'}:{channel_id}:{event_ts or ts}"
                 ),
@@ -7805,7 +7804,6 @@ class SlackAdapter(BasePlatformAdapter):
         if trigger_id:
             event.task_fence_ingress = task_fence_sidecar_for_human_message(
                 event,
-                source="gateway:slack",
                 source_event_id=(
                     f"command:{team_id or '-'}:{channel_id}:{trigger_id}"
                 ),
