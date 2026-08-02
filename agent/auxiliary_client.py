@@ -110,9 +110,20 @@ from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
+_TASK_FENCE_OPENAI_CHAT_COMPLETIONS_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:openai.chat.completions.create",
+    capability_version="task-fence-capability-v4",
+)
+_TASK_FENCE_OPENAI_RESPONSES_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:openai.responses.create",
+    capability_version="task-fence-capability-v4",
+)
 
 
 # ── resolve_provider_client fall-through dedup ───────────────────────────
@@ -1243,6 +1254,7 @@ class _CodexCompletionsAdapter:
                         getattr(self._client, "base_url", "") or ""
                     ),
                 },
+                launch_route=_TASK_FENCE_OPENAI_RESPONSES_LAUNCH_ROUTE,
                 policy=task_fence_model_policy,
             ):
                 event_stream = self._client.responses.create(**stream_kwargs)
@@ -4098,6 +4110,7 @@ def _task_fence_sync_model_create(
         adapter="provider:openai.chat.completions.create",
         request=kwargs,
         route=route,
+        launch_route=_TASK_FENCE_OPENAI_CHAT_COMPLETIONS_LAUNCH_ROUTE,
         policy=task_fence_model_policy,
     ):
         return create(**kwargs)

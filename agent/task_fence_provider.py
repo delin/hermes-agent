@@ -7,7 +7,10 @@ import json
 import logging
 import uuid
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
+
+if TYPE_CHECKING:
+    from task_fence import TaskFenceLaunchRoute
 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +160,7 @@ def task_fence_model_handoff(
     adapter: str,
     request: Mapping[str, Any],
     route: Mapping[str, Any],
+    launch_route: TaskFenceLaunchRoute,
     policy: Any | None,
 ) -> Iterator[str | None]:
     """Observe one physical provider handoff without gating legacy dispatch."""
@@ -165,6 +169,26 @@ def task_fence_model_handoff(
         bind_causal_envelope,
         current_causal_envelope,
     )
+
+    if policy is not None:
+        try:
+            launch_validation = policy.classify_launch_route(launch_route)
+            if launch_validation is not None and not launch_validation.verified:
+                logger.warning(
+                    "Task Fence shadow model launch route would block for %s "
+                    "(%s): %s",
+                    adapter,
+                    launch_validation.route_id,
+                    launch_validation.reason,
+                )
+                policy = None
+        except Exception as exc:
+            logger.warning(
+                "Task Fence shadow model launch route failed for %s: %s",
+                adapter,
+                type(exc).__name__,
+            )
+            policy = None
 
     try:
         envelope = current_causal_envelope()
@@ -263,6 +287,7 @@ def task_fence_model_stream_handoff(
     adapter: str,
     request: Mapping[str, Any],
     route: Mapping[str, Any],
+    launch_route: TaskFenceLaunchRoute,
     policy: Any | None,
     open_stream: Callable[[], Any],
 ) -> Iterator[Any]:
@@ -272,6 +297,7 @@ def task_fence_model_stream_handoff(
         adapter=adapter,
         request=request,
         route=route,
+        launch_route=launch_route,
         policy=policy,
     ):
         with open_stream() as stream:

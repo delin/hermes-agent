@@ -1498,6 +1498,7 @@ class TaskFencePolicy:
         store: _TaskFencePolicyStore,
         *,
         runtime_conversation_key: str | None = None,
+        launch_catalog: TaskFenceLaunchCatalog | None = None,
     ):
         _bounded_text(
             runtime_conversation_key,
@@ -1507,6 +1508,17 @@ class TaskFencePolicy:
         )
         self._store = store
         self._runtime_conversation_key = runtime_conversation_key
+        self._launch_catalog = launch_catalog
+
+    def classify_launch_route(
+        self,
+        route: TaskFenceLaunchRoute,
+    ) -> TaskFenceLaunchRouteValidation | None:
+        """Classify an independent handoff witness when a catalog is bound."""
+
+        if self._launch_catalog is None:
+            return None
+        return self._launch_catalog.classify_route(route)
 
     def admit_operation(
         self,

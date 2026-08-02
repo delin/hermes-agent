@@ -2344,7 +2344,14 @@ def run_conversation(
                     ):
                         provider_store = getattr(agent, "_session_db", None)
                         if provider_store is not None:
-                            provider_policy = TaskFencePolicy(provider_store)
+                            provider_policy = TaskFencePolicy(
+                                provider_store,
+                                launch_catalog=getattr(
+                                    agent,
+                                    "_task_fence_launch_catalog",
+                                    None,
+                                ),
+                            )
                     provider_call_kwargs = {}
                     if provider_policy is not None:
                         provider_call_kwargs["_task_fence_model_policy"] = (
@@ -6284,6 +6291,11 @@ def run_conversation(
                         _task_fence_policy = TaskFencePolicy(
                             _task_fence_store,
                             runtime_conversation_key=_task_fence_projection.conversation_id,
+                            launch_catalog=getattr(
+                                agent,
+                                "_task_fence_launch_catalog",
+                                None,
+                            ),
                         )
                 with (
                     bind_causal_envelope(_task_fence_generation_envelope),

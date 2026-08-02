@@ -21,9 +21,14 @@ from task_fence import (
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
     TASK_FENCE_FINAL_GENERATION_KEY,
+    TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
     TASK_FENCE_STORE_SCHEMA_VERSION,
+    TaskFenceCapabilityKind,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
+    TaskFenceLaunchCatalog,
+    TaskFenceLaunchRoute,
     TaskFencePolicy,
     TaskFenceProtocolRejected,
     TaskFenceProvenanceRejected,
@@ -32,11 +37,46 @@ from task_fence import (
     bind_task_fence_policy,
     current_causal_envelope,
     current_task_fence_policy,
+    task_fence_launch_manifest_fingerprint,
 )
 
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _bind_recording_launch_catalog(agent) -> None:
+    witnesses = []
+    catalog = TaskFenceLaunchCatalog(
+        conversation_fingerprint="a" * 64,
+        manifest_fingerprint=task_fence_launch_manifest_fingerprint(
+            TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+        ),
+        runtime_epoch=1,
+        mode_generation=0,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        declarations=TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    )
+
+    def classify_route(route):
+        witnesses.append(route)
+        return catalog.classify_route(route)
+
+    agent._task_fence_launch_catalog = SimpleNamespace(
+        classify_route=classify_route
+    )
+    agent._task_fence_launch_witnesses = witnesses
+
+
+def _assert_launch_witnesses(agent, *route_ids: str) -> None:
+    assert agent._task_fence_launch_witnesses == [
+        TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.ADAPTER,
+            route_id=route_id,
+            capability_version="task-fence-capability-v4",
+        )
+        for route_id in route_ids
+    ]
 
 
 def _openai_response_evidence(response_id: str) -> str:
@@ -880,6 +920,7 @@ def provenance_agent(registered_probe_tools):
             skip_memory=True,
         )
         agent.client = MagicMock()
+        _bind_recording_launch_catalog(agent)
         yield agent
 
 
@@ -942,6 +983,7 @@ moa:
         agent.tool_delay = 0
         agent.save_trajectories = False
         agent.compression_enabled = False
+        _bind_recording_launch_catalog(agent)
         yield agent
 
 
@@ -2747,6 +2789,11 @@ def test_real_stream_retry_records_one_model_attempt_per_sdk_handoff(
         assert result["completed"] is True
         assert result["final_response"] == "stream retry succeeded"
         assert len(entries) == 2
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:openai.chat.completions.create",
+            "provider:openai.chat.completions.create",
+        )
         envelopes = [entry[0] for entry in entries]
         assert {entry[1] for entry in entries} == {"STARTED"}
         assert len({envelope.invocation_id for envelope in envelopes}) == 2
@@ -3071,6 +3118,11 @@ def test_real_anthropic_stream_retry_starts_before_each_lazy_open(
             entry for entry in observed if entry[0] == "factory"
         ]
         assert len(factory_entries) == 2
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:anthropic.messages.stream",
+            "provider:anthropic.messages.stream",
+        )
         assert {entry[3] for entry in observed} == {"STARTED"}
         assert all(entry[4] is None for entry in observed)
         assert not any(entry[5] for entry in observed)
@@ -3405,6 +3457,11 @@ def test_real_codex_midstream_retry_starts_before_each_responses_create(
         assert result["completed"] is True
         assert result["final_response"] == "codex retry succeeded"
         assert len(creates) == 2
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:openai.responses.create",
+            "provider:openai.responses.create",
+        )
         assert all(entry[0]["stream"] is True for entry in creates)
         assert {entry[2] for entry in creates} == {"STARTED"}
         assert all(entry[3] is None for entry in creates)
@@ -4079,6 +4136,10 @@ def test_real_bedrock_nonstream_starts_before_converse(
         assert factories[0][2] is None
         assert factories[0][3] is False
         assert len(calls) == 1
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:bedrock.converse",
+        )
         request, envelope, state, ambient_policy, carries_authority = calls[0]
         assert "__bedrock_converse__" not in request
         assert "__bedrock_region__" not in request
@@ -4230,6 +4291,11 @@ def test_real_bedrock_stream_retry_starts_each_physical_handoff(
         assert result["completed"] is True
         assert result["final_response"] == "bedrock stream succeeded"
         assert len(calls) == 2
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:bedrock.converse_stream",
+            "provider:bedrock.converse_stream",
+        )
         assert all(entry[2] == "STARTED" for entry in calls)
         assert all(entry[3] is None for entry in calls)
         assert not any(entry[4] for entry in calls)
@@ -4362,6 +4428,11 @@ def test_real_bedrock_iam_fallback_starts_each_physical_handoff(
             "provider:bedrock.converse_stream",
             "provider:bedrock.converse",
         ]
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:bedrock.converse_stream",
+            "provider:bedrock.converse",
+        )
         assert all(entry[3] == "STARTED" for entry in calls)
         assert all(entry[4] is None for entry in calls)
         assert not any(entry[5] for entry in calls)

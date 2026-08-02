@@ -14,11 +14,17 @@ from task_fence import (
     DecisionReason,
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
+    TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchCatalog,
+    TaskFenceLaunchRoute,
     TaskFencePolicy,
     bind_causal_envelope,
     bind_task_fence_policy,
     current_causal_envelope,
     current_task_fence_policy,
+    task_fence_launch_manifest_fingerprint,
 )
 from tools.registry import _task_fence_tool_fingerprint, registry
 
@@ -73,6 +79,43 @@ def _live_model_lane(path):
     )
     generation = db.reserve_task_fence_generation(acceptance)
     return db, acceptance, generation
+
+
+def _recording_launch_policy(db):
+    witnesses = []
+    catalog = TaskFenceLaunchCatalog(
+        conversation_fingerprint="a" * 64,
+        manifest_fingerprint=task_fence_launch_manifest_fingerprint(
+            TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+        ),
+        runtime_epoch=1,
+        mode_generation=0,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        declarations=TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    )
+
+    def classify_route(route):
+        witnesses.append(route)
+        return catalog.classify_route(route)
+
+    return (
+        TaskFencePolicy(
+            db,
+            launch_catalog=SimpleNamespace(classify_route=classify_route),
+        ),
+        witnesses,
+    )
+
+
+def _assert_launch_witnesses(witnesses, *route_ids: str) -> None:
+    assert witnesses == [
+        TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.ADAPTER,
+            route_id=route_id,
+            capability_version="task-fence-capability-v4",
+        )
+        for route_id in route_ids
+    ]
 
 
 def _tool_schema(name: str) -> dict:
@@ -879,7 +922,7 @@ def test_persistent_moa_model_capability_is_per_call(tmp_path):
     from agent.auxiliary_client import _task_fence_sync_model_create
 
     db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     prompt_secret = "raw-moa-aggregator-prompt-secret"
     request = {
         "model": "aggregator-model",
@@ -932,6 +975,10 @@ def test_persistent_moa_model_capability_is_per_call(tmp_path):
             )
 
         assert first == second == "legacy-result"
+        _assert_launch_witnesses(
+            launch_witnesses,
+            "provider:openai.chat.completions.create",
+        )
         assert [entry[0] for entry in observed] == [request, request]
         assert observed[0][1].generation_id == generation.generation_id
         assert observed[0][1].invocation_id is not None
@@ -942,6 +989,108 @@ def test_persistent_moa_model_capability_is_per_call(tmp_path):
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 1
         assert prompt_secret not in "\n".join(db._conn.iterdump())
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("changed", "changed_reachable_route"),
+        ("fault", "RuntimeError"),
+        ("malformed", "AttributeError"),
+    ],
+)
+def test_provider_launch_witness_failure_keeps_physical_handoff(
+    tmp_path,
+    caplog,
+    case,
+    expected_reason,
+):
+    from agent.auxiliary_client import _task_fence_sync_model_create
+
+    db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
+    fault_secret = "raw-provider-classifier-fault-secret"
+    if case == "changed":
+        policy, _witnesses = _recording_launch_policy(db)
+        launch_route = TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.ADAPTER,
+            route_id="provider:openai.chat.completions.create",
+            capability_version="task-fence-capability-v5",
+        )
+    elif case == "fault":
+        def classify_route(_route):
+            raise RuntimeError(fault_secret)
+
+        policy = TaskFencePolicy(
+            db,
+            launch_catalog=SimpleNamespace(classify_route=classify_route),
+        )
+        launch_route = TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.ADAPTER,
+            route_id="provider:openai.chat.completions.create",
+            capability_version="task-fence-capability-v4",
+        )
+    else:
+        policy = TaskFencePolicy(
+            db,
+            launch_catalog=SimpleNamespace(classify_route=lambda _route: object()),
+        )
+        launch_route = TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.ADAPTER,
+            route_id="provider:openai.chat.completions.create",
+            capability_version="task-fence-capability-v4",
+        )
+
+    request = {
+        "model": "provider-launch-test",
+        "messages": [{"role": "user", "content": "legacy call survives"}],
+    }
+    response = object()
+    physical_calls = []
+
+    def create(**kwargs):
+        physical_calls.append(dict(kwargs))
+        assert current_task_fence_policy() is None
+        return response
+
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    try:
+        caplog.set_level(logging.WARNING, logger="agent.task_fence_provider")
+        with (
+            bind_causal_envelope(generation),
+            bind_task_fence_policy(None),
+            patch(
+                "agent.auxiliary_client."
+                "_TASK_FENCE_OPENAI_CHAT_COMPLETIONS_LAUNCH_ROUTE",
+                launch_route,
+            ),
+        ):
+            result = _task_fence_sync_model_create(
+                client,
+                request,
+                route_provider="openrouter",
+                task_fence_model_policy=policy,
+            )
+
+        assert result is response
+        assert physical_calls == [request]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_dispatch_permits"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+        assert any(
+            expected_reason in record.message for record in caplog.records
+        )
+        assert fault_secret not in caplog.text
     finally:
         db.close()
 
@@ -1144,7 +1293,7 @@ def test_persistent_moa_codex_adapter_starts_before_responses_create(
     from agent.task_fence_provider import model_wire_fingerprint
 
     db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     prompt_secret = "raw-moa-codex-prompt-secret"
     creates = []
 
@@ -1222,6 +1371,10 @@ def test_persistent_moa_codex_adapter_starts_before_responses_create(
 
         assert response.choices[0].message.content == "codex done"
         assert len(creates) == 1
+        _assert_launch_witnesses(
+            launch_witnesses,
+            "provider:openai.responses.create",
+        )
         wire_request, envelope, state, ambient_policy = creates[0]
         assert wire_request["stream"] is True
         assert envelope.generation_id == generation.generation_id
@@ -1337,7 +1490,7 @@ def test_persistent_moa_bedrock_auxiliary_owns_exact_converse_leaf(
     from agent.task_fence_provider import model_wire_fingerprint
 
     db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     model = "openai.gpt-oss-20b-1:0"
     prompt_secret = "raw-moa-bedrock-converse-prompt"
     observed = []
@@ -1414,6 +1567,10 @@ def test_persistent_moa_bedrock_auxiliary_owns_exact_converse_leaf(
 
         assert audited.choices[0].message.content == "bedrock done"
         assert legacy.choices[0].message.content == "bedrock done"
+        _assert_launch_witnesses(
+            launch_witnesses,
+            "provider:bedrock.converse",
+        )
         assert len(observed) == 2
         native_request = observed[0][0]
         assert native_request == build_converse_kwargs(
@@ -1959,7 +2116,7 @@ def test_gemini_native_nonstream_starts_before_http_handoff(tmp_path):
         base_url=endpoint,
         http_client=HTTP(),
     )
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     try:
         with (
             bind_task_fence_policy(policy),
@@ -1972,6 +2129,10 @@ def test_gemini_native_nonstream_starts_before_http_handoff(tmp_path):
             )
 
         assert response.choices[0].message.content == "gemini done"
+        _assert_launch_witnesses(
+            launch_witnesses,
+            "provider:gemini.generateContent",
+        )
         assert observed["attempt"] == "STARTED"
         assert observed["envelope"].generation_id == generation.generation_id
         assert observed["envelope"].invocation_id is not None
@@ -2061,6 +2222,7 @@ def test_gemini_native_stream_starts_at_lazy_http_handoff(tmp_path):
                     envelope,
                     attempt["state"],
                     current_task_fence_policy(),
+                    len(launch_witnesses),
                 )
             )
             return StreamResponse()
@@ -2079,7 +2241,7 @@ def test_gemini_native_stream_starts_at_lazy_http_handoff(tmp_path):
         api_key="test-key",
         http_client=HTTP(),
     )
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     try:
         with (
             bind_task_fence_policy(policy),
@@ -2092,14 +2254,20 @@ def test_gemini_native_stream_starts_at_lazy_http_handoff(tmp_path):
                 _task_fence_model_policy=policy,
             )
             assert observed == []
+            assert launch_witnesses == []
             chunks = list(stream)
 
         assert len(observed) == 1
+        _assert_launch_witnesses(
+            launch_witnesses,
+            "provider:gemini.streamGenerateContent",
+        )
         assert observed[0][0] == "POST"
         assert observed[0][4] == "STARTED"
         assert observed[0][3].generation_id == generation.generation_id
         assert observed[0][3].invocation_id is not None
         assert observed[0][5] is None
+        assert observed[0][6] == 1
         assert chunks[0].choices[0].delta.content == "streamed"
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
@@ -2238,7 +2406,7 @@ def test_anthropic_stream_fallback_starts_each_physical_handoff(tmp_path):
     from agent.anthropic_adapter import create_anthropic_message
 
     db, _acceptance, generation = _live_model_lane(tmp_path / "state.db")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     prompt_secret = "raw-anthropic-fallback-secret"
     observed = []
     response = SimpleNamespace(content=[], stop_reason="end_turn")
@@ -2304,6 +2472,11 @@ def test_anthropic_stream_fallback_starts_each_physical_handoff(tmp_path):
             )
 
         assert result is response
+        _assert_launch_witnesses(
+            launch_witnesses,
+            "provider:anthropic.messages.stream",
+            "provider:anthropic.messages.create",
+        )
         assert [entry[0] for entry in observed] == [
             "stream_factory",
             "stream_enter",

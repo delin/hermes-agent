@@ -30,8 +30,19 @@ import httpx
 
 from agent.bounded_response import read_streaming_error_body
 from agent.gemini_schema import sanitize_gemini_tool_parameters
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 
 logger = logging.getLogger(__name__)
+_TASK_FENCE_GEMINI_GENERATE_CONTENT_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:gemini.generateContent",
+    capability_version="task-fence-capability-v4",
+)
+_TASK_FENCE_GEMINI_STREAM_GENERATE_CONTENT_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:gemini.streamGenerateContent",
+    capability_version="task-fence-capability-v4",
+)
 
 try:
     import hermes_cli as _hermes_cli
@@ -1031,6 +1042,7 @@ class GeminiNativeClient:
                 "model": model,
                 "endpoint": self.base_url,
             },
+            launch_route=_TASK_FENCE_GEMINI_GENERATE_CONTENT_LAUNCH_ROUTE,
             policy=_task_fence_model_policy,
         ):
             response = self._http.post(
@@ -1081,6 +1093,9 @@ class GeminiNativeClient:
                         "model": model,
                         "endpoint": self.base_url,
                     },
+                    launch_route=(
+                        _TASK_FENCE_GEMINI_STREAM_GENERATE_CONTENT_LAUNCH_ROUTE
+                    ),
                     policy=task_fence_model_policy,
                 ):
                     response = stream_stack.enter_context(

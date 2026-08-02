@@ -42,10 +42,31 @@ from agent.message_sanitization import (
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_TASK_FENCE_OPENAI_CHAT_COMPLETIONS_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:openai.chat.completions.create",
+    capability_version="task-fence-capability-v4",
+)
+_TASK_FENCE_BEDROCK_CONVERSE_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:bedrock.converse",
+    capability_version="task-fence-capability-v4",
+)
+_TASK_FENCE_BEDROCK_CONVERSE_STREAM_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:bedrock.converse_stream",
+    capability_version="task-fence-capability-v4",
+)
+_TASK_FENCE_ANTHROPIC_MESSAGES_STREAM_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:anthropic.messages.stream",
+    capability_version="task-fence-capability-v4",
+)
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -202,7 +223,10 @@ def _task_fence_iteration_summary_attempt(agent, acceptance):
     generation = _reserve_task_fence_shadow_generation(agent, acceptance)
     store = getattr(agent, "_session_db", None)
     try:
-        policy = TaskFencePolicy(store)
+        policy = TaskFencePolicy(
+            store,
+            launch_catalog=getattr(agent, "_task_fence_launch_catalog", None),
+        )
     except Exception as exc:
         logger.warning(
             "Task Fence shadow summary policy unavailable: %s",
@@ -306,6 +330,7 @@ def _create_openai_chat_completion(
         adapter=adapter,
         request=api_kwargs,
         route=route,
+        launch_route=_TASK_FENCE_OPENAI_CHAT_COMPLETIONS_LAUNCH_ROUTE,
         policy=task_fence_model_policy,
     ) as attempt_id:
         if type(task_fence_attempt_holder) is dict:
@@ -761,6 +786,7 @@ def _dispatch_nonstreaming_api_request(
                 adapter="provider:bedrock.converse",
                 request=api_kwargs,
                 route=_task_fence_bedrock_route(agent, api_kwargs, region),
+                launch_route=_TASK_FENCE_BEDROCK_CONVERSE_LAUNCH_ROUTE,
                 policy=task_fence_model_policy,
             ):
                 raw_response = client.converse(**api_kwargs)
@@ -3010,6 +3036,9 @@ def interruptible_streaming_api_call(
                                 final_kwargs,
                                 region,
                             ),
+                            launch_route=(
+                                _TASK_FENCE_BEDROCK_CONVERSE_STREAM_LAUNCH_ROUTE
+                            ),
                             policy=task_fence_model_policy,
                         ):
                             raw_response = client.converse_stream(**final_kwargs)
@@ -3037,6 +3066,9 @@ def interruptible_streaming_api_call(
                                     agent,
                                     final_kwargs,
                                     region,
+                                ),
+                                launch_route=(
+                                    _TASK_FENCE_BEDROCK_CONVERSE_LAUNCH_ROUTE
                                 ),
                                 policy=task_fence_model_policy,
                             ):
@@ -4013,6 +4045,7 @@ def interruptible_streaming_api_call(
                 adapter="provider:anthropic.messages.stream",
                 request=final_kwargs,
                 route=route,
+                launch_route=_TASK_FENCE_ANTHROPIC_MESSAGES_STREAM_LAUNCH_ROUTE,
                 policy=task_fence_model_policy,
             ):
                 manager = request_client.messages.stream(**final_kwargs)

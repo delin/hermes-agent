@@ -135,10 +135,10 @@ def _campaign_probe_factory(
     store: SessionDB,
     probes: list[_CampaignPolicyProbe],
 ):
-    def factory(candidate_store):
+    def factory(candidate_store, **kwargs):
         assert candidate_store is store
         probe = _campaign_probe(
-            TaskFencePolicy(candidate_store),
+            TaskFencePolicy(candidate_store, **kwargs),
             route_id=route_id,
         )
         probes.append(probe)

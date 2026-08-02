@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
@@ -54,6 +55,16 @@ def _get_anthropic_sdk():
     return _anthropic_sdk
 
 logger = logging.getLogger(__name__)
+_TASK_FENCE_ANTHROPIC_MESSAGES_STREAM_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:anthropic.messages.stream",
+    capability_version="task-fence-capability-v4",
+)
+_TASK_FENCE_ANTHROPIC_MESSAGES_CREATE_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:anthropic.messages.create",
+    capability_version="task-fence-capability-v4",
+)
 
 THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
@@ -3025,6 +3036,9 @@ def create_anthropic_message(
                 adapter="provider:anthropic.messages.stream",
                 request=stream_kwargs,
                 route=model_route,
+                launch_route=(
+                    _TASK_FENCE_ANTHROPIC_MESSAGES_STREAM_LAUNCH_ROUTE
+                ),
                 policy=task_fence_model_policy,
                 open_stream=lambda: stream_fn(**stream_kwargs),
             ) as stream:
@@ -3065,6 +3079,7 @@ def create_anthropic_message(
         adapter="provider:anthropic.messages.create",
         request=create_kwargs,
         route=model_route,
+        launch_route=_TASK_FENCE_ANTHROPIC_MESSAGES_CREATE_LAUNCH_ROUTE,
         policy=task_fence_model_policy,
     ):
         return messages_api.create(**create_kwargs)

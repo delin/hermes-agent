@@ -23,8 +23,14 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 
 logger = logging.getLogger(__name__)
+_TASK_FENCE_OPENAI_RESPONSES_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:openai.responses.create",
+    capability_version="task-fence-capability-v4",
+)
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -1295,6 +1301,7 @@ def run_codex_stream(
                     ),
                     "endpoint": str(getattr(agent, "base_url", "") or ""),
                 },
+                launch_route=_TASK_FENCE_OPENAI_RESPONSES_LAUNCH_ROUTE,
                 policy=task_fence_model_policy,
             ):
                 return active_client.responses.create(**stream_kwargs)

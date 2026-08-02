@@ -4669,6 +4669,13 @@ class TurnRunner:
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
+        # The immutable startup catalog is process-local and never changes
+        # prompt bytes, tool schemas, or the cache signature.
+        agent._task_fence_launch_catalog = getattr(
+            self._runner,
+            "_task_fence_launch_catalog",
+            None,
+        )
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
         # rather than tool_progress alone: the progress_callback also relays
         # _thinking assistant scratch text, which is gated on

@@ -34,7 +34,14 @@ import re
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
+
 logger = logging.getLogger(__name__)
+_TASK_FENCE_BEDROCK_CONVERSE_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.ADAPTER,
+    route_id="provider:bedrock.converse",
+    capability_version="task-fence-capability-v4",
+)
 
 # ---------------------------------------------------------------------------
 # Ensure boto3/botocore are installed before any code in this module runs.
@@ -1136,6 +1143,7 @@ def call_converse(
                     ),
                     "region": str(region or ""),
                 },
+                launch_route=_TASK_FENCE_BEDROCK_CONVERSE_LAUNCH_ROUTE,
                 policy=task_fence_model_policy,
             ):
                 response = client.converse(**kwargs)

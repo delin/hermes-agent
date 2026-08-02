@@ -191,6 +191,9 @@ class CampaignPolicyProbe:
         )
         return decision
 
+    def classify_launch_route(self, route):
+        return self._policy.classify_launch_route(route)
+
     def finish_attempt(self, *args: Any, **kwargs: Any) -> None:
         self._policy.finish_attempt(*args, **kwargs)
 

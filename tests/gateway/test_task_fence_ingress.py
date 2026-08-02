@@ -244,6 +244,11 @@ async def test_gateway_queued_turn_returns_latest_generation_without_cached_leak
 
     observed = []
     created = []
+    observed_catalogs = []
+    observed_cache_state = []
+    launch_catalog = object()
+    tools_sentinel = object()
+    runner._task_fence_launch_catalog = launch_catalog
     generations = {
         "first": object(),
         "queued": object(),
@@ -254,6 +259,8 @@ async def test_gateway_queued_turn_returns_latest_generation_without_cached_leak
 
         def __init__(self, **kwargs):
             self.model = kwargs["model"]
+            self._cached_system_prompt = "stable cached prefix"
+            self.tools = tools_sentinel
             created.append(self)
 
         def run_conversation(
@@ -265,6 +272,11 @@ async def test_gateway_queued_turn_returns_latest_generation_without_cached_leak
         ):
             turn_acceptance = kwargs.get("task_fence_acceptance")
             observed.append((message, turn_acceptance))
+            observed_catalogs.append(self._task_fence_launch_catalog)
+            observed_cache_state.append(
+                (self._cached_system_prompt, self.tools)
+            )
+            assert "_task_fence_launch_catalog" not in kwargs
             result = {
                 "final_response": f"done:{message}",
                 "messages": [],
@@ -313,6 +325,10 @@ async def test_gateway_queued_turn_returns_latest_generation_without_cached_leak
     assert untyped["final_response"] == "done:untyped"
     assert untyped[_TASK_FENCE_FINAL_TURN_GENERATION_KEY] is None
     assert len(created) == 1
+    assert observed_catalogs == [launch_catalog] * 3
+    assert observed_cache_state == [
+        ("stable cached prefix", tools_sentinel),
+    ] * 3
     assert observed == [
         ("first", first_acceptance),
         ("queued", queued_acceptance),
