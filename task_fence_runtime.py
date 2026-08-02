@@ -26,6 +26,8 @@ from task_fence import (
     TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
     TaskFenceArtifactIdentity,
     TaskFenceCapabilityUnavailable,
+    TaskFenceLaunchBindingUnavailable,
+    TaskFenceLaunchManifest,
     TaskFenceProtocolRejected,
     TaskFenceRecovery,
     TaskFenceRecoveryUnavailable,
@@ -488,6 +490,7 @@ def prepare_task_fence_shadow_startup(
     *,
     hermes_home: Path | None = None,
     multiplex_profiles: bool = False,
+    launch_manifest: TaskFenceLaunchManifest | None = None,
 ) -> TaskFenceRecovery | None:
     """Run the selected cohort's receipt-bound recovery before consumers open."""
 
@@ -535,6 +538,13 @@ def prepare_task_fence_shadow_startup(
             expected_runtime_epoch=store.runtime_epoch,
             expected_mode_generation=store.mode_generation,
         )
+        if launch_manifest is not None:
+            database.materialize_task_fence_selected_launch_binding(
+                shadow_conversation_key=shadow_conversation_key,
+                manifest=launch_manifest,
+                expected_runtime_epoch=store.runtime_epoch,
+                expected_mode_generation=store.mode_generation,
+            )
         return database.recover_task_fence_state(
             expected_runtime_epoch=store.runtime_epoch,
             expected_mode_generation=store.mode_generation,
@@ -546,6 +556,7 @@ def prepare_task_fence_shadow_startup(
         raise
     except (
         TaskFenceCapabilityUnavailable,
+        TaskFenceLaunchBindingUnavailable,
         TaskFenceProtocolRejected,
         TaskFenceRecoveryUnavailable,
     ) as exc:

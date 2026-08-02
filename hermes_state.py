@@ -58,6 +58,7 @@ from task_fence import (
     TASK_FENCE_POLICY_VERSION,
     TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
     TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
     TASK_FENCE_STORE_SCHEMA_VERSION,
     CorrelationKind,
     ExecutionEffect,
@@ -74,6 +75,9 @@ from task_fence import (
     TaskFenceCapabilityDeclaration,
     TaskFenceCapabilityMaterialization,
     TaskFenceCapabilityUnavailable,
+    TaskFenceLaunchBindingMaterialization,
+    TaskFenceLaunchBindingUnavailable,
+    TaskFenceLaunchManifest,
     TaskFenceIngressSidecar,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
@@ -86,6 +90,7 @@ from task_fence import (
     TaskFenceRecoveryUnavailable,
     TaskFenceTaskControl,
     operation_binding_fingerprint,
+    task_fence_launch_manifest_fingerprint,
     validate_action,
     validate_ingress_envelope,
     validate_operation_descriptor,
@@ -299,10 +304,13 @@ _TASK_FENCE_MAX_V2_MIGRATION_ACCEPTANCES = 10_000
 _TASK_FENCE_MAX_V2_MIGRATION_PENDING_ROWS = 1_000_000
 _TASK_FENCE_MAX_V2_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_MAX_V2_MIGRATION_HISTORY_WORK = 1_000_000
-_TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5, 6})
+_TASK_FENCE_SUPPORTED_HISTORICAL_SCHEMA_VERSIONS = frozenset(
+    {2, 3, 4, 5, 6, 7}
+)
 _TASK_FENCE_MAX_V3_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_MAX_V4_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_MAX_V5_MIGRATION_ROWS = 1_000_000
+_TASK_FENCE_MAX_V6_MIGRATION_ROWS = 1_000_000
 _TASK_FENCE_MAX_RECOVERY_ROWS = 1_000_000
 _TASK_FENCE_MAX_RECOVERY_AUTHORITIES = 8_192
 _TASK_FENCE_MAX_RECOVERY_INCIDENT_ATTEMPTS = 64
@@ -323,10 +331,14 @@ _TASK_FENCE_DELIVERY_RECOVERY_PENDING_ADAPTER = (
 )
 _TASK_FENCE_TABLE_NAME_RE = re.compile(r"\Atask_fence_[a-z0-9_]+\Z")
 _TASK_FENCE_POLICY_DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
+_TASK_FENCE_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _TASK_FENCE_PROCESS_CHECKPOINT_INVOCATION_ID_RE = re.compile(
     r"\Atfqp_[0-9a-f]{64}\Z"
 )
 _TASK_FENCE_IMPLICIT_AUDIT_COHORT = "__task_fence_shadow_v1__"
+_TASK_FENCE_SELECTED_ACTIVATION_COHORT = (
+    "__task_fence_selected_activation_v1__"
+)
 # Fixed audit-only bound; no config until a real consumer sets a latency budget.
 _TASK_FENCE_POLICY_PERMIT_TTL_SECONDS = 24 * 60 * 60
 _TASK_FENCE_POLICY_EVIDENCE_MAX_BYTES = 2_048
@@ -482,6 +494,17 @@ class TaskFenceCapabilityInspection:
     verified: bool
     reason: str
     declarations: Tuple[TaskFenceCapabilityDeclaration, ...]
+
+
+@dataclass(frozen=True)
+class TaskFenceLaunchBindingInspection:
+    """Exact inactive activation binding from one read snapshot."""
+
+    store: TaskFenceStoreInspection
+    verified: bool
+    reason: str
+    conversation_fingerprint: Optional[str]
+    manifest_fingerprint: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -2795,11 +2818,35 @@ CREATE INDEX IF NOT EXISTS main.idx_task_fence_recovery_requeues_history
 """
 
 
+# One set-once row binds the opaque selected conversation and a complete typed
+# launch-manifest digest to a distinct explicit inactive cohort. The manifest
+# remains code-owned and independently versioned; this table stores no route
+# inventory and no raw selector.
+TASK_FENCE_SCHEMA_V7_EXTENSION_SQL = """
+CREATE TABLE IF NOT EXISTS main.task_fence_cohort_launch_bindings (
+    cohort_key TEXT PRIMARY KEY REFERENCES task_fence_cohorts(cohort_key)
+        CHECK (cohort_key = '__task_fence_selected_activation_v1__'),
+    conversation_fingerprint TEXT NOT NULL CHECK (
+        length(conversation_fingerprint) = 64
+        AND conversation_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    manifest_fingerprint TEXT NOT NULL CHECK (
+        length(manifest_fingerprint) = 64
+        AND manifest_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    bound_at REAL NOT NULL CHECK (
+        typeof(bound_at) = 'real' AND bound_at >= 0
+    )
+);
+"""
+
+
 TASK_FENCE_SCHEMA_POST_V1_SQL = (
     TASK_FENCE_SCHEMA_V2_EXTENSION_SQL
     + TASK_FENCE_SCHEMA_V3_REDUCTION_SQL
     + TASK_FENCE_SCHEMA_V5_EXTENSION_SQL
     + TASK_FENCE_SCHEMA_V6_EXTENSION_SQL
+    + TASK_FENCE_SCHEMA_V7_EXTENSION_SQL
 )
 TASK_FENCE_SCHEMA_V4_SQL = (
     TASK_FENCE_SCHEMA_V3_SQL + TASK_FENCE_SCHEMA_V4_EXTENSION_SQL
@@ -2807,7 +2854,10 @@ TASK_FENCE_SCHEMA_V4_SQL = (
 TASK_FENCE_SCHEMA_V5_SQL = (
     TASK_FENCE_SCHEMA_V3_SQL + TASK_FENCE_SCHEMA_V5_EXTENSION_SQL
 )
-TASK_FENCE_SCHEMA_SQL = TASK_FENCE_SCHEMA_V5_SQL + TASK_FENCE_SCHEMA_V6_EXTENSION_SQL
+TASK_FENCE_SCHEMA_V6_SQL = (
+    TASK_FENCE_SCHEMA_V5_SQL + TASK_FENCE_SCHEMA_V6_EXTENSION_SQL
+)
+TASK_FENCE_SCHEMA_SQL = TASK_FENCE_SCHEMA_V6_SQL + TASK_FENCE_SCHEMA_V7_EXTENSION_SQL
 
 _task_fence_expected_schema_objects: Optional[Tuple[Tuple[str, str, str, str], ...]] = (
     None
@@ -2825,6 +2875,9 @@ _task_fence_expected_v4_schema_objects: Optional[
     Tuple[Tuple[str, str, str, str], ...]
 ] = None
 _task_fence_expected_v5_schema_objects: Optional[
+    Tuple[Tuple[str, str, str, str], ...]
+] = None
+_task_fence_expected_v6_schema_objects: Optional[
     Tuple[Tuple[str, str, str, str], ...]
 ] = None
 _task_fence_expected_schema_objects_lock = threading.Lock()
@@ -2934,6 +2987,17 @@ def _expected_task_fence_v5_schema_objects() -> Tuple[Tuple[str, str, str, str],
                 TASK_FENCE_SCHEMA_V5_SQL
             )
         return _task_fence_expected_v5_schema_objects
+
+
+def _expected_task_fence_v6_schema_objects() -> Tuple[Tuple[str, str, str, str], ...]:
+    """Lazily build the exact pre-launch-binding migration signature."""
+    global _task_fence_expected_v6_schema_objects
+    with _task_fence_expected_schema_objects_lock:
+        if _task_fence_expected_v6_schema_objects is None:
+            _task_fence_expected_v6_schema_objects = _task_fence_schema_objects_for_sql(
+                TASK_FENCE_SCHEMA_V6_SQL
+            )
+        return _task_fence_expected_v6_schema_objects
 
 
 def _expected_task_fence_schema_objects() -> Tuple[Tuple[str, str, str, str], ...]:
@@ -4689,6 +4753,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cursor,
             TASK_FENCE_SCHEMA_V6_EXTENSION_SQL,
         )
+        self._execute_task_fence_schema_sql(
+            cursor,
+            TASK_FENCE_SCHEMA_V7_EXTENSION_SQL,
+        )
         updated_tasks = cursor.execute(
             "UPDATE main.task_fence_tasks SET store_schema_version = ? "
             "WHERE store_schema_version = 3",
@@ -4869,6 +4937,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_task_fence_schema_sql(
             cursor,
             TASK_FENCE_SCHEMA_V6_EXTENSION_SQL,
+        )
+        self._execute_task_fence_schema_sql(
+            cursor,
+            TASK_FENCE_SCHEMA_V7_EXTENSION_SQL,
         )
         columns = (
             "decision_order, decision_id, decision_point, outcome, reason_code, "
@@ -5061,6 +5133,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cursor,
             TASK_FENCE_SCHEMA_V6_EXTENSION_SQL,
         )
+        self._execute_task_fence_schema_sql(
+            cursor,
+            TASK_FENCE_SCHEMA_V7_EXTENSION_SQL,
+        )
         updated_tasks = cursor.execute(
             "UPDATE main.task_fence_tasks SET store_schema_version = ? "
             "WHERE store_schema_version = 5",
@@ -5099,6 +5175,171 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise sqlite3.DatabaseError("Task Fence v5 migration foreign key mismatch")
         return True
 
+    def _task_fence_v6_is_migratable_unlocked(
+        self,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        if schema_objects != _expected_task_fence_v6_schema_objects():
+            return False
+        metadata = self._conn.execute(
+            "SELECT singleton, store_schema_version, control_protocol_version, "
+            "runtime_epoch, mode_generation, ever_enforced, "
+            "tested_artifact_commit, tested_artifact_checksum, "
+            "dependency_lock_fingerprint "
+            "FROM main.task_fence_control ORDER BY singleton LIMIT 2"
+        ).fetchall()
+        if len(metadata) != 1:
+            return False
+        control = metadata[0]
+        if (
+            control["singleton"] != 1
+            or control["store_schema_version"] != 6
+            or control["control_protocol_version"]
+            != TASK_FENCE_CONTROL_PROTOCOL_VERSION
+            or type(control["runtime_epoch"]) is not int
+            or control["runtime_epoch"] < 0
+            or control["mode_generation"] != 0
+            or control["ever_enforced"] != 0
+        ):
+            return False
+        artifact_values = (
+            control["tested_artifact_commit"],
+            control["tested_artifact_checksum"],
+            control["dependency_lock_fingerprint"],
+        )
+        if any(value is not None for value in artifact_values):
+            if any(value is None for value in artifact_values):
+                return False
+            try:
+                TaskFenceArtifactIdentity(
+                    tested_artifact_commit=artifact_values[0],
+                    tested_artifact_checksum=artifact_values[1],
+                    dependency_lock_fingerprint=artifact_values[2],
+                )
+            except TaskFenceProtocolRejected:
+                return False
+
+        remaining_rows = _TASK_FENCE_MAX_V6_MIGRATION_ROWS
+        for object_type, table_name, _table, _sql in schema_objects:
+            if object_type != "table":
+                continue
+            if _TASK_FENCE_TABLE_NAME_RE.fullmatch(table_name) is None:
+                raise sqlite3.DatabaseError("invalid trusted Task Fence table name")
+            safe_table = table_name.replace('"', '""')
+            count = self._conn.execute(
+                f'SELECT COUNT(*) FROM (SELECT 1 FROM main."{safe_table}" LIMIT ?)',
+                (remaining_rows + 1,),
+            ).fetchone()[0]
+            if type(count) is not int or count > remaining_rows:
+                return False
+            remaining_rows -= count
+
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_cohorts "
+            "WHERE mode != 'audit' OR mode_generation != 0 "
+            "OR activation_state != 'inactive' "
+            "OR cohort_key = ? LIMIT 1",
+            (_TASK_FENCE_SELECTED_ACTIVATION_COHORT,),
+        ).fetchone() is not None:
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_tasks "
+            "WHERE store_schema_version != 6 "
+            "OR control_protocol_version != ? "
+            "OR current_runtime_epoch != ? LIMIT 1",
+            (
+                TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+                control["runtime_epoch"],
+            ),
+        ).fetchone() is not None:
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_acceptance_snapshots "
+            "WHERE task_store_schema_version IS NOT NULL "
+            "AND task_store_schema_version NOT IN (2, 3, 4, 5, 6) LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        if self._conn.execute(
+            "SELECT 1 FROM main.task_fence_cohort_capabilities "
+            "WHERE cohort_key != ? LIMIT 1",
+            (_TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+        ).fetchone() is not None:
+            return False
+        projection_reason, _declarations = (
+            self._task_fence_selected_capability_projection_unlocked(self._conn)
+        )
+        if projection_reason not in {"verified", "capabilities_not_materialized"}:
+            return False
+        if projection_reason == "verified":
+            cohort = self._conn.execute(
+                "SELECT mode, mode_generation, activation_state "
+                "FROM main.task_fence_cohorts WHERE cohort_key = ?",
+                (_TASK_FENCE_IMPLICIT_AUDIT_COHORT,),
+            ).fetchone()
+            if cohort is None or tuple(cohort) != ("audit", 0, "inactive"):
+                return False
+        return self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            schema_objects,
+        )
+
+    def _migrate_task_fence_v6_to_current_unlocked(
+        self,
+        cursor: sqlite3.Cursor,
+        schema_objects: Tuple[Tuple[str, str, str, str], ...],
+    ) -> bool:
+        if not self._task_fence_v6_is_migratable_unlocked(schema_objects):
+            return False
+
+        control = cursor.execute(
+            "SELECT runtime_epoch FROM main.task_fence_control "
+            "WHERE singleton = 1"
+        ).fetchone()
+        task_count = cursor.execute(
+            "SELECT COUNT(*) FROM main.task_fence_tasks"
+        ).fetchone()[0]
+        if control is None or type(task_count) is not int:
+            return False
+        self._execute_task_fence_schema_sql(
+            cursor,
+            TASK_FENCE_SCHEMA_V7_EXTENSION_SQL,
+        )
+        updated_tasks = cursor.execute(
+            "UPDATE main.task_fence_tasks SET store_schema_version = ? "
+            "WHERE store_schema_version = 6",
+            (TASK_FENCE_STORE_SCHEMA_VERSION,),
+        )
+        if updated_tasks.rowcount != task_count:
+            raise sqlite3.DatabaseError("Task Fence v6 migration task metadata changed")
+        updated_control = cursor.execute(
+            "UPDATE main.task_fence_control "
+            "SET store_schema_version = ?, "
+            "updated_at = CAST(strftime('%s', 'now') AS REAL) "
+            "WHERE singleton = 1 AND store_schema_version = 6 "
+            "AND control_protocol_version = ? AND runtime_epoch = ? "
+            "AND mode_generation = 0 AND ever_enforced = 0",
+            (
+                TASK_FENCE_STORE_SCHEMA_VERSION,
+                TASK_FENCE_CONTROL_PROTOCOL_VERSION,
+                control["runtime_epoch"],
+            ),
+        )
+        if updated_control.rowcount != 1:
+            raise sqlite3.DatabaseError(
+                "Task Fence v6 migration control metadata changed"
+            )
+        if (
+            _read_task_fence_schema_objects(self._conn)
+            != _expected_task_fence_schema_objects()
+        ):
+            raise sqlite3.DatabaseError("Task Fence v6 migration schema mismatch")
+        if not self._task_fence_foreign_keys_clean_unlocked(
+            self._conn,
+            _expected_task_fence_schema_objects(),
+        ):
+            raise sqlite3.DatabaseError("Task Fence v6 migration foreign key mismatch")
+        return True
+
     def _init_task_fence_schema(self) -> None:
         """Create current Task Fence schema or migrate an exact older shadow.
 
@@ -5133,12 +5374,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             expected_v3 = _expected_task_fence_v3_schema_objects()
             expected_v4 = _expected_task_fence_v4_schema_objects()
             expected_v5 = _expected_task_fence_v5_schema_objects()
+            expected_v6 = _expected_task_fence_v6_schema_objects()
             if observed and observed not in {
                 expected_v1,
                 expected_v2,
                 expected_v3,
                 expected_v4,
                 expected_v5,
+                expected_v6,
             }:
                 return
 
@@ -5231,6 +5474,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._conn.rollback()
                     logger.warning(
                         "Task Fence exact v5 shadow state is not safely "
+                        "migratable; automatic current migration was refused "
+                        "and legacy dispatch behavior is unchanged."
+                    )
+                    return
+            elif observed == expected_v6:
+                if not self._migrate_task_fence_v6_to_current_unlocked(
+                    cursor,
+                    observed,
+                ):
+                    self._conn.rollback()
+                    logger.warning(
+                        "Task Fence exact v6 shadow state is not safely "
                         "migratable; automatic current migration was refused "
                         "and legacy dispatch behavior is unchanged."
                     )
@@ -5834,6 +6089,373 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except sqlite3.DatabaseError:
             raise TaskFenceCapabilityUnavailable(
                 "capability_database_error"
+            ) from None
+
+    @staticmethod
+    def _task_fence_conversation_fingerprint(
+        conversation_key: object,
+    ) -> str:
+        if not _task_fence_v2_identifier_compatible(conversation_key):
+            raise TaskFenceProtocolRejected(
+                "invalid_shadow_conversation_key"
+            )
+        return hashlib.sha256(
+            b"hermes.task_fence.conversation.v1\0"
+            + conversation_key.encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _task_fence_launch_routes_reason(
+        manifest: TaskFenceLaunchManifest,
+        declarations: Tuple[TaskFenceCapabilityDeclaration, ...],
+    ) -> str:
+        declared = {
+            (
+                declaration.kind,
+                declaration.capability_id,
+                declaration.capability_version,
+            )
+            for declaration in declarations
+        }
+        for route in manifest.routes:
+            if (
+                route.kind,
+                route.route_id,
+                route.capability_version,
+            ) not in declared:
+                return "launch_route_not_declared"
+        return "verified"
+
+    def inspect_task_fence_selected_launch_binding(
+        self,
+        *,
+        shadow_conversation_key: str,
+        manifest: TaskFenceLaunchManifest = TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+    ) -> TaskFenceLaunchBindingInspection:
+        """Inspect the exact selected inactive binding without repair."""
+
+        try:
+            expected_conversation_fingerprint = (
+                self._task_fence_conversation_fingerprint(
+                    shadow_conversation_key
+                )
+            )
+        except TaskFenceProtocolRejected as exc:
+            return TaskFenceLaunchBindingInspection(
+                _failed_task_fence_store_inspection(exc.reason),
+                False,
+                exc.reason,
+                None,
+                None,
+            )
+        if not isinstance(manifest, TaskFenceLaunchManifest):
+            reason = "invalid_launch_manifest"
+            return TaskFenceLaunchBindingInspection(
+                _failed_task_fence_store_inspection(reason),
+                False,
+                reason,
+                None,
+                None,
+            )
+        expected_manifest_fingerprint = task_fence_launch_manifest_fingerprint(
+            manifest
+        )
+        try:
+            with self._lock:
+                if self._conn is None:
+                    raise sqlite3.ProgrammingError("SessionDB is closed")
+                owned_snapshot = self._begin_task_fence_read_snapshot_unlocked()
+                try:
+                    store = self._inspect_task_fence_store_unlocked(
+                        include_counts=False
+                    )
+                    if not store.compatible:
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            store.reason,
+                            None,
+                            None,
+                        )
+                    cohort_reason = (
+                        self._task_fence_selected_cohort_reason_unlocked(
+                            self._conn,
+                            store,
+                        )
+                    )
+                    if cohort_reason != "verified":
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            cohort_reason,
+                            None,
+                            None,
+                        )
+                    projection_reason, declarations = (
+                        self._task_fence_selected_capability_projection_unlocked(
+                            self._conn
+                        )
+                    )
+                    if projection_reason != "verified":
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            projection_reason,
+                            None,
+                            None,
+                        )
+                    route_reason = self._task_fence_launch_routes_reason(
+                        manifest,
+                        declarations,
+                    )
+                    if route_reason != "verified":
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            route_reason,
+                            None,
+                            None,
+                        )
+                    cohort = self._conn.execute(
+                        "SELECT mode, mode_generation, activation_state, "
+                        "audit_degraded FROM main.task_fence_cohorts "
+                        "WHERE cohort_key = ?",
+                        (_TASK_FENCE_SELECTED_ACTIVATION_COHORT,),
+                    ).fetchone()
+                    bindings = self._conn.execute(
+                        "SELECT cohort_key, conversation_fingerprint, "
+                        "manifest_fingerprint, bound_at "
+                        "FROM main.task_fence_cohort_launch_bindings "
+                        "ORDER BY cohort_key LIMIT 2",
+                    ).fetchall()
+                    if cohort is None and not bindings:
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            "launch_binding_not_materialized",
+                            None,
+                            None,
+                        )
+                    if cohort is None or len(bindings) != 1:
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            "launch_binding_conflict",
+                            None,
+                            None,
+                        )
+                    if tuple(cohort) != (
+                        "audit",
+                        store.mode_generation,
+                        "inactive",
+                        0,
+                    ):
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            "launch_binding_conflict",
+                            None,
+                            None,
+                        )
+                    binding = bindings[0]
+                    conversation_fingerprint = binding[
+                        "conversation_fingerprint"
+                    ]
+                    manifest_fingerprint = binding["manifest_fingerprint"]
+                    bound_at = binding["bound_at"]
+                    if (
+                        not isinstance(conversation_fingerprint, str)
+                        or binding["cohort_key"]
+                        != _TASK_FENCE_SELECTED_ACTIVATION_COHORT
+                        or _TASK_FENCE_SHA256_RE.fullmatch(
+                            conversation_fingerprint
+                        ) is None
+                        or conversation_fingerprint
+                        != expected_conversation_fingerprint
+                        or not isinstance(manifest_fingerprint, str)
+                        or _TASK_FENCE_SHA256_RE.fullmatch(
+                            manifest_fingerprint
+                        ) is None
+                        or isinstance(bound_at, bool)
+                        or not isinstance(bound_at, (int, float))
+                        or not math.isfinite(float(bound_at))
+                        or bound_at < 0
+                        or manifest_fingerprint
+                        != expected_manifest_fingerprint
+                    ):
+                        return TaskFenceLaunchBindingInspection(
+                            store,
+                            False,
+                            "launch_binding_conflict",
+                            None,
+                            None,
+                        )
+                    return TaskFenceLaunchBindingInspection(
+                        store,
+                        True,
+                        "verified",
+                        conversation_fingerprint,
+                        manifest_fingerprint,
+                    )
+                finally:
+                    self._end_task_fence_read_snapshot_unlocked(owned_snapshot)
+        except Exception as exc:
+            logger.debug("Task Fence launch binding inspection failed: %s", exc)
+            reason = _task_fence_inspection_failure_reason(exc)
+            return TaskFenceLaunchBindingInspection(
+                _failed_task_fence_store_inspection(reason),
+                False,
+                reason,
+                None,
+                None,
+            )
+
+    def materialize_task_fence_selected_launch_binding(
+        self,
+        *,
+        shadow_conversation_key: str,
+        manifest: TaskFenceLaunchManifest,
+        expected_runtime_epoch: int,
+        expected_mode_generation: int,
+    ) -> TaskFenceLaunchBindingMaterialization:
+        """Atomically create or exactly replay one inactive candidate binding."""
+
+        conversation_fingerprint = self._task_fence_conversation_fingerprint(
+            shadow_conversation_key
+        )
+        if not isinstance(manifest, TaskFenceLaunchManifest):
+            raise TaskFenceProtocolRejected("invalid_launch_manifest")
+        manifest_fingerprint = task_fence_launch_manifest_fingerprint(manifest)
+        if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
+        if type(expected_mode_generation) is not int or expected_mode_generation < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_mode_generation")
+        if self.read_only or self._conn is None:
+            raise TaskFenceLaunchBindingUnavailable("store_unavailable")
+
+        def _materialize(
+            conn: sqlite3.Connection,
+        ) -> TaskFenceLaunchBindingMaterialization:
+            store = self._inspect_task_fence_store_unlocked(
+                include_counts=False
+            )
+            if not store.compatible:
+                raise TaskFenceLaunchBindingUnavailable(store.reason)
+            if store.runtime_epoch != expected_runtime_epoch:
+                raise TaskFenceLaunchBindingUnavailable(
+                    "runtime_epoch_changed"
+                )
+            if store.mode_generation != expected_mode_generation:
+                raise TaskFenceLaunchBindingUnavailable(
+                    "mode_generation_changed"
+                )
+            if store.ever_enforced is not False:
+                raise TaskFenceLaunchBindingUnavailable(
+                    "launch_binding_precondition"
+                )
+            cohort_reason = self._task_fence_selected_cohort_reason_unlocked(
+                conn,
+                store,
+            )
+            if cohort_reason != "verified":
+                raise TaskFenceLaunchBindingUnavailable(cohort_reason)
+            projection_reason, declarations = (
+                self._task_fence_selected_capability_projection_unlocked(conn)
+            )
+            if projection_reason != "verified":
+                raise TaskFenceLaunchBindingUnavailable(projection_reason)
+            route_reason = self._task_fence_launch_routes_reason(
+                manifest,
+                declarations,
+            )
+            if route_reason != "verified":
+                raise TaskFenceLaunchBindingUnavailable(route_reason)
+
+            cohort = conn.execute(
+                "SELECT mode, mode_generation, activation_state, "
+                "audit_degraded FROM main.task_fence_cohorts "
+                "WHERE cohort_key = ?",
+                (_TASK_FENCE_SELECTED_ACTIVATION_COHORT,),
+            ).fetchone()
+            bindings = conn.execute(
+                "SELECT cohort_key, conversation_fingerprint, manifest_fingerprint, "
+                "bound_at FROM main.task_fence_cohort_launch_bindings "
+                "ORDER BY cohort_key LIMIT 2",
+            ).fetchall()
+            if cohort is None and not bindings:
+                now = time.time()
+                conn.execute(
+                    "INSERT INTO main.task_fence_cohorts ("
+                    "cohort_key, mode, mode_generation, activation_state, "
+                    "audit_degraded, created_at, updated_at"
+                    ") VALUES (?, 'audit', ?, 'inactive', 0, ?, ?)",
+                    (
+                        _TASK_FENCE_SELECTED_ACTIVATION_COHORT,
+                        expected_mode_generation,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO main.task_fence_cohort_launch_bindings ("
+                    "cohort_key, conversation_fingerprint, "
+                    "manifest_fingerprint, bound_at"
+                    ") VALUES (?, ?, ?, ?)",
+                    (
+                        _TASK_FENCE_SELECTED_ACTIVATION_COHORT,
+                        conversation_fingerprint,
+                        manifest_fingerprint,
+                        now,
+                    ),
+                )
+                return TaskFenceLaunchBindingMaterialization(
+                    conversation_fingerprint=conversation_fingerprint,
+                    manifest_fingerprint=manifest_fingerprint,
+                    created=True,
+                )
+            if cohort is None or len(bindings) != 1:
+                raise TaskFenceLaunchBindingUnavailable(
+                    "launch_binding_conflict"
+                )
+            binding = bindings[0]
+            bound_at = binding["bound_at"]
+            if (
+                tuple(cohort)
+                != (
+                    "audit",
+                    expected_mode_generation,
+                    "inactive",
+                    0,
+                )
+                or binding["cohort_key"]
+                != _TASK_FENCE_SELECTED_ACTIVATION_COHORT
+                or binding["conversation_fingerprint"]
+                != conversation_fingerprint
+                or binding["manifest_fingerprint"] != manifest_fingerprint
+                or isinstance(bound_at, bool)
+                or not isinstance(bound_at, (int, float))
+                or not math.isfinite(float(bound_at))
+                or bound_at < 0
+            ):
+                raise TaskFenceLaunchBindingUnavailable(
+                    "launch_binding_conflict"
+                )
+            return TaskFenceLaunchBindingMaterialization(
+                conversation_fingerprint=conversation_fingerprint,
+                manifest_fingerprint=manifest_fingerprint,
+                created=False,
+            )
+
+        try:
+            return self._execute_write(_materialize)
+        except (
+            TaskFenceProtocolRejected,
+            TaskFenceLaunchBindingUnavailable,
+        ):
+            raise
+        except sqlite3.DatabaseError:
+            raise TaskFenceLaunchBindingUnavailable(
+                "launch_binding_database_error"
             ) from None
 
     def recover_task_fence_state(

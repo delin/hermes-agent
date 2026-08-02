@@ -21,7 +21,7 @@ from typing import Iterator, Mapping, Protocol
 
 
 CONTROL_PROTOCOL_VERSION = 1
-TASK_FENCE_STORE_SCHEMA_VERSION = 6
+TASK_FENCE_STORE_SCHEMA_VERSION = 7
 
 _MAX_SOURCE_BYTES = 256
 _MAX_IDENTIFIER_BYTES = 512
@@ -29,6 +29,7 @@ _MAX_OPAQUE_REFERENCE_BYTES = 2_048
 _MAX_CORRELATION_IDS = 64
 _MAX_EVIDENCE_REFS = 32
 _MAX_CAPABILITY_DECLARATIONS = 64
+_MAX_LAUNCH_ROUTES = 64
 _MAX_CAUSAL_ENVELOPE_BYTES = 16_384
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -414,6 +415,14 @@ class TaskFenceCapabilityUnavailable(RuntimeError):
         super().__init__(reason)
 
 
+class TaskFenceLaunchBindingUnavailable(RuntimeError):
+    """An inactive launch binding could not use the durable control store."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 @dataclass(frozen=True)
 class TaskFenceArtifactIdentity:
     """Canonical caller-supplied identity claim for one OCI platform artifact.
@@ -592,6 +601,117 @@ class TaskFenceCapabilityMaterialization:
     created: bool
 
 
+@dataclass(frozen=True)
+class TaskFenceLaunchRoute:
+    """One capability route admitted by a closed launch manifest."""
+
+    kind: TaskFenceCapabilityKind
+    route_id: str
+    capability_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, TaskFenceCapabilityKind):
+            raise TaskFenceProtocolRejected("invalid_launch_route_kind")
+        for field in ("route_id", "capability_version"):
+            _bounded_text(
+                getattr(self, field),
+                field=field,
+                max_bytes=_MAX_IDENTIFIER_BYTES,
+            )
+
+
+@dataclass(frozen=True)
+class TaskFenceLaunchManifest:
+    """Closed expected route set for one inactive activation candidate.
+
+    The manifest is an allowlist to be checked against resolved runtime
+    reachability by a later startup validator. It is not discovery evidence
+    and does not make any route live by itself.
+    """
+
+    manifest_version: str
+    routes: tuple[TaskFenceLaunchRoute, ...]
+
+    def __post_init__(self) -> None:
+        _bounded_text(
+            self.manifest_version,
+            field="manifest_version",
+            max_bytes=_MAX_IDENTIFIER_BYTES,
+        )
+        if (
+            not isinstance(self.routes, tuple)
+            or not self.routes
+            or len(self.routes) > _MAX_LAUNCH_ROUTES
+        ):
+            raise TaskFenceProtocolRejected("invalid_launch_routes")
+        keys = []
+        for route in self.routes:
+            if not isinstance(route, TaskFenceLaunchRoute):
+                raise TaskFenceProtocolRejected("invalid_launch_route_type")
+            keys.append(
+                (
+                    route.kind.value,
+                    route.route_id,
+                    route.capability_version,
+                )
+            )
+        if len(set(keys)) != len(keys):
+            raise TaskFenceProtocolRejected("duplicate_launch_route")
+        object.__setattr__(
+            self,
+            "routes",
+            tuple(
+                sorted(
+                    self.routes,
+                    key=lambda route: (
+                        route.kind.value,
+                        route.route_id,
+                        route.capability_version,
+                    ),
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class TaskFenceLaunchBindingMaterialization:
+    """Atomic create-or-exact-replay result for one inactive launch binding."""
+
+    conversation_fingerprint: str
+    manifest_fingerprint: str
+    created: bool
+
+
+def task_fence_launch_manifest_fingerprint(
+    manifest: TaskFenceLaunchManifest,
+) -> str:
+    """Commit one complete canonical launch manifest to a stable digest."""
+
+    if not isinstance(manifest, TaskFenceLaunchManifest):
+        raise TaskFenceProtocolRejected("invalid_launch_manifest")
+    semantic = {
+        "manifest_version": manifest.manifest_version,
+        "routes": [
+            {
+                "kind": route.kind.value,
+                "route_id": route.route_id,
+                "capability_version": route.capability_version,
+            }
+            for route in manifest.routes
+        ],
+    }
+    encoded = json.dumps(
+        semantic,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(
+        b"hermes.task_fence.launch_manifest.v1\0" + encoded
+    ).hexdigest()
+
+
 def _capability_declaration(
     kind: TaskFenceCapabilityKind,
     capability_id: str,
@@ -683,6 +803,65 @@ TASK_FENCE_SELECTED_COHORT_CAPABILITIES = _canonical_capability_declarations(
         _capability_declaration(kind, capability_id, state)
         for kind, capability_id, state in _SELECTED_COHORT_CAPABILITY_DEFINITIONS
     )
+)
+
+
+# Explicit first-candidate allowlist. Membership is intentionally curated
+# instead of derived from capability state: inventory support is evidence
+# vocabulary, while launch membership is an independent product decision.
+_SELECTED_LAUNCH_ROUTE_IDS = (
+    "gateway:slack:typed_ingress",
+    "provider:openai.chat.completions.create",
+    "provider:gemini.generateContent",
+    "provider:gemini.streamGenerateContent",
+    "provider:anthropic.messages.create",
+    "provider:anthropic.messages.stream",
+    "provider:openai.responses.create",
+    "provider:bedrock.converse",
+    "provider:bedrock.converse_stream",
+    "gateway:slack:chat_post_message",
+    "runtime:registered-tool-handoff",
+    "runtime:inline-tool-handoff",
+    "runtime:execute-code-rpc-descendant",
+    "runtime:iteration-summary:owned-wires",
+    "runtime:persistent-moa-acting",
+    "runtime:delegated-child-launch",
+    "runtime:delegation-completion",
+    "runtime:process-completion",
+    "runtime:goal-continuation",
+    "runtime:wake-continuation",
+    "runtime:foreground-terminal-retry",
+)
+_CAPABILITY_BY_ID = {
+    declaration.capability_id: declaration
+    for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+}
+if len(_CAPABILITY_BY_ID) != len(TASK_FENCE_SELECTED_COHORT_CAPABILITIES):
+    raise RuntimeError("Task Fence capability ID drift")
+if len(set(_SELECTED_LAUNCH_ROUTE_IDS)) != len(_SELECTED_LAUNCH_ROUTE_IDS):
+    raise RuntimeError("Task Fence launch route ID drift")
+try:
+    _SELECTED_LAUNCH_DECLARATIONS = tuple(
+        _CAPABILITY_BY_ID[route_id] for route_id in _SELECTED_LAUNCH_ROUTE_IDS
+    )
+except KeyError as exc:
+    raise RuntimeError("Task Fence launch route is not declared") from exc
+if any(
+    declaration.state is not TaskFenceCapabilityState.SUPPORTED
+    for declaration in _SELECTED_LAUNCH_DECLARATIONS
+):
+    raise RuntimeError("Task Fence launch route is not supported")
+
+TASK_FENCE_SELECTED_LAUNCH_MANIFEST = TaskFenceLaunchManifest(
+    manifest_version="task-fence-selected-launch-v1",
+    routes=tuple(
+        TaskFenceLaunchRoute(
+            kind=declaration.kind,
+            route_id=declaration.capability_id,
+            capability_version=declaration.capability_version,
+        )
+        for declaration in _SELECTED_LAUNCH_DECLARATIONS
+    ),
 )
 
 

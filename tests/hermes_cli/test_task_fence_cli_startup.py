@@ -78,10 +78,14 @@ def _install_active_preflight(
         "acquire_task_fence_owner_lock",
         lambda home=None: events.append("owner") or True,
     )
+    def prepare_without_launch_binding(key, **kwargs):
+        assert kwargs.get("launch_manifest") is None
+        events.append("recover")
+
     monkeypatch.setattr(
         task_fence_runtime,
         "prepare_task_fence_shadow_startup",
-        lambda key, **kwargs: events.append("recover"),
+        prepare_without_launch_binding,
     )
     monkeypatch.setattr(
         task_fence_runtime,

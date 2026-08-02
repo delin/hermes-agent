@@ -1858,6 +1858,17 @@ def _task_fence_gateway_startup_selection(
     return conversation_key, multiplex_profiles
 
 
+def _task_fence_gateway_launch_manifest(conversation_key: str):
+    """Select only the documented first inactive gateway candidate."""
+
+    parsed = _parse_session_key(conversation_key)
+    if parsed is None or parsed["platform"] != "slack":
+        return None
+    from task_fence import TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+
+    return TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -25893,6 +25904,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             shadow_conversation_key,
             hermes_home=_hermes_home,
             multiplex_profiles=shadow_multiplex_profiles,
+            launch_manifest=_task_fence_gateway_launch_manifest(
+                shadow_conversation_key
+            ),
         )
         if recovery is not None:
             logger.info(

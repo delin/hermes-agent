@@ -21,6 +21,7 @@ EXPECTED_TASK_FENCE_TABLES = {
     "task_fence_attempt_transitions",
     "task_fence_attempts",
     "task_fence_cohort_capabilities",
+    "task_fence_cohort_launch_bindings",
     "task_fence_cohorts",
     "task_fence_control",
     "task_fence_dispatch_permits",

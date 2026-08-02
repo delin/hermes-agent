@@ -8,11 +8,14 @@ import pytest
 import task_fence_runtime as startup
 from gateway.config import GatewayConfig
 from hermes_state import SessionDB
-from task_fence import TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+from task_fence import (
+    TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+)
 
 
 _PLATFORM = "linux/amd64"
-_SHADOW_SESSION_KEY = "slack:workspace:channel:user"
+_SHADOW_SESSION_KEY = "agent:main:slack:dm:workspace:channel:user"
 _COMMIT = "a" * 40
 _ARTIFACT_DIGEST = "sha256:" + "b" * 64
 _LOCK_DIGEST = "sha256:" + "c" * 64
@@ -132,6 +135,27 @@ def test_parse_receipt_returns_typed_identity() -> None:
     assert identity.tested_artifact_commit == _COMMIT
     assert identity.tested_artifact_checksum == _ARTIFACT_DIGEST
     assert identity.dependency_lock_fingerprint == _LOCK_DIGEST
+
+
+def test_initial_launch_manifest_selection_is_canonical_slack_only() -> None:
+    from gateway import run as gateway_run
+
+    assert (
+        gateway_run._task_fence_gateway_launch_manifest(_SHADOW_SESSION_KEY)
+        is TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+    )
+    assert (
+        gateway_run._task_fence_gateway_launch_manifest(
+            "agent:main:telegram:dm:chat"
+        )
+        is None
+    )
+    assert (
+        gateway_run._task_fence_gateway_launch_manifest(
+            "slack:workspace:channel:user"
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -304,6 +328,20 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
         traced_materialize,
     )
 
+    real_bind = SessionDB.materialize_task_fence_selected_launch_binding
+
+    def traced_bind(self: SessionDB, **kwargs):
+        events.append("binding")
+        result = real_bind(self, **kwargs)
+        assert result.created is True
+        return result
+
+    monkeypatch.setattr(
+        SessionDB,
+        "materialize_task_fence_selected_launch_binding",
+        traced_bind,
+    )
+
     real_recover = SessionDB.recover_task_fence_state
 
     def traced_recover(self: SessionDB, **kwargs):
@@ -413,6 +451,9 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
                 capabilities = (
                     database.inspect_task_fence_selected_cohort_capabilities()
                 )
+                binding = database.inspect_task_fence_selected_launch_binding(
+                    shadow_conversation_key=_SHADOW_SESSION_KEY,
+                )
                 cohort = tuple(
                     database._conn.execute(
                         "SELECT mode, mode_generation, activation_state, "
@@ -439,6 +480,8 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
                 declaration.state.value == "unsupported"
                 for declaration in capabilities.declarations
             )
+            assert binding.verified is True
+            assert binding.reason == "verified"
             assert cohort == ("audit", 0, "inactive", 0)
             database = SessionDB(tmp_path / "state.db")
             try:
@@ -538,12 +581,13 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     )
 
     assert ok is True
-    assert events[:8] == [
+    assert events[:9] == [
         "lock",
         "pid",
         "receipt",
         "checkpoint",
         "capabilities",
+        "binding",
         "composite",
         "runner",
         "start",
@@ -703,6 +747,123 @@ async def test_capability_conflict_refuses_before_recovery_without_repair(
     assert rows_after == rows_before
     assert inspection.reason == "capability_declaration_conflict"
     assert inspection.declarations == ()
+
+
+@pytest.mark.asyncio
+async def test_launch_binding_conflict_refuses_before_recovery_without_repair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    platform = startup._runtime_platform()
+    receipt_path = tmp_path / "tested-artifact.json"
+    _write_receipt(
+        receipt_path,
+        _receipt_bytes(_receipt_payload(platform=platform)),
+    )
+    _pretend_receipt_is_root_owned(monkeypatch)
+    monkeypatch.setattr(startup, "_TESTED_ARTIFACT_RECEIPT_PATH", receipt_path)
+
+    seed = SessionDB(tmp_path / "state.db")
+    store = seed.inspect_task_fence_store(include_counts=False)
+    seed.materialize_task_fence_selected_cohort_capabilities(
+        expected_runtime_epoch=store.runtime_epoch,
+        expected_mode_generation=store.mode_generation,
+    )
+    seed.materialize_task_fence_selected_launch_binding(
+        shadow_conversation_key=_SHADOW_SESSION_KEY,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        expected_runtime_epoch=store.runtime_epoch,
+        expected_mode_generation=store.mode_generation,
+    )
+    seed._conn.execute(
+        "UPDATE task_fence_cohort_launch_bindings "
+        "SET conversation_fingerprint = ?",
+        ("d" * 64,),
+    )
+    seed._conn.commit()
+    control_before = tuple(
+        seed._conn.execute(
+            "SELECT * FROM task_fence_control WHERE singleton = 1"
+        ).fetchone()
+    )
+    binding_before = tuple(
+        seed._conn.execute(
+            "SELECT * FROM task_fence_cohort_launch_bindings"
+        ).fetchone()
+    )
+    seed.close()
+
+    def recover_must_not_run(self: SessionDB, **kwargs):
+        events.append("recovery")
+        raise AssertionError("recovery ran after launch binding conflict")
+
+    monkeypatch.setattr(
+        SessionDB,
+        "recover_task_fence_state",
+        recover_must_not_run,
+    )
+    real_release_owner = startup.release_task_fence_owner_lock
+
+    def traced_release_owner() -> None:
+        events.append("release_owner")
+        real_release_owner()
+
+    monkeypatch.setattr(
+        startup,
+        "release_task_fence_owner_lock",
+        traced_release_owner,
+    )
+
+    class RunnerMustNotOpen:
+        def __init__(self, config: GatewayConfig):
+            raise AssertionError("runner opened after launch binding conflict")
+
+    gateway_run = _install_start_gateway_shell(
+        monkeypatch, tmp_path, events, RunnerMustNotOpen
+    )
+
+    ok = await gateway_run.start_gateway(
+        config=GatewayConfig(
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
+            sessions_dir=tmp_path / "sessions",
+        ),
+        verbosity=None,
+    )
+
+    assert ok is False
+    assert events == [
+        "lock",
+        "pid",
+        "release_owner",
+        "remove_pid",
+        "release_lock",
+    ]
+    assert (
+        "Task Fence shadow startup refused: launch_binding_conflict"
+        in caplog.messages
+    )
+    reopened = SessionDB(tmp_path / "state.db")
+    try:
+        control_after = tuple(
+            reopened._conn.execute(
+                "SELECT * FROM task_fence_control WHERE singleton = 1"
+            ).fetchone()
+        )
+        binding_after = tuple(
+            reopened._conn.execute(
+                "SELECT * FROM task_fence_cohort_launch_bindings"
+            ).fetchone()
+        )
+        inspection = reopened.inspect_task_fence_selected_launch_binding(
+            shadow_conversation_key=_SHADOW_SESSION_KEY,
+        )
+    finally:
+        reopened.close()
+    assert control_after == control_before
+    assert binding_after == binding_before
+    assert inspection.reason == "launch_binding_conflict"
 
 
 @pytest.mark.asyncio
@@ -886,10 +1047,18 @@ async def test_configured_startup_recovers_before_full_config_loader(
         "acquire_task_fence_owner_lock",
         lambda home=None: events.append("owner") or True,
     )
+    def prepare_before_full_config(key, **kwargs):
+        assert key == _SHADOW_SESSION_KEY
+        assert (
+            kwargs["launch_manifest"]
+            is TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+        )
+        events.append("recover")
+
     monkeypatch.setattr(
         startup,
         "prepare_task_fence_shadow_startup",
-        lambda key, **kwargs: events.append("recover"),
+        prepare_before_full_config,
     )
 
     def load_full_config() -> GatewayConfig:

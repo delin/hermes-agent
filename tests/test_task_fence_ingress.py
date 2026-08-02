@@ -167,6 +167,7 @@ def _downgrade_current_store_to_exact_v2(
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DROP TABLE main.task_fence_cohort_launch_bindings")
         conn.execute("DROP TABLE main.task_fence_recovery_requeues")
         conn.execute("DROP TABLE main.task_fence_policy_decisions")
         conn.execute(
@@ -263,6 +264,7 @@ def _downgrade_current_store_to_exact_v3(path) -> None:
     assert isinstance(snapshot_trigger[0], str)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DROP TABLE main.task_fence_cohort_launch_bindings")
         conn.execute("DROP TABLE main.task_fence_recovery_requeues")
         conn.execute("DROP TABLE main.task_fence_policy_decisions")
         conn.execute(
@@ -316,6 +318,7 @@ def _downgrade_current_store_to_exact_v5(path) -> None:
     assert snapshot_trigger is not None and isinstance(snapshot_trigger[0], str)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DROP TABLE main.task_fence_cohort_launch_bindings")
         conn.execute("DROP TABLE main.task_fence_recovery_requeues")
         conn.execute(
             "DROP TRIGGER main.task_fence_acceptance_snapshots_no_update"
