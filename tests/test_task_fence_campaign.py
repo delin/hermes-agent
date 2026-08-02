@@ -2140,9 +2140,9 @@ def test_campaign_excludes_sync_smart_approval_at_real_terminal_handoff(
             }
 
     class TrackedTaskFencePolicy(TaskFencePolicy):
-        def __init__(self, store):
+        def __init__(self, store, **kwargs):
             assert store is db
-            super().__init__(store)
+            super().__init__(store, **kwargs)
             policy_constructions.append(self)
 
     agent = campaign_summary_agent
@@ -2569,9 +2569,9 @@ def test_campaign_excludes_sync_xai_tts_tags_at_real_tool_handoff(
         return XaiResponse()
 
     class TrackedTaskFencePolicy(TaskFencePolicy):
-        def __init__(self, store):
+        def __init__(self, store, **kwargs):
             assert store is db
-            super().__init__(store)
+            super().__init__(store, **kwargs)
             policy_constructions.append(self)
 
     agent = campaign_summary_agent

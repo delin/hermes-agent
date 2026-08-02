@@ -28,6 +28,11 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Experimental, default-off Task Fence shadow lane. One exact canonical
+    # conversation root only: no wildcard, platform switch, or env carrier.
+    "task_fence": {
+        "shadow_conversation_key": "",
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
@@ -2367,12 +2372,6 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
-        # Experimental, default-off Task Fence shadow ingress lane. This is
-        # one exact build_session_key() value, not a wildcard or mode switch.
-        "task_fence": {
-            "shadow_session_key": "",
-        },
-
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

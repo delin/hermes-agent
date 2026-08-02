@@ -88,9 +88,8 @@ def _recover(db: SessionDB):
 def _write_shadow_config(home, conversation_id: str) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
-        "gateway:\n"
-        "  task_fence:\n"
-        f"    shadow_session_key: {json.dumps(conversation_id)}\n",
+        "task_fence:\n"
+        f"  shadow_conversation_key: {json.dumps(conversation_id)}\n",
         encoding="utf-8",
     )
 

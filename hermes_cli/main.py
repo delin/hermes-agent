@@ -2506,6 +2506,108 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+def _refuse_task_fence_cli_startup(reason: str) -> None:
+    print(f"Task Fence shadow startup refused: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _prepare_task_fence_cli_startup(args) -> str:
+    """Claim and recover the bounded classic-CLI Task Fence owner."""
+    if getattr(args, "command", None) not in {None, "chat"}:
+        return ""
+
+    from hermes_constants import get_default_hermes_root, get_process_hermes_home
+    from task_fence_config import load_task_fence_shadow_conversation_key
+
+    hermes_home = get_process_hermes_home()
+    shadow_conversation_key = load_task_fence_shadow_conversation_key(hermes_home)
+    if not shadow_conversation_key:
+        setattr(args, "task_fence_shadow_conversation_key", "")
+        return ""
+
+    resume_session_id = str(getattr(args, "resume", "") or "").strip()
+    if not resume_session_id or getattr(args, "continue_last", None):
+        _refuse_task_fence_cli_startup("explicit_resume_required")
+    if (
+        getattr(args, "query", None)
+        or getattr(args, "image", None)
+        or getattr(args, "oneshot", None)
+    ):
+        _refuse_task_fence_cli_startup("noninteractive_cli_unsupported")
+    if _resolve_use_tui(args):
+        _refuse_task_fence_cli_startup("tui_unsupported")
+    if getattr(args, "skills", None) or getattr(args, "source", None):
+        _refuse_task_fence_cli_startup("extended_cli_ingress_unsupported")
+    if getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False):
+        _refuse_task_fence_cli_startup("config_bypass_unsupported")
+
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        configured_worktree = bool(load_config_readonly().get("worktree", False))
+    except Exception:
+        configured_worktree = False
+    if getattr(args, "worktree", False) or configured_worktree:
+        _refuse_task_fence_cli_startup("worktree_unsupported")
+
+    process_home = hermes_home.expanduser().resolve(strict=False)
+    default_home = get_default_hermes_root().expanduser().resolve(strict=False)
+    if os.path.normcase(str(process_home)) != os.path.normcase(str(default_home)):
+        _refuse_task_fence_cli_startup("default_profile_required")
+
+    from gateway.status import is_gateway_runtime_lock_active
+    from task_fence_runtime import (
+        TaskFenceStartupUnavailable,
+        acquire_task_fence_owner_lock,
+        prepare_task_fence_shadow_startup,
+        release_task_fence_owner_lock,
+    )
+
+    try:
+        if is_gateway_runtime_lock_active():
+            raise TaskFenceStartupUnavailable("gateway_runtime_active")
+        if not acquire_task_fence_owner_lock(hermes_home):
+            raise TaskFenceStartupUnavailable("runtime_owner_unavailable")
+
+        prepare_task_fence_shadow_startup(
+            shadow_conversation_key,
+            hermes_home=hermes_home,
+        )
+
+        # Recovery must commit and close before this startup-owned exact-row/root
+        # check. This rejects title fallback while allowing a compression tip to
+        # select its stable compression-only conversation root.
+        from hermes_state import SessionDB
+
+        database = SessionDB(hermes_home / "state.db")
+        try:
+            if database.get_session(resume_session_id) is None:
+                raise TaskFenceStartupUnavailable("resume_session_not_found")
+            conversation_root = database.get_task_fence_compression_root(
+                resume_session_id
+            )
+            if conversation_root != shadow_conversation_key:
+                raise TaskFenceStartupUnavailable("selected_conversation_mismatch")
+        finally:
+            database.close()
+    except TaskFenceStartupUnavailable as exc:
+        release_task_fence_owner_lock()
+        _refuse_task_fence_cli_startup(exc.reason)
+    except BaseException:
+        release_task_fence_owner_lock()
+        raise
+
+    import atexit
+
+    atexit.register(release_task_fence_owner_lock)
+    setattr(
+        args,
+        "task_fence_shadow_conversation_key",
+        shadow_conversation_key,
+    )
+    return shadow_conversation_key
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
@@ -2707,6 +2809,9 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "task_fence_shadow_conversation_key": getattr(
+            args, "task_fence_shadow_conversation_key", ""
+        ),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -10831,6 +10936,8 @@ def _try_termux_fast_cli_launch() -> bool:
         _print_version_info(check_updates=False)
         return True
 
+    _prepare_task_fence_cli_startup(args)
+
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
         _run_and_exit_oneshot(
@@ -10900,6 +11007,7 @@ def _try_termux_fast_tui_launch() -> bool:
     if not _resolve_use_tui(args):
         return False
 
+    _prepare_task_fence_cli_startup(args)
     cmd_chat(args)
     return True
 
@@ -12426,6 +12534,10 @@ def main():
     # value is already False and --yolo silently does nothing.
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+
+    # The active classic-CLI cohort must own receipt/recovery before plugin/MCP
+    # discovery or any resume/title helper can open SessionDB.
+    _prepare_task_fence_cli_startup(args)
 
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated

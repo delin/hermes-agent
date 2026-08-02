@@ -38,6 +38,7 @@ import tempfile
 import time
 import uuid
 import textwrap
+from dataclasses import dataclass
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
@@ -4191,6 +4192,14 @@ class _VoiceInputMessage:
         return self.text
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _TaskFenceCLIInput:
+    """Private carrier from durable CLI acceptance to the agent turn."""
+
+    text: str
+    task_fence_acceptance: Any
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -4213,6 +4222,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        task_fence_shadow_conversation_key: str = "",
     ):
         """
         Initialize the Hermes CLI.
@@ -4533,6 +4543,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
         self._resumed = False
+        self._task_fence_shadow_conversation_key = (
+            task_fence_shadow_conversation_key
+            if isinstance(task_fence_shadow_conversation_key, str)
+            else ""
+        )
+        self._task_fence_cli_startup_resume = bool(resume)
         # Per-prompt elapsed timer — started at the beginning of each chat turn,
         # frozen when the agent thread completes, displayed in the status bar.
         self._prompt_start_time: Optional[float] = None  # time.time() when turn started
@@ -13318,7 +13334,113 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def _queue_task_fence_foreground_input(self, text: str) -> None:
+        """Accept one exact idle CLI submit before exposing it to the queue."""
+
+        queued_input: Any = text
+        selector = getattr(self, "_task_fence_shadow_conversation_key", "")
+        eligible = (
+            type(text) is str
+            and isinstance(selector, str)
+            and bool(selector)
+            and getattr(self, "_task_fence_cli_startup_resume", False)
+            and bool(text)
+            and text == text.strip()
+            and not _looks_like_slash_command(text)
+            and not getattr(self, "_agent_running", False)
+            and not getattr(self, "_command_running", False)
+            and not getattr(self, "_pending_resume_sessions", None)
+            and not getattr(self, "_voice_mode", False)
+            and not getattr(self, "_voice_continuous", False)
+            and "@" not in text
+            and re.search(
+                r"\[Pasted text #\d+: \d+ lines \u2192 .+?\]",
+                text,
+            )
+            is None
+        )
+
+        if eligible:
+            try:
+                stripped = _strip_leaked_bracketed_paste_wrappers(text)
+                sanitized, had_mouse_reports = (
+                    _strip_leaked_terminal_responses_with_meta(stripped)
+                )
+                text.encode("utf-8")
+                eligible = (
+                    stripped == text
+                    and sanitized == text
+                    and not had_mouse_reports
+                    and _detect_file_drop(text) is None
+                )
+            except Exception:
+                eligible = False
+
+        database = getattr(self, "_session_db", None)
+        if eligible and database is not None:
+            try:
+                conversation_root = database.get_task_fence_compression_root(
+                    self.session_id
+                )
+            except Exception:
+                logger.warning(
+                    "Task Fence CLI shadow ingress failed open: "
+                    "conversation root unavailable",
+                    exc_info=True,
+                )
+                eligible = False
+            else:
+                eligible = conversation_root == selector
+        else:
+            eligible = False
+
+        if eligible:
+            task_fence_protocol = None
+            try:
+                import task_fence as task_fence_protocol
+
+                sidecar = task_fence_protocol.task_fence_sidecar_for_plain_text(
+                    source="cli:foreground",
+                    source_event_id=f"submit:{uuid.uuid4().hex}",
+                    payload_text=text,
+                )
+                acceptance = database.accept_task_fence_ingress_sidecar(
+                    sidecar,
+                    conversation_id=selector,
+                )
+            except Exception as exc:
+                known_errors = (
+                    (
+                        task_fence_protocol.TaskFenceIngressRejected,
+                        task_fence_protocol.TaskFenceIngressUnavailable,
+                        task_fence_protocol.TaskFenceProtocolRejected,
+                    )
+                    if task_fence_protocol is not None
+                    else ()
+                )
+                if known_errors and isinstance(exc, known_errors):
+                    logger.warning(
+                        "Task Fence CLI shadow ingress failed open (%s)",
+                        exc.reason,
+                    )
+                else:
+                    logger.exception("Task Fence CLI shadow ingress failed open")
+            else:
+                queued_input = _TaskFenceCLIInput(
+                    text=text,
+                    task_fence_acceptance=acceptance,
+                )
+
+        self._pending_input.put(queued_input)
+
+
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        task_fence_acceptance: Any = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -13335,10 +13457,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             images: Optional list of Path objects for attached images
             voice_input: True when the message came from voice transcription
                 (gates the concise voice-response prefix, #65827)
+            task_fence_acceptance: Private durable ingress snapshot for this
+                exact user message.
             
         Returns:
             The agent's response, or None on error
         """
+        task_fence_message = message if type(message) is str else None
+        if images or task_fence_message is None:
+            task_fence_acceptance = None
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -13458,6 +13586,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+
+        if (
+            task_fence_acceptance is not None
+            and (
+                type(message) is not str
+                or message != task_fence_message
+            )
+        ):
+            task_fence_acceptance = None
 
         # Keep the exact CLI input dict available until turn-start persistence.
         # Copy the completed agent transcript before appending: otherwise this
@@ -13662,6 +13799,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        task_fence_acceptance=task_fence_acceptance,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -15104,7 +15242,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     except Exception:
                         pass
                 else:
-                    self._pending_input.put(payload)
+                    if not images and text and not _looks_like_slash_command(text):
+                        self._queue_task_fence_foreground_input(text)
+                    else:
+                        self._pending_input.put(payload)
                 # History stores real pasted content, not the placeholder, so
                 # up-arrow recall restores the actual text.
                 self._inline_pastes(event.app.current_buffer)
@@ -16834,10 +16975,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    task_fence_acceptance = None
+                    if isinstance(user_input, _TaskFenceCLIInput):
+                        task_fence_acceptance = user_input.task_fence_acceptance
+                        user_input = user_input.text
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
                     if is_voice_input:
+                        task_fence_acceptance = None
                         user_input = user_input.text
 
                     if not user_input:
@@ -16850,13 +16997,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Unpack image payload: (text, [Path, ...]) or plain str
                     submit_images = []
                     if isinstance(user_input, tuple):
+                        task_fence_acceptance = None
                         user_input, submit_images = user_input
 
                     if isinstance(user_input, str):
+                        _raw_user_input = user_input
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
-                        user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
+                        user_input, _had_mouse_reports = (
+                            _strip_leaked_terminal_responses_with_meta(user_input)
+                        )
+                        if user_input != _raw_user_input or _had_mouse_reports:
+                            task_fence_acceptance = None
                         if _had_mouse_reports:
-                            self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+                            self._recover_terminal_input_modes(
+                                reason="mouse reports leaked into submitted input"
+                            )
 
                     # Typed bare stop phrase while a voice chat is active ends
                     # the voice chat (same semantics as SAYING "stop") instead
@@ -16870,6 +17025,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # See _detect_file_drop() for details.
                     _file_drop = _detect_file_drop(user_input) if isinstance(user_input, str) else None
                     if _file_drop:
+                        task_fence_acceptance = None
                         _drop_path = _file_drop["path"]
                         _remainder = _file_drop["remainder"]
                         if _file_drop["is_image"]:
@@ -16895,6 +17051,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         continue
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
+                        task_fence_acceptance = None
                         _cprint(f"\n⚙️  {user_input}")
                         try:
                             if not self.process_command(user_input):
@@ -16916,6 +17073,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # as the user message instead of looping back to idle.
                         _seed = getattr(self, "_pending_agent_seed", None)
                         if _seed:
+                            task_fence_acceptance = None
                             self._pending_agent_seed = None
                             user_input = _seed
                         else:
@@ -16925,12 +17083,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
                     if paste_refs:
+                        task_fence_acceptance = None
                         user_input = self._expand_paste_references(user_input)
                     print()
                     self._print_user_message_preview(user_input)
                     
                     # Show image attachment count
                     if submit_images:
+                        task_fence_acceptance = None
                         n = len(submit_images)
                         _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
 
@@ -16943,7 +17103,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            task_fence_acceptance=task_fence_acceptance,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -17476,6 +17641,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    task_fence_shadow_conversation_key: str = "",
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -17611,6 +17777,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        task_fence_shadow_conversation_key=task_fence_shadow_conversation_key,
     )
 
     if parsed_skills:

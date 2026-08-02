@@ -18,6 +18,10 @@ from enum import Enum
 
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+from task_fence_config import (
+    coerce_task_fence_shadow_conversation_key,
+    load_task_fence_shadow_conversation_key,
+)
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -37,31 +41,6 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return is_truthy_value(value, default=default)
 
 
-def _coerce_task_fence_shadow_session_key(value: Any) -> str:
-    """Return one exact bounded gateway lane key or the disabled value."""
-
-    if value is None or value == "":
-        return ""
-    if not isinstance(value, str):
-        logger.warning(
-            "Ignoring invalid gateway.task_fence.shadow_session_key "
-            "(expected one exact session key, got %s)",
-            type(value).__name__,
-        )
-        return ""
-    session_key = value.strip()
-    if (
-        not session_key
-        or "\x00" in session_key
-        or len(session_key.encode("utf-8")) > 512
-    ):
-        logger.warning(
-            "Ignoring invalid gateway.task_fence.shadow_session_key "
-            "(empty, NUL-containing, or larger than 512 bytes)"
-        )
-        return ""
-    return session_key
-
 
 def _load_primary_gateway_yaml(home: Path) -> Optional[dict]:
     """Load managed-overlay-aware config.yaml without gateway side effects."""
@@ -80,35 +59,6 @@ def _load_primary_gateway_yaml(home: Path) -> Optional[dict]:
 
     return managed_scope.apply_managed_overlay(config)
 
-
-def _resolve_task_fence_shadow_session_key(config: dict) -> str:
-    """Resolve the sole config.yaml Task Fence lane."""
-    gateway_config = config.get("gateway")
-    if not isinstance(gateway_config, dict) or "task_fence" not in gateway_config:
-        return ""
-
-    task_fence_config = gateway_config.get("task_fence")
-    if not isinstance(task_fence_config, dict):
-        logger.warning(
-            "Ignoring invalid gateway.task_fence in config.yaml "
-            "(expected mapping, got %s)",
-            type(task_fence_config).__name__,
-        )
-        return ""
-    return _coerce_task_fence_shadow_session_key(
-        task_fence_config.get("shadow_session_key")
-    )
-
-
-def load_task_fence_shadow_session_key() -> str:
-    """Load only the effective shadow lane, without gateway plugin discovery."""
-    try:
-        config = _load_primary_gateway_yaml(get_hermes_home())
-    except Exception:
-        return ""
-    if config is None:
-        return ""
-    return _resolve_task_fence_shadow_session_key(config)
 
 
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
@@ -1000,11 +950,11 @@ class GatewayConfig:
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
 
-    # One exact, startup-latched gateway session lane may opt into Task Fence
+    # One exact, startup-latched conversation may opt into Task Fence
     # durable ingress acceptance. Empty is intentionally the only default:
     # this Work Package is shadow-only and does not claim platform-wide
     # coverage or add a wildcard activation surface.
-    task_fence_shadow_session_key: str = ""
+    task_fence_shadow_conversation_key: str = ""
 
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
@@ -1039,9 +989,9 @@ class GatewayConfig:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
         )
-        self.task_fence_shadow_session_key = (
-            _coerce_task_fence_shadow_session_key(
-                self.task_fence_shadow_session_key
+        self.task_fence_shadow_conversation_key = (
+            coerce_task_fence_shadow_conversation_key(
+                self.task_fence_shadow_conversation_key
             )
         )
 
@@ -1156,7 +1106,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "task_fence": {
-                "shadow_session_key": self.task_fence_shadow_session_key,
+                "shadow_conversation_key": self.task_fence_shadow_conversation_key,
             },
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
@@ -1222,17 +1172,11 @@ class GatewayConfig:
         thread_sessions_per_user = data.get("thread_sessions_per_user")
         multiplex_profiles = data.get("multiplex_profiles")
         nested_gateway = data.get("gateway") if isinstance(data.get("gateway"), dict) else {}
-        if "task_fence" in data:
-            task_fence = data.get("task_fence")
-        else:
-            task_fence = nested_gateway.get("task_fence")
+        task_fence = data.get("task_fence")
         if not isinstance(task_fence, dict):
             task_fence = {}
-        task_fence_shadow_session_key = _coerce_task_fence_shadow_session_key(
-            data.get(
-                "task_fence_shadow_session_key",
-                task_fence.get("shadow_session_key"),
-            )
+        task_fence_shadow_conversation_key = coerce_task_fence_shadow_conversation_key(
+            task_fence.get("shadow_conversation_key")
         )
         if "systemd_watchdog_seconds" in data:
             systemd_watchdog_raw = data.get("systemd_watchdog_seconds")
@@ -1307,7 +1251,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
-            task_fence_shadow_session_key=task_fence_shadow_session_key,
+            task_fence_shadow_conversation_key=task_fence_shadow_conversation_key,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
@@ -1378,6 +1322,10 @@ def load_gateway_config() -> GatewayConfig:
     # stale legacy gateway.json silently activate the shadow lane.
     gw_data.pop("task_fence", None)
     gw_data.pop("task_fence_shadow_session_key", None)
+    gw_data.pop("task_fence_shadow_conversation_key", None)
+    gw_data["task_fence"] = {
+        "shadow_conversation_key": load_task_fence_shadow_conversation_key(_home)
+    }
 
     # Primary source: config.yaml
     try:
@@ -1454,10 +1402,6 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["profile_routes"] = _pr
 
             if isinstance(gateway_section, dict):
-                if "task_fence" in gateway_section:
-                    gw_data["task_fence_shadow_session_key"] = (
-                        _resolve_task_fence_shadow_session_key(yaml_cfg)
-                    )
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]

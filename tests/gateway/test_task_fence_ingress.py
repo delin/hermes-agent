@@ -14,7 +14,6 @@ from gateway.config import (
     Platform,
     PlatformConfig,
     load_gateway_config,
-    load_task_fence_shadow_session_key,
 )
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -23,6 +22,7 @@ from gateway.platforms.base import (
     SendResult,
     task_fence_sidecar_for_human_message,
 )
+from task_fence_config import load_task_fence_shadow_conversation_key
 from gateway.run import (
     GatewayRunner,
     _TASK_FENCE_FINAL_TURN_GENERATION_KEY,
@@ -181,7 +181,7 @@ def _runner(
         platforms={
             Platform.SLACK: PlatformConfig(enabled=True, token="test")
         },
-        task_fence_shadow_session_key=(
+        task_fence_shadow_conversation_key=(
             _session_key() if configured_key is None else configured_key
         ),
     )
@@ -1311,22 +1311,23 @@ async def test_session_closing_command_commits_before_adapter_dispatch(
 
 
 def test_gateway_config_has_one_exact_default_off_shadow_lane():
-    assert GatewayConfig().task_fence_shadow_session_key == ""
+    assert GatewayConfig().task_fence_shadow_conversation_key == ""
     config = GatewayConfig.from_dict(
         {
-            "gateway": {
-                "task_fence": {
-                    "shadow_session_key": _session_key(),
-                }
+            "task_fence": {
+                "shadow_conversation_key": _session_key(),
             }
         }
     )
-    assert config.task_fence_shadow_session_key == _session_key()
-    assert config.to_dict()["task_fence"]["shadow_session_key"] == _session_key()
+    assert config.task_fence_shadow_conversation_key == _session_key()
+    assert (
+        config.to_dict()["task_fence"]["shadow_conversation_key"]
+        == _session_key()
+    )
     assert (
         GatewayConfig.from_dict(
-            {"task_fence": {"shadow_session_key": ["not", "a", "key"]}}
-        ).task_fence_shadow_session_key
+            {"task_fence": {"shadow_conversation_key": ["not", "a", "key"]}}
+        ).task_fence_shadow_conversation_key
         == ""
     )
     assert (
@@ -1339,27 +1340,38 @@ def test_gateway_config_has_one_exact_default_off_shadow_lane():
                     }
                 },
             }
-        ).task_fence_shadow_session_key
+        ).task_fence_shadow_conversation_key
         == ""
     )
+    for ignored_alias in (
+        {"task_fence_shadow_conversation_key": _session_key()},
+        {"task_fence": {"shadow_session_key": _session_key()}},
+        {
+            "gateway": {
+                "task_fence": {
+                    "shadow_conversation_key": _session_key(),
+                }
+            }
+        },
+    ):
+        assert GatewayConfig.from_dict(ignored_alias).task_fence_shadow_conversation_key == ""
 
 
 def test_real_config_loader_latches_exact_shadow_lane(tmp_path):
     (tmp_path / "config.yaml").write_text(
-        "gateway:\n"
-        "  task_fence:\n"
-        f"    shadow_session_key: {_session_key()}\n",
+        "task_fence:\n"
+        f"  shadow_conversation_key: {_session_key()}\n",
         encoding="utf-8",
     )
     home_token = set_hermes_home_override(str(tmp_path))
     try:
         config = load_gateway_config()
-        status_session_key = load_task_fence_shadow_session_key()
+        status_session_key = load_task_fence_shadow_conversation_key()
     finally:
         reset_hermes_home_override(home_token)
 
-    assert config.task_fence_shadow_session_key == _session_key()
-    assert status_session_key == config.task_fence_shadow_session_key
+    assert config.task_fence_shadow_conversation_key == _session_key()
+    assert status_session_key == config.task_fence_shadow_conversation_key
 
 
 def test_malformed_yaml_cannot_preserve_legacy_json_shadow_lane(tmp_path):
@@ -1368,17 +1380,17 @@ def test_malformed_yaml_cannot_preserve_legacy_json_shadow_lane(tmp_path):
         encoding="utf-8",
     )
     (tmp_path / "config.yaml").write_text(
-        "gateway:\n  task_fence: false\n",
+        "task_fence: false\n",
         encoding="utf-8",
     )
     home_token = set_hermes_home_override(str(tmp_path))
     try:
         config = load_gateway_config()
-        status_session_key = load_task_fence_shadow_session_key()
+        status_session_key = load_task_fence_shadow_conversation_key()
     finally:
         reset_hermes_home_override(home_token)
 
-    assert config.task_fence_shadow_session_key == ""
+    assert config.task_fence_shadow_conversation_key == ""
     assert status_session_key == ""
 
 
@@ -1390,26 +1402,25 @@ def test_legacy_gateway_json_cannot_activate_shadow_lane(tmp_path):
     home_token = set_hermes_home_override(str(tmp_path))
     try:
         config = load_gateway_config()
-        status_session_key = load_task_fence_shadow_session_key()
+        status_session_key = load_task_fence_shadow_conversation_key()
     finally:
         reset_hermes_home_override(home_token)
 
-    assert config.task_fence_shadow_session_key == ""
+    assert config.task_fence_shadow_conversation_key == ""
     assert status_session_key == ""
 
 
 def test_shadow_status_config_keeps_literal_env_references(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_FENCE_TEST_LANE", "expanded-lane")
     (tmp_path / "config.yaml").write_text(
-        "gateway:\n"
-        "  task_fence:\n"
-        "    shadow_session_key: \"${TASK_FENCE_TEST_LANE}\"\n",
+        "task_fence:\n"
+        "  shadow_conversation_key: \"${TASK_FENCE_TEST_LANE}\"\n",
         encoding="utf-8",
     )
     home_token = set_hermes_home_override(str(tmp_path))
     try:
-        startup_session_key = load_gateway_config().task_fence_shadow_session_key
-        status_session_key = load_task_fence_shadow_session_key()
+        startup_session_key = load_gateway_config().task_fence_shadow_conversation_key
+        status_session_key = load_task_fence_shadow_conversation_key()
     finally:
         reset_hermes_home_override(home_token)
 
@@ -1419,11 +1430,11 @@ def test_shadow_status_config_keeps_literal_env_references(tmp_path, monkeypatch
 
 def test_shadow_status_config_does_not_repair_malformed_yaml(tmp_path):
     config_path = tmp_path / "config.yaml"
-    config_path.write_text("gateway:\n  task_fence: [\n", encoding="utf-8")
+    config_path.write_text("task_fence: [\n", encoding="utf-8")
     before = config_path.read_bytes(), tuple(tmp_path.iterdir())
     home_token = set_hermes_home_override(str(tmp_path))
     try:
-        assert load_task_fence_shadow_session_key() == ""
+        assert load_task_fence_shadow_conversation_key() == ""
     finally:
         reset_hermes_home_override(home_token)
 
@@ -1434,9 +1445,9 @@ def test_invalid_shadow_lane_warning_does_not_echo_value(caplog):
     secret = "do-not-log-this-value"
 
     config = GatewayConfig.from_dict(
-        {"task_fence": {"shadow_session_key": [secret]}}
+        {"task_fence": {"shadow_conversation_key": [secret]}}
     )
 
-    assert config.task_fence_shadow_session_key == ""
+    assert config.task_fence_shadow_conversation_key == ""
     assert secret not in caplog.text
     assert "got list" in caplog.text

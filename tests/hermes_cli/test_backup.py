@@ -129,6 +129,7 @@ class TestShouldExclude:
         assert _should_exclude(Path("state.db-wal"))
         assert _should_exclude(Path("state.db-shm"))
         assert _should_exclude(Path("state.db-journal"))
+        assert _should_exclude(Path("task-fence-owner.lock"))
         assert _should_exclude(Path("memory_store.db-wal"))
         # The .db itself is still included (and safe-copied separately)
         assert not _should_exclude(Path("state.db"))

@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 from task_fence import (
     OperationDescriptor,
     OperationKind,
@@ -31,6 +36,10 @@ _MAX_RECEIPT_BYTES = 4096
 _MAX_PROCESS_CHECKPOINT_BYTES = 1_048_576
 _MAX_PROCESS_CHECKPOINT_ENTRIES = 64
 _MAX_PROCESS_SESSION_ID_BYTES = 512
+_TASK_FENCE_OWNER_LOCK_FILENAME = "task-fence-owner.lock"
+_WINDOWS_LOCK_OFFSET = 1024 * 1024
+_task_fence_owner_lock_handle: Any = None
+_task_fence_owner_lock_path: Path | None = None
 _RECEIPT_KEYS = frozenset({
     "schema",
     "target_platform",
@@ -68,6 +77,77 @@ class TaskFenceStartupUnavailable(RuntimeError):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
+
+
+def _owner_lock_path(hermes_home: Path | None = None) -> Path:
+    from hermes_constants import get_process_hermes_home
+
+    home = Path(hermes_home) if hermes_home is not None else get_process_hermes_home()
+    return (home / _TASK_FENCE_OWNER_LOCK_FILENAME).expanduser().resolve(strict=False)
+
+
+def _try_acquire_owner_file_lock(handle: Any) -> bool:
+    try:
+        if sys.platform == "win32":
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write("\n")
+                handle.flush()
+            handle.seek(_WINDOWS_LOCK_OFFSET)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+def _release_owner_file_lock(handle: Any) -> None:
+    try:
+        if sys.platform == "win32":
+            handle.seek(_WINDOWS_LOCK_OFFSET)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def acquire_task_fence_owner_lock(hermes_home: Path | None = None) -> bool:
+    """Claim the process-wide Task Fence owner for one HERMES_HOME."""
+    global _task_fence_owner_lock_handle, _task_fence_owner_lock_path
+
+    path = _owner_lock_path(hermes_home)
+    if _task_fence_owner_lock_handle is not None:
+        return _task_fence_owner_lock_path == path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+", encoding="utf-8")
+    except OSError:
+        return False
+    if not _try_acquire_owner_file_lock(handle):
+        handle.close()
+        return False
+    _task_fence_owner_lock_handle = handle
+    _task_fence_owner_lock_path = path
+    return True
+
+
+def release_task_fence_owner_lock() -> None:
+    """Release the Task Fence owner lock when held by this process."""
+    global _task_fence_owner_lock_handle, _task_fence_owner_lock_path
+
+    handle = _task_fence_owner_lock_handle
+    _task_fence_owner_lock_handle = None
+    _task_fence_owner_lock_path = None
+    if handle is None:
+        return
+    _release_owner_file_lock(handle)
+    try:
+        handle.close()
+    except OSError:
+        pass
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,12 +482,17 @@ def _read_process_checkpoint_snapshot(
     return tuple(observations)
 
 
-def prepare_task_fence_shadow_startup(config: Any) -> TaskFenceRecovery | None:
+def prepare_task_fence_shadow_startup(
+    shadow_conversation_key: str,
+    *,
+    hermes_home: Path | None = None,
+    multiplex_profiles: bool = False,
+) -> TaskFenceRecovery | None:
     """Run the selected cohort's receipt-bound recovery before consumers open."""
 
-    if not getattr(config, "task_fence_shadow_session_key", ""):
+    if not shadow_conversation_key:
         return None
-    if getattr(config, "multiplex_profiles", False):
+    if multiplex_profiles:
         raise TaskFenceStartupUnavailable("multiplex_profiles_unsupported")
 
     identity = _read_receipt()
@@ -416,10 +501,10 @@ def prepare_task_fence_shadow_startup(config: Any) -> TaskFenceRecovery | None:
         from hermes_constants import get_hermes_home
         from hermes_state import SessionDB
 
-        hermes_home = get_hermes_home()
+        resolved_home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
         process_checkpoint = _read_process_checkpoint_snapshot(
-            hermes_home / "processes.json",
-            shadow_session_key=config.task_fence_shadow_session_key,
+            resolved_home / "processes.json",
+            shadow_session_key=shadow_conversation_key,
         )
         logger.info(
             "Task Fence shadow startup captured %d process checkpoint "
@@ -435,7 +520,7 @@ def prepare_task_fence_shadow_startup(config: Any) -> TaskFenceRecovery | None:
             )
             for observation in process_checkpoint
         )
-        database = SessionDB(hermes_home / "state.db")
+        database = SessionDB(resolved_home / "state.db")
         store = database.inspect_task_fence_store()
         if not store.compatible:
             raise TaskFenceStartupUnavailable(store.reason)
@@ -449,7 +534,7 @@ def prepare_task_fence_shadow_startup(config: Any) -> TaskFenceRecovery | None:
             expected_runtime_epoch=store.runtime_epoch,
             expected_mode_generation=store.mode_generation,
             tested_artifact_identity=identity,
-            shadow_session_key=config.task_fence_shadow_session_key,
+            shadow_session_key=shadow_conversation_key,
             process_checkpoint_operations=process_checkpoint_operations,
         )
     except TaskFenceStartupUnavailable:

@@ -47,25 +47,48 @@ def test_gateway_config_loader_honors_managed(homes, monkeypatch):
         managed,
         user=(
             "group_sessions_per_user: false\n"
-            "gateway:\n"
-            "  task_fence:\n"
-            "    shadow_session_key: user-lane\n"
+            "task_fence:\n"
+            "  shadow_conversation_key: user-lane\n"
         ),
         mgd=(
             "group_sessions_per_user: true\n"
-            "gateway:\n"
-            "  task_fence:\n"
-            "    shadow_session_key: managed-lane\n"
+            "task_fence:\n"
+            "  shadow_conversation_key: managed-lane\n"
         ),
     )
     import gateway.config as gc
+    from task_fence_config import load_task_fence_shadow_conversation_key
 
     # load_gateway_config resolves home via get_hermes_home() (HERMES_HOME env).
     cfg = gc.load_gateway_config()
     # Managed value should have flowed into the GatewayConfig.
     assert cfg.group_sessions_per_user is True
-    assert cfg.task_fence_shadow_session_key == "managed-lane"
-    assert gc.load_task_fence_shadow_session_key() == "managed-lane"
+    assert cfg.task_fence_shadow_conversation_key == "managed-lane"
+    assert load_task_fence_shadow_conversation_key() == "managed-lane"
+
+
+def test_task_fence_managed_selector_is_raw_and_not_env_expanded(
+    homes,
+    monkeypatch,
+):
+    home, managed = homes
+    monkeypatch.setenv("TASK_FENCE_MANAGED_SELECTOR", "expanded-value")
+    _seed(
+        home,
+        managed,
+        user=(
+            "task_fence:\n"
+            "  shadow_conversation_key: user-lane\n"
+        ),
+        mgd=(
+            "task_fence:\n"
+            "  shadow_conversation_key: ${TASK_FENCE_MANAGED_SELECTOR}\n"
+        ),
+    )
+    from task_fence_config import load_task_fence_shadow_conversation_key
+
+    expected = "${TASK_FENCE_MANAGED_SELECTOR}"
+    assert load_task_fence_shadow_conversation_key() == expected
 
 
 

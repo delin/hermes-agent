@@ -6275,9 +6275,16 @@ def run_conversation(
 
                 _task_fence_policy = None
                 if _task_fence_acceptance is not None:
+                    _task_fence_projection = _task_fence_acceptance.task_projection
+                else:
+                    _task_fence_projection = None
+                if _task_fence_projection is not None:
                     _task_fence_store = getattr(agent, "_session_db", None)
                     if _task_fence_store is not None:
-                        _task_fence_policy = TaskFencePolicy(_task_fence_store)
+                        _task_fence_policy = TaskFencePolicy(
+                            _task_fence_store,
+                            runtime_conversation_key=_task_fence_projection.conversation_id,
+                        )
                 with (
                     bind_causal_envelope(_task_fence_generation_envelope),
                     bind_task_fence_policy(_task_fence_policy),

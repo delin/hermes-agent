@@ -74,4 +74,9 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
     assert artifacts
     if kind == "wheel":
         with zipfile.ZipFile(artifacts[0]) as wheel:
-            assert "task_fence.py" in wheel.namelist()
+            wheel_members = set(wheel.namelist())
+            assert {
+                "task_fence.py",
+                "task_fence_config.py",
+                "task_fence_runtime.py",
+            } <= wheel_members

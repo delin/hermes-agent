@@ -37,7 +37,7 @@ _SHA256_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 
 TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
-TASK_FENCE_CAPABILITY_VERSION = "task-fence-capability-v3"
+TASK_FENCE_CAPABILITY_VERSION = "task-fence-capability-v4"
 TASK_FENCE_FINAL_GENERATION_KEY = "_task_fence_final_generation"
 TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER = (
     "runtime:process_checkpoint_recovery_pending"
@@ -575,6 +575,8 @@ _SELECTED_COHORT_CAPABILITY_DEFINITIONS = (
     (_ADAPTER, "gateway:slack:other_ingress", _UNSUPPORTED),
     (_ADAPTER, "gateway:telegram:typed_ingress", _SUPPORTED),
     (_ADAPTER, "gateway:telegram:other_ingress", _UNSUPPORTED),
+    (_ADAPTER, "cli:foreground:typed_ingress", _SUPPORTED),
+    (_ADAPTER, "cli:other_ingress", _UNSUPPORTED),
     (_ADAPTER, "provider:openai.chat.completions.create", _SUPPORTED),
     (_ADAPTER, "provider:gemini.generateContent", _SUPPORTED),
     (_ADAPTER, "provider:gemini.streamGenerateContent", _SUPPORTED),
@@ -772,6 +774,31 @@ class TaskFenceIngressSidecar:
             source_sequence=self.source_sequence,
             causal_parent_generation_id=self.causal_parent_generation_id,
         )
+
+
+def task_fence_sidecar_for_plain_text(
+    *,
+    source: str,
+    source_event_id: str,
+    payload_text: str,
+) -> TaskFenceIngressSidecar:
+    """Classify one trusted plain-text human submit without surface logic."""
+
+    if not isinstance(payload_text, str):
+        raise TaskFenceProtocolRejected("invalid_plaintext_payload")
+    try:
+        payload_hash = hashlib.sha256(
+            f"text\x00{payload_text}".encode("utf-8")
+        ).hexdigest()
+    except UnicodeEncodeError:
+        raise TaskFenceProtocolRejected("invalid_plaintext_payload") from None
+    return TaskFenceIngressSidecar(
+        source=source,
+        source_event_id=source_event_id,
+        action=TASK_FENCE_ACTIONS["initial_submit"],
+        active_lane_action=TASK_FENCE_ACTIONS["comment_hold"],
+        payload_hash=payload_hash,
+    )
 
 
 @dataclass(frozen=True)
@@ -1083,8 +1110,20 @@ class _TaskFencePolicyStore(Protocol):
 class TaskFencePolicy:
     """Shared audit-only policy facade; decisions do not gate legacy dispatch."""
 
-    def __init__(self, store: _TaskFencePolicyStore):
+    def __init__(
+        self,
+        store: _TaskFencePolicyStore,
+        *,
+        runtime_conversation_key: str | None = None,
+    ):
+        _bounded_text(
+            runtime_conversation_key,
+            field="runtime_conversation_key",
+            max_bytes=_MAX_IDENTIFIER_BYTES,
+            optional=True,
+        )
         self._store = store
+        self._runtime_conversation_key = runtime_conversation_key
 
     def admit_operation(
         self,
@@ -1168,6 +1207,15 @@ def current_task_fence_policy() -> TaskFencePolicy | None:
     """Return the policy explicitly bound for one accepted runtime turn."""
 
     return _CURRENT_TASK_FENCE_POLICY.get()
+
+
+def current_task_fence_runtime_conversation_key() -> str | None:
+    """Return the stable conversation key bound to an accepted tool turn."""
+
+    policy = current_task_fence_policy()
+    if policy is None:
+        return None
+    return policy._runtime_conversation_key
 
 
 @contextmanager

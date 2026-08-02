@@ -286,7 +286,7 @@ class TestTaskFenceIngressSidecar:
             platforms={
                 Platform.SLACK: PlatformConfig(enabled=True, token="test")
             },
-            task_fence_shadow_session_key=session_key,
+            task_fence_shadow_conversation_key=session_key,
         )
         runner._session_db = AsyncSessionDB(db)
         runner._update_prompt_pending = {}

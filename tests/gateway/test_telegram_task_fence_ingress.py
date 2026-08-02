@@ -117,7 +117,7 @@ def _stack(
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: platform_config},
-        task_fence_shadow_session_key=configured_key,
+        task_fence_shadow_conversation_key=configured_key,
     )
     db = SessionDB(db_path=tmp_path / "state.db")
     runner._session_db = AsyncSessionDB(db)

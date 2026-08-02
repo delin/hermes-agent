@@ -2528,14 +2528,18 @@ def terminal_tool(
                 "EOF."
             )
 
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
+        # Task Fence uses its compression-stable conversation key for runtime
+        # recovery. Legacy turns keep the approval/session context and raw
+        # task_id fallback unchanged.
+        from task_fence import current_task_fence_runtime_conversation_key
         from tools.approval import get_current_session_key
 
-        session_key = get_current_session_key(default="") or (task_id or "")
-
+        legacy_session_key = (
+            get_current_session_key(default="") or (task_id or "")
+        )
+        runtime_session_key = (
+            current_task_fence_runtime_conversation_key() or legacy_session_key
+        )
         if background:
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
@@ -2545,7 +2549,7 @@ def terminal_tool(
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
-                session_key=session_key,
+                session_key=legacy_session_key,
             )
             try:
                 if env_type == "local":
@@ -2553,7 +2557,7 @@ def terminal_tool(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
-                        session_key=session_key,
+                        session_key=runtime_session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
                     )
@@ -2563,7 +2567,7 @@ def terminal_tool(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
-                        session_key=session_key,
+                        session_key=runtime_session_key,
                     )
 
                 result_data = {
@@ -2761,7 +2765,7 @@ def terminal_tool(
                         process_registry.pending_watchers.append({
                             "session_id": proc_session.id,
                             "check_interval": 5,
-                            "session_key": session_key,
+                            "session_key": runtime_session_key,
                             "platform": proc_session.watcher_platform,
                             "chat_id": proc_session.watcher_chat_id,
                             "user_id": proc_session.watcher_user_id,
@@ -2805,7 +2809,7 @@ def terminal_tool(
                     command_cwd = _resolve_command_cwd(
                         workdir=workdir,
                         default_cwd=cwd,
-                        session_key=session_key,
+                        session_key=legacy_session_key,
                     )
                     execute_kwargs = {
                         "timeout": effective_timeout,
@@ -2831,7 +2835,7 @@ def terminal_tool(
                             {
                                 "task_id": effective_task_id,
                                 "session_id": session_id,
-                                "session_key": session_key,
+                                "session_key": legacy_session_key,
                                 "environment": env_type,
                             },
                             adapter="agent-runtime:terminal-retry",
@@ -2872,7 +2876,7 @@ def terminal_tool(
             # session — record it under the session key so the durable record
             # never depends on the shared env surviving or on who drives the
             # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            record_session_cwd(legacy_session_key, getattr(env, "cwd", None))
 
             # Extract output
             output = result.get("output", "")

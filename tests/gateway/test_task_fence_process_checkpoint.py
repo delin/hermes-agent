@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import hermes_state
-from gateway import task_fence_startup as startup
+import task_fence_runtime as startup
 from hermes_state import SessionDB
 from task_fence import (
     OperationDescriptor,

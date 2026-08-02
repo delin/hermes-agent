@@ -32,9 +32,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 from gateway.config import (
     coerce_systemd_watchdog_seconds,
     load_gateway_config,
-    load_task_fence_shadow_session_key,
 )
 from gateway.status import terminate_pid
+from task_fence_config import load_task_fence_shadow_conversation_key
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
@@ -1417,11 +1417,11 @@ def _print_task_fence_shadow_status() -> None:
     print()
     print("Task Fence shadow (configured conversation only):")
     try:
-        session_key = load_task_fence_shadow_session_key()
+        conversation_key = load_task_fence_shadow_conversation_key()
     except Exception:
         print("  State: inspection unavailable (config_load_failed)")
         return
-    if not session_key:
+    if not conversation_key:
         print("  State: not configured")
         return
 
@@ -1435,7 +1435,7 @@ def _print_task_fence_shadow_status() -> None:
 
         db = SessionDB(db_path, read_only=True)
         try:
-            inspection = db.inspect_task_fence_conversation(session_key)
+            inspection = db.inspect_task_fence_conversation(conversation_key)
         finally:
             db.close()
     except Exception:

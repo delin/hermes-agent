@@ -3358,7 +3358,12 @@ def delegate_task(
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
-        _session_key = get_current_session_key(default="")
+        from task_fence import current_task_fence_runtime_conversation_key
+
+        _session_key = (
+            current_task_fence_runtime_conversation_key()
+            or get_current_session_key(default="")
+        )
         _origin_ui_session_id = ""
         try:
             from gateway.session_context import get_session_env

@@ -86,6 +86,7 @@ _EXCLUDED_SUFFIXES = (
 _EXCLUDED_NAMES = {
     "gateway.pid",
     "cron.pid",
+    "task-fence-owner.lock",
 }
 
 # File names that ``hermes import`` must never overwrite, matched by basename so
@@ -119,6 +120,7 @@ _IMPORT_SKIP_NAMES = {
     "cron.pid",
     "gateway.lock",
     "processes.json",
+    "task-fence-owner.lock",
 }
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.

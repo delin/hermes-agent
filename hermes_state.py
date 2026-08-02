@@ -14861,6 +14861,61 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return f"{base} #{max_num + 1}"
 
+    def get_task_fence_compression_root(self, session_id: str) -> str:
+        """Return the compression-only root for one Task Fence conversation.
+
+        Generic session ancestry also contains branches, delegated agents, and
+        tool-owned children. Those edges must never inherit human authority.
+        Walk only the inverse of the canonical compression-continuation edge
+        used by :meth:`get_compression_tip`, stopping on malformed state.
+        """
+
+        current = session_id
+        seen = {current} if current else set()
+        for _ in range(100):
+            with self._lock:
+                row = self._conn.execute(
+                    """
+                    SELECT child.parent_session_id, child.source,
+                           child.model_config, parent.id AS parent_id,
+                           parent.end_reason AS parent_end_reason
+                    FROM sessions AS child
+                    LEFT JOIN sessions AS parent
+                      ON parent.id = child.parent_session_id
+                    WHERE child.id = ?
+                    """,
+                    (current,),
+                ).fetchone()
+            if row is None:
+                return current
+            parent_id = row["parent_id"]
+            if not parent_id or row["parent_session_id"] != parent_id:
+                return current
+            if row["source"] == "tool":
+                return current
+            raw_config = row["model_config"]
+            if raw_config is None:
+                model_config = {}
+            elif isinstance(raw_config, str):
+                try:
+                    model_config = json.loads(raw_config)
+                except json.JSONDecodeError:
+                    return current
+                if not isinstance(model_config, dict):
+                    return current
+            else:
+                return current
+            if (
+                model_config.get("_branched_from") is not None
+                or model_config.get("_delegate_from") is not None
+                or row["parent_end_reason"] != "compression"
+                or parent_id in seen
+            ):
+                return current
+            seen.add(parent_id)
+            current = parent_id
+        return current
+
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 

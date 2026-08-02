@@ -375,6 +375,8 @@ py-modules = [
   "hermes_time",
   "hermes_logging",
   "task_fence",
+  "task_fence_config",
+  "task_fence_runtime",
   "utils",
   "mcp_serve",
 ]

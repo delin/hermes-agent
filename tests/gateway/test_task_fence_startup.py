@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from gateway import task_fence_startup as startup
+import task_fence_runtime as startup
 from gateway.config import GatewayConfig
 from hermes_state import SessionDB
 
@@ -15,6 +15,15 @@ _SHADOW_SESSION_KEY = "slack:workspace:channel:user"
 _COMMIT = "a" * 40
 _ARTIFACT_DIGEST = "sha256:" + "b" * 64
 _LOCK_DIGEST = "sha256:" + "c" * 64
+
+@pytest.fixture(autouse=True)
+def _release_task_fence_owner_lock():
+    startup.release_task_fence_owner_lock()
+    try:
+        yield
+    finally:
+        startup.release_task_fence_owner_lock()
+
 
 
 def _receipt_payload(*, platform: str = _PLATFORM) -> dict[str, str]:
@@ -477,7 +486,7 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
 
     ok = await gateway_run.start_gateway(
         config=GatewayConfig(
-            task_fence_shadow_session_key=_SHADOW_SESSION_KEY,
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
             sessions_dir=tmp_path / "sessions",
         ),
         verbosity=None,
@@ -515,7 +524,7 @@ async def test_active_startup_failure_releases_claim_without_runner(
 
     ok = await gateway_run.start_gateway(
         config=GatewayConfig(
-            task_fence_shadow_session_key=_SHADOW_SESSION_KEY,
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
             sessions_dir=tmp_path / "sessions",
         ),
         verbosity=None,
@@ -597,7 +606,7 @@ async def test_process_checkpoint_failure_releases_claim_without_runner(
 
     ok = await gateway_run.start_gateway(
         config=GatewayConfig(
-            task_fence_shadow_session_key=_SHADOW_SESSION_KEY,
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
             sessions_dir=tmp_path / "sessions",
         ),
         verbosity=None,
@@ -631,7 +640,7 @@ async def test_multiplex_shadow_key_refuses_before_receipt_or_runner(
     ok = await gateway_run.start_gateway(
         config=GatewayConfig(
             multiplex_profiles=True,
-            task_fence_shadow_session_key=_SHADOW_SESSION_KEY,
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
             sessions_dir=tmp_path / "sessions",
         ),
         verbosity=None,
@@ -668,3 +677,72 @@ async def test_pid_claim_error_releases_lock_before_barrier(
         )
 
     assert events == ["lock", "pid", "remove_pid", "release_lock"]
+
+
+@pytest.mark.asyncio
+async def test_configured_startup_recovers_before_full_config_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    (tmp_path / "config.yaml").write_text(
+        "task_fence:\n"
+        f"  shadow_conversation_key: {_SHADOW_SESSION_KEY}\n",
+        encoding="utf-8",
+    )
+
+    class OrderedRunner:
+        def __init__(self, config: GatewayConfig):
+            events.append("runner")
+            self.config = config
+            self.should_exit_cleanly = True
+            self.exit_reason = None
+            self.exit_code = None
+            self.adapters = {}
+
+        async def start(self) -> bool:
+            events.append("start")
+            return True
+
+    gateway_run = _install_start_gateway_shell(
+        monkeypatch,
+        tmp_path,
+        events,
+        OrderedRunner,
+    )
+    monkeypatch.setattr(
+        startup,
+        "acquire_task_fence_owner_lock",
+        lambda home=None: events.append("owner") or True,
+    )
+    monkeypatch.setattr(
+        startup,
+        "prepare_task_fence_shadow_startup",
+        lambda key, **kwargs: events.append("recover"),
+    )
+
+    def load_full_config() -> GatewayConfig:
+        events.append("full_config")
+        return GatewayConfig(
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
+            sessions_dir=tmp_path / "sessions",
+        )
+
+    monkeypatch.setattr(
+        gateway_run,
+        "load_gateway_config_for_runner",
+        load_full_config,
+    )
+
+    ok = await gateway_run.start_gateway(config=None, verbosity=None)
+
+    assert ok is True
+    assert events[:7] == [
+        "lock",
+        "pid",
+        "owner",
+        "recover",
+        "full_config",
+        "runner",
+        "start",
+    ]

@@ -558,6 +558,7 @@ from task_fence import (
     TaskFenceIngressSidecar,
     TaskFenceProtocolRejected,
     TerminalReason,
+    task_fence_sidecar_for_plain_text,
 )
 
 
@@ -2203,7 +2204,6 @@ def task_fence_sidecar_for_human_message(
 
     command = event.get_command()
     terminal_reason = None
-    active_lane_action = None
     if command == "stop":
         action = TASK_FENCE_ACTIONS["stop"]
         terminal_reason = TerminalReason.STOPPED
@@ -2213,18 +2213,23 @@ def task_fence_sidecar_for_human_message(
     elif command is not None:
         return None
     elif event.message_type is MessageType.TEXT:
-        action = TASK_FENCE_ACTIONS["initial_submit"]
-        active_lane_action = TASK_FENCE_ACTIONS["comment_hold"]
+        action = None
     else:
         return None
 
     try:
+        canonical_text = event.text if payload_text is None else payload_text
+        if event.message_type is MessageType.TEXT:
+            return task_fence_sidecar_for_plain_text(
+                source=f"gateway:{platform_name}",
+                source_event_id=source_event_id,
+                payload_text=canonical_text or "",
+            )
         message_type = getattr(
             event.message_type,
             "value",
             str(event.message_type),
         )
-        canonical_text = event.text if payload_text is None else payload_text
         payload_hash = hashlib.sha256(
             f"{message_type}\x00{canonical_text or ''}".encode("utf-8")
         ).hexdigest()
@@ -2232,7 +2237,6 @@ def task_fence_sidecar_for_human_message(
             source=f"gateway:{platform_name}",
             source_event_id=source_event_id,
             action=action,
-            active_lane_action=active_lane_action,
             payload_hash=payload_hash,
             terminal_reason=terminal_reason,
         )

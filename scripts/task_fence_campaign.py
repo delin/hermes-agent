@@ -308,7 +308,7 @@ async def _accept_configured_slack_ingress(db: Any) -> tuple[Any, int]:
     runner: Any = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.SLACK: PlatformConfig(enabled=True)},
-        task_fence_shadow_session_key=session_key,
+        task_fence_shadow_conversation_key=session_key,
     )
     runner._session_db = AsyncSessionDB(db)
     runner._update_prompt_pending = {}

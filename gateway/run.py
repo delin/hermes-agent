@@ -1814,6 +1814,50 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+def _task_fence_gateway_startup_selection(
+    config: Optional["GatewayConfig"],
+    hermes_home: Path,
+) -> tuple[str, bool]:
+    """Load only the startup-latched selector and multiplex incompatibility."""
+
+    if config is not None:
+        return (
+            config.task_fence_shadow_conversation_key,
+            bool(config.multiplex_profiles),
+        )
+
+    from task_fence_config import load_task_fence_shadow_conversation_key
+
+    conversation_key = load_task_fence_shadow_conversation_key(hermes_home)
+    if not conversation_key:
+        return "", False
+
+    from gateway.config import (
+        _coerce_bool,
+        _env_multiplex_profiles_override,
+        _load_primary_gateway_yaml,
+    )
+
+    try:
+        raw_config = _load_primary_gateway_yaml(hermes_home) or {}
+    except Exception:
+        raw_config = {}
+    gateway_config = (
+        raw_config.get("gateway")
+        if isinstance(raw_config.get("gateway"), dict)
+        else {}
+    )
+    multiplex_raw = raw_config.get(
+        "multiplex_profiles",
+        gateway_config.get("multiplex_profiles"),
+    )
+    multiplex_profiles = _coerce_bool(multiplex_raw, False)
+    env_override = _env_multiplex_profiles_override()
+    if env_override is not None:
+        multiplex_profiles = env_override
+    return conversation_key, multiplex_profiles
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -3348,7 +3392,7 @@ def _task_fence_delivery_capability_for_event(
     projection = getattr(acceptance, "task_projection", None)
     configured_key = getattr(
         getattr(runner, "config", None),
-        "task_fence_shadow_session_key",
+        "task_fence_shadow_conversation_key",
         "",
     )
     try:
@@ -8461,7 +8505,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         configured_key = getattr(
             getattr(self, "config", None),
-            "task_fence_shadow_session_key",
+            "task_fence_shadow_conversation_key",
             "",
         )
         if not configured_key:
@@ -12609,7 +12653,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            from task_fence_runtime import release_task_fence_owner_lock
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
+            release_task_fence_owner_lock()
             remove_pid_file()
             release_gateway_runtime_lock()
 
@@ -25785,9 +25831,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # and GatewayRunner only opens consumer state after that commit.
     import atexit
     from gateway.status import write_pid_file
-    from gateway.task_fence_startup import (
+    from task_fence_runtime import (
         TaskFenceStartupUnavailable,
+        acquire_task_fence_owner_lock,
         prepare_task_fence_shadow_startup,
+        release_task_fence_owner_lock,
     )
 
     _current_pid = get_running_pid()
@@ -25804,6 +25852,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
 
     def _release_startup_claim() -> None:
+        try:
+            release_task_fence_owner_lock()
+        except Exception:
+            logger.debug("Could not release Task Fence owner lock", exc_info=True)
         try:
             remove_pid_file()
         except Exception:
@@ -25826,18 +25878,51 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         raise
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+    atexit.register(release_task_fence_owner_lock)
 
     try:
-        resolved_config = (
-            config if config is not None else load_gateway_config_for_runner()
+        (
+            shadow_conversation_key,
+            shadow_multiplex_profiles,
+        ) = _task_fence_gateway_startup_selection(config, _hermes_home)
+        if shadow_conversation_key and not acquire_task_fence_owner_lock(
+            _hermes_home
+        ):
+            raise TaskFenceStartupUnavailable("runtime_owner_unavailable")
+        recovery = prepare_task_fence_shadow_startup(
+            shadow_conversation_key,
+            hermes_home=_hermes_home,
+            multiplex_profiles=shadow_multiplex_profiles,
         )
-        recovery = prepare_task_fence_shadow_startup(resolved_config)
         if recovery is not None:
             logger.info(
                 "Task Fence shadow startup recovered runtime epoch %d -> %d",
                 recovery.previous_runtime_epoch,
                 recovery.runtime_epoch,
             )
+
+        # Full platform/plugin discovery is intentionally after owner recovery.
+        resolved_config = (
+            config if config is not None else load_gateway_config_for_runner()
+        )
+        if config is None:
+            if (
+                resolved_config.task_fence_shadow_conversation_key
+                != shadow_conversation_key
+            ):
+                logger.warning(
+                    "Task Fence selector changed during gateway startup; "
+                    "using the startup-latched value"
+                )
+            resolved_config.task_fence_shadow_conversation_key = (
+                shadow_conversation_key
+            )
+            if (
+                shadow_conversation_key
+                and bool(resolved_config.multiplex_profiles)
+                != shadow_multiplex_profiles
+            ):
+                raise TaskFenceStartupUnavailable("startup_config_changed")
         runner = GatewayRunner(resolved_config)
     except TaskFenceStartupUnavailable as exc:
         _release_startup_claim()
@@ -26340,7 +26425,9 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     # never be stranded. os._exit skips atexit, and the early SystemExit exit
     # paths never run _stop_impl, so release here (idempotent).
     try:
+        from task_fence_runtime import release_task_fence_owner_lock
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
+        release_task_fence_owner_lock()
         remove_pid_file()
         release_gateway_runtime_lock()
     except Exception:

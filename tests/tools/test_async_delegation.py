@@ -652,6 +652,80 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     assert evt["session_key"] == "post-compress-tip"
     assert evt["origin_ui_session_id"] == "origin-tab"
 
+def test_delegate_task_background_uses_task_fence_conversation_root(
+    monkeypatch,
+):
+    from unittest.mock import MagicMock
+
+    import tools.delegate_tool as dt
+    from task_fence import TaskFencePolicy, bind_task_fence_policy
+    from tools.approval import (
+        reset_current_session_key,
+        set_current_session_key,
+    )
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "compression-tip"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+
+    credentials = {
+        "model": "m",
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "command": None,
+        "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kwargs: fake_child)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials",
+        lambda *args, **kwargs: credentials,
+    )
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda *args, **kwargs: {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        },
+    )
+
+    approval_token = set_current_session_key("compression-tip")
+    try:
+        with bind_task_fence_policy(
+            TaskFencePolicy(
+                object(),
+                runtime_conversation_key="compression-root",
+            )
+        ):
+            parsed = json.loads(
+                dt.delegate_task(
+                    goal="background task",
+                    background=True,
+                    parent_agent=parent,
+                )
+            )
+        event = _drain_for(parsed["delegation_id"])
+    finally:
+        reset_current_session_key(approval_token)
+
+    assert event is not None
+    assert event["session_key"] == "compression-root"
+    assert event["parent_session_id"] == "compression-tip"
+
+
 
 def test_concurrent_dispatch_respects_capacity():
     """Two threads racing dispatch with cap=1 must yield exactly one accept
