@@ -98,6 +98,12 @@ class OperationKind(str, Enum):
     DELIVERY = "delivery"
 
 
+class TaskFenceRuntimeMode(str, Enum):
+    AUDIT = "audit"
+    ENFORCE = "enforce"
+    HALT_DISPATCH = "halt_dispatch"
+
+
 class DecisionOutcome(str, Enum):
     WOULD_RESERVE = "would_reserve"
     WOULD_ALLOW = "would_allow"
@@ -283,6 +289,65 @@ class TaskFenceProtocolRejected(ValueError):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class TaskFenceModeRecord:
+    """Validated durable inputs for fail-closed startup mode resolution."""
+
+    mode: TaskFenceRuntimeMode = TaskFenceRuntimeMode.AUDIT
+    mode_generation: int = 0
+    ever_enforced: bool = False
+    audit_degraded: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, TaskFenceRuntimeMode):
+            raise TaskFenceProtocolRejected("invalid_task_fence_runtime_mode")
+        if (
+            type(self.mode_generation) is not int
+            or not 0 <= self.mode_generation <= _MAX_SQLITE_INTEGER
+        ):
+            raise TaskFenceProtocolRejected("invalid_mode_generation")
+        if type(self.ever_enforced) is not bool:
+            raise TaskFenceProtocolRejected("invalid_ever_enforced")
+        if type(self.audit_degraded) is not bool:
+            raise TaskFenceProtocolRejected("invalid_audit_degraded")
+
+
+def effective_task_fence_startup_mode(
+    record: TaskFenceModeRecord,
+    configured_mode: str | None,
+    *,
+    store_healthy: bool = True,
+    compatible: bool = True,
+) -> TaskFenceRuntimeMode:
+    """Resolve startup mode without allowing reset or silent downgrade.
+
+    This pure contract does not mutate durable state or activate enforcement.
+    Callers may wire it only after durable transition and route-compatibility
+    contracts exist.
+    """
+    if store_healthy is not True or compatible is not True:
+        return TaskFenceRuntimeMode.HALT_DISPATCH
+    if record.ever_enforced and record.mode is TaskFenceRuntimeMode.AUDIT:
+        return TaskFenceRuntimeMode.HALT_DISPATCH
+    if record.mode is TaskFenceRuntimeMode.ENFORCE and (
+        not record.ever_enforced or record.mode_generation == 0
+    ):
+        return TaskFenceRuntimeMode.HALT_DISPATCH
+    if configured_mode is None:
+        if record.ever_enforced or record.mode is not TaskFenceRuntimeMode.AUDIT:
+            return TaskFenceRuntimeMode.HALT_DISPATCH
+        return TaskFenceRuntimeMode.AUDIT
+    try:
+        configured = TaskFenceRuntimeMode(configured_mode)
+    except (TypeError, ValueError):
+        return TaskFenceRuntimeMode.HALT_DISPATCH
+    if configured is not record.mode:
+        return TaskFenceRuntimeMode.HALT_DISPATCH
+    if configured is TaskFenceRuntimeMode.ENFORCE and record.audit_degraded:
+        return TaskFenceRuntimeMode.HALT_DISPATCH
+    return configured
 
 
 class TaskFenceIngressRejected(TaskFenceProtocolRejected):

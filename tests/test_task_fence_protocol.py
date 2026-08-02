@@ -24,8 +24,11 @@ from task_fence import (
     Origin,
     ResolutionDisposition,
     TaskFenceAction as Action,
+    TaskFenceModeRecord as ModeRecord,
     TaskFenceProtocolRejected as ProtocolRejected,
+    TaskFenceRuntimeMode as RuntimeMode,
     action_shape as wire_shape,
+    effective_task_fence_startup_mode as effective_startup_mode,
     validate_action,
 )
 
@@ -38,12 +41,6 @@ class TaskStatus(str, Enum):
     INCIDENT = "incident"
     STOPPED = "stopped"
     DONE = "done"
-
-
-class RuntimeMode(str, Enum):
-    AUDIT = "audit"
-    ENFORCE = "enforce"
-    HALT_DISPATCH = "halt_dispatch"
 
 
 @dataclass(frozen=True)
@@ -70,14 +67,6 @@ class DispatchEnvelope:
     run_id: str | None
     generation_id: str | None
     invocation_id: str
-
-
-@dataclass(frozen=True)
-class ModeRecord:
-    mode: RuntimeMode = RuntimeMode.AUDIT
-    generation: int = 0
-    ever_enforced: bool = False
-    audit_degraded: bool = False
 
 
 class DispatchBlocked(RuntimeError):
@@ -320,7 +309,7 @@ def transition_mode(
     offline: bool,
 ) -> ModeRecord:
     """Model a reviewed mode transition; emergency halt is always reachable."""
-    if expected_generation != record.generation:
+    if expected_generation != record.mode_generation:
         raise ProtocolRejected("stale mode generation")
     if target is not RuntimeMode.HALT_DISPATCH and not offline:
         raise ProtocolRejected("mode activation requires an offline transition")
@@ -330,7 +319,7 @@ def transition_mode(
         raise ProtocolRejected("degraded audit cannot promote to enforce")
     return ModeRecord(
         mode=target,
-        generation=record.generation + 1,
+        mode_generation=record.mode_generation + 1,
         ever_enforced=record.ever_enforced or target is RuntimeMode.ENFORCE,
         audit_degraded=record.audit_degraded,
     )
@@ -343,38 +332,15 @@ def clear_audit_degraded(
     offline: bool,
     conformance_passed: bool,
 ) -> ModeRecord:
-    if expected_generation != record.generation:
+    if expected_generation != record.mode_generation:
         raise ProtocolRejected("stale mode generation")
     if not offline or not conformance_passed:
         raise ProtocolRejected("degraded audit requires offline conformance")
-    return replace(record, generation=record.generation + 1, audit_degraded=False)
-
-
-def effective_startup_mode(
-    record: ModeRecord,
-    configured_mode: str | None,
-    *,
-    store_healthy: bool = True,
-    compatible: bool = True,
-) -> RuntimeMode:
-    """Resolve startup mode without permitting config reset or silent downgrade."""
-    if not store_healthy or not compatible:
-        return RuntimeMode.HALT_DISPATCH
-    if record.ever_enforced and record.mode is RuntimeMode.AUDIT:
-        return RuntimeMode.HALT_DISPATCH
-    if configured_mode is None:
-        if record.ever_enforced or record.mode is not RuntimeMode.AUDIT:
-            return RuntimeMode.HALT_DISPATCH
-        return RuntimeMode.AUDIT
-    try:
-        configured = RuntimeMode(configured_mode)
-    except ValueError:
-        return RuntimeMode.HALT_DISPATCH
-    if configured is not record.mode:
-        return RuntimeMode.HALT_DISPATCH
-    if configured is RuntimeMode.ENFORCE and record.audit_degraded:
-        return RuntimeMode.HALT_DISPATCH
-    return configured
+    return replace(
+        record,
+        mode_generation=record.mode_generation + 1,
+        audit_degraded=False,
+    )
 
 
 def recover_after_restart(
@@ -641,9 +607,45 @@ def test_dispatch_permit_is_exact_and_single_use() -> None:
         authorize_and_start(state, envelope, consumed)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "reason"),
+    [
+        ({"mode": "audit"}, "invalid_task_fence_runtime_mode"),
+        ({"mode_generation": True}, "invalid_mode_generation"),
+        ({"mode_generation": -1}, "invalid_mode_generation"),
+        ({"mode_generation": 2**63}, "invalid_mode_generation"),
+        ({"ever_enforced": 1}, "invalid_ever_enforced"),
+        ({"audit_degraded": 0}, "invalid_audit_degraded"),
+    ],
+)
+def test_mode_record_rejects_untyped_or_unbounded_state(
+    kwargs: dict[str, object],
+    reason: str,
+) -> None:
+    with pytest.raises(ProtocolRejected, match=reason):
+        ModeRecord(**kwargs)
+
+
 def test_mode_activation_and_restart_fail_safe() -> None:
     initial = ModeRecord()
     assert effective_startup_mode(initial, None) is RuntimeMode.AUDIT
+
+    for corrupt_enforced in (
+        ModeRecord(
+            mode=RuntimeMode.ENFORCE,
+            mode_generation=1,
+            ever_enforced=False,
+        ),
+        ModeRecord(
+            mode=RuntimeMode.ENFORCE,
+            mode_generation=0,
+            ever_enforced=True,
+        ),
+    ):
+        assert (
+            effective_startup_mode(corrupt_enforced, "enforce")
+            is RuntimeMode.HALT_DISPATCH
+        )
 
     with pytest.raises(ProtocolRejected, match="offline transition"):
         transition_mode(
@@ -664,7 +666,7 @@ def test_mode_activation_and_restart_fail_safe() -> None:
         transition_mode(
             enforced,
             RuntimeMode.AUDIT,
-            expected_generation=enforced.generation,
+            expected_generation=enforced.mode_generation,
             offline=True,
         )
     corrupt_audit = replace(enforced, mode=RuntimeMode.AUDIT)
@@ -684,7 +686,7 @@ def test_mode_activation_and_restart_fail_safe() -> None:
     emergency_halt = transition_mode(
         enforced,
         RuntimeMode.HALT_DISPATCH,
-        expected_generation=enforced.generation,
+        expected_generation=enforced.mode_generation,
         offline=False,
     )
     assert emergency_halt.mode is RuntimeMode.HALT_DISPATCH
@@ -692,14 +694,14 @@ def test_mode_activation_and_restart_fail_safe() -> None:
         transition_mode(
             emergency_halt,
             RuntimeMode.AUDIT,
-            expected_generation=enforced.generation,
+            expected_generation=enforced.mode_generation,
             offline=True,
         )
     with pytest.raises(ProtocolRejected, match="cannot return to audit"):
         transition_mode(
             emergency_halt,
             RuntimeMode.AUDIT,
-            expected_generation=emergency_halt.generation,
+            expected_generation=emergency_halt.mode_generation,
             offline=True,
         )
 
@@ -725,7 +727,7 @@ def test_mode_activation_and_restart_fail_safe() -> None:
         conformance_passed=True,
     )
     assert not cleared.audit_degraded
-    assert cleared.generation == 1
+    assert cleared.mode_generation == 1
 
 
 def test_restart_pauses_task_and_invalidates_old_descendants() -> None:
