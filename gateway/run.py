@@ -3337,16 +3337,24 @@ def _task_fence_delivery_capability_for_event(
     streaming_result: bool = False,
     runtime_footer: bool = False,
 ) -> Any | None:
-    """Return the one bounded Slack final-delivery capability, if exact."""
+    """Return one bounded gateway final-delivery capability, if exact."""
 
     source = getattr(event, "source", None)
+    platform = getattr(source, "platform", None)
+    platform_name = getattr(platform, "value", None)
+    delivery_source = f"gateway:{platform_name}"
     sidecar = getattr(event, "task_fence_ingress", None)
     acceptance = getattr(event, "task_fence_acceptance", None)
+    projection = getattr(acceptance, "task_projection", None)
     configured_key = getattr(
         getattr(runner, "config", None),
         "task_fence_shadow_session_key",
         "",
     )
+    try:
+        canonical_key = runner._session_key_for_source(source)
+    except Exception:
+        canonical_key = None
     if (
         queued_followup
         or proxy_result
@@ -3358,10 +3366,16 @@ def _task_fence_delivery_capability_for_event(
         or getattr(event, "message_type", None) is not MessageType.TEXT
         or event.get_command() is not None
         or not str(getattr(event, "message_id", "") or "")
-        or getattr(source, "platform", None) is not Platform.SLACK
+        or platform not in _TASK_FENCE_TYPED_INGRESS_PLATFORMS
+        or (
+            platform is Platform.TELEGRAM
+            and getattr(source, "chat_type", None) != "dm"
+        )
         or getattr(source, "profile", None) not in {None, "", "default"}
-        or getattr(sidecar, "source", None) != "gateway:slack"
+        or getattr(sidecar, "source", None) != delivery_source
         or acceptance is None
+        or getattr(projection, "conversation_id", None) != session_key
+        or canonical_key != session_key
         or not configured_key
         or session_key != configured_key
     ):
@@ -3379,6 +3393,8 @@ def _task_fence_delivery_capability_for_event(
 
     return TaskFenceDeliveryCapability(
         parent=parent,
+        delivery_source=delivery_source,
+        conversation_id=session_key,
     )
 
 

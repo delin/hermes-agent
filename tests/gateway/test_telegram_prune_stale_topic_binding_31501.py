@@ -194,7 +194,9 @@ class TestThreadNotFoundFallbackSitesPruneBinding:
     def test_streaming_send_fallback_calls_prune(self):
         from plugins.platforms.telegram import adapter as telegram_mod
 
-        src = inspect.getsource(telegram_mod.TelegramAdapter.send)
+        src = inspect.getsource(
+            telegram_mod.TelegramAdapter._send_with_task_fence_delivery
+        )
         # Locate the second-failure branch (the one that flips
         # ``used_thread_fallback``).  It must invoke the prune
         # helper before flipping the flag.

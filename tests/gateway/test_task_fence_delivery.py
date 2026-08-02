@@ -791,6 +791,38 @@ async def test_direct_slack_send_is_outside_delivery_audit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delivery_capability_cannot_cross_conversation(tmp_path):
+    db, runner, event, session_key, parent = await _accepted_lane(tmp_path)
+    response = "conversation-bound final response"
+    _stage_capability(runner, event, session_key, response, parent)
+    capability = getattr(event, TASK_FENCE_DELIVERY_CAPABILITY_ATTR)
+    setattr(
+        event,
+        TASK_FENCE_DELIVERY_CAPABILITY_ATTR,
+        replace(capability, conversation_id=f"{session_key}:other"),
+    )
+    adapter, client = _slack_adapter()
+    adapter.gateway_runner = runner
+
+    async def post_message(**_kwargs):
+        assert current_task_fence_policy() is None
+        assert _CURRENT_DELIVERY_CAPABILITY.get() is None
+        return {"ts": "1710000000.000104"}
+
+    client.chat_postMessage.side_effect = post_message
+    try:
+        await _run_base_final(adapter, event, session_key, response)
+
+        assert client.chat_postMessage.await_count == 1
+        assert _count(db, "task_fence_policy_decisions") == 0
+        assert _count(db, "task_fence_dispatch_permits") == 0
+        assert _count(db, "task_fence_attempts") == 0
+        assert not hasattr(event, TASK_FENCE_DELIVERY_CAPABILITY_ATTR)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_mixed_final_response_stays_outside_delivery_audit(tmp_path):
     db, runner, event, session_key, parent = await _accepted_lane(tmp_path)
     response = "bounded text\n\n![diagram](https://example.test/diagram.png)"

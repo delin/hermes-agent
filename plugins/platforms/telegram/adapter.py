@@ -284,6 +284,11 @@ from gateway.platforms.base import (
     task_fence_sidecar_for_human_message,
     utf16_len,
 )
+from gateway.task_fence_delivery import (
+    TaskFenceDeliveryCapability,
+    isolate_task_fence_delivery_capability,
+    task_fence_telegram_send_message_handoff,
+)
 from plugins.platforms.telegram.telegram_ids import (
     normalize_telegram_chat_id,
 )
@@ -293,6 +298,7 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace, env_float, env_int
+from task_fence import bind_task_fence_policy
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -4347,6 +4353,29 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
+        """Send while keeping Task Fence authority outside Telegram SDK code."""
+
+        with (
+            isolate_task_fence_delivery_capability() as delivery_capability,
+            bind_task_fence_policy(None),
+        ):
+            return await self._send_with_task_fence_delivery(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+                delivery_capability=delivery_capability,
+            )
+
+    async def _send_with_task_fence_delivery(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        delivery_capability: TaskFenceDeliveryCapability | None,
+    ) -> SendResult:
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
@@ -4466,28 +4495,44 @@ class TelegramAdapter(BasePlatformAdapter):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
-                            msg = await self._bot.send_message(
-                                chat_id=normalize_telegram_chat_id(chat_id),
-                                text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
-                                reply_to_message_id=reply_to_id,
+                            request = {
+                                "chat_id": normalize_telegram_chat_id(chat_id),
+                                "text": chunk,
+                                "parse_mode": ParseMode.MARKDOWN_V2,
+                                "reply_to_message_id": reply_to_id,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                            }
+                            bot = self._bot
+                            msg = await task_fence_telegram_send_message_handoff(
+                                capability=delivery_capability,
+                                runner=getattr(self, "gateway_runner", None),
+                                bot=bot,
+                                request=request,
+                                send_message=bot.send_message,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
-                                msg = await self._bot.send_message(
-                                    chat_id=normalize_telegram_chat_id(chat_id),
-                                    text=plain_chunk,
-                                    parse_mode=None,
-                                    reply_to_message_id=reply_to_id,
+                                request = {
+                                    "chat_id": normalize_telegram_chat_id(chat_id),
+                                    "text": plain_chunk,
+                                    "parse_mode": None,
+                                    "reply_to_message_id": reply_to_id,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                }
+                                bot = self._bot
+                                msg = await task_fence_telegram_send_message_handoff(
+                                    capability=delivery_capability,
+                                    runner=getattr(self, "gateway_runner", None),
+                                    bot=bot,
+                                    request=request,
+                                    send_message=bot.send_message,
                                 )
                             else:
                                 raise

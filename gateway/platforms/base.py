@@ -6275,7 +6275,19 @@ class BasePlatformAdapter(ABC):
                     _task_fence_delivery_scope = nullcontext()
                     if (
                         _task_fence_delivery_capability is not None
-                        and delivery_adapter.platform is Platform.SLACK
+                        and delivery_adapter.platform is event.source.platform
+                        and getattr(
+                            _task_fence_delivery_capability,
+                            "delivery_source",
+                            None,
+                        )
+                        == f"gateway:{_platform_name(event.source.platform)}"
+                        and getattr(
+                            _task_fence_delivery_capability,
+                            "conversation_id",
+                            None,
+                        )
+                        == session_key
                         and not is_ephemeral_response
                         and not force_document_attachments
                         and not images

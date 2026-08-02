@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -28,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 TASK_FENCE_DELIVERY_CAPABILITY_ATTR = "_task_fence_delivery_capability"
 _SLACK_CHAT_POST_MESSAGE_ADAPTER = "gateway:slack:chat_post_message"
+_TELEGRAM_SEND_MESSAGE_ADAPTER = "gateway:telegram:send_message"
+_TELEGRAM_SEND_MESSAGE_REQUEST_KEYS = frozenset(
+    {
+        "chat_id",
+        "text",
+        "parse_mode",
+        "reply_to_message_id",
+        "message_thread_id",
+        "direct_messages_topic_id",
+        "link_preview_options",
+        "disable_web_page_preview",
+        "disable_notification",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +50,8 @@ class TaskFenceDeliveryCapability:
     """One accepted turn's non-dispatchable final-delivery provenance."""
 
     parent: CausalEnvelope | None
+    delivery_source: str
+    conversation_id: str
 
 
 _CURRENT_DELIVERY_CAPABILITY: ContextVar[TaskFenceDeliveryCapability | None] = (
@@ -119,21 +136,18 @@ def _slack_post_message_fingerprint(
     return digest.hexdigest()
 
 
-def _audit_slack_post_message_start(
+def _audit_delivery_start(
     policy: TaskFencePolicy,
     child: CausalEnvelope | None,
     invocation_id: str,
-    team_id: str | None,
-    request: Mapping[str, Any],
+    adapter: str,
+    invocation_fingerprint: str,
 ) -> str | None:
     operation = OperationDescriptor(
         invocation_id=invocation_id,
         kind=OperationKind.DELIVERY,
-        adapter=_SLACK_CHAT_POST_MESSAGE_ADAPTER,
-        invocation_fingerprint=_slack_post_message_fingerprint(
-            team_id=team_id,
-            request=request,
-        ),
+        adapter=adapter,
+        invocation_fingerprint=invocation_fingerprint,
     )
     admitted = policy.admit_operation(child, operation)
     if (
@@ -201,19 +215,122 @@ def _slack_post_message_acknowledgement_ref(
     )
 
 
-async def task_fence_slack_post_message_handoff(
+def _telegram_json_projection(value: Any) -> Any:
+    """Project the closed Bot.send_message request into canonical JSON."""
+
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError("non-finite Telegram request value")
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_telegram_json_projection(item) for item in value]
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("non-string Telegram request key")
+        return {
+            key: _telegram_json_projection(item)
+            for key, item in value.items()
+        }
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _telegram_json_projection(to_dict())
+    raise TypeError("unsupported Telegram request value")
+
+
+def _telegram_send_message_fingerprint(
+    *,
+    bot_id: Any,
+    request: Mapping[str, Any],
+) -> str:
+    """Commit to one exact Bot.send_message call without retaining payload."""
+
+    unknown_keys = set(request) - _TELEGRAM_SEND_MESSAGE_REQUEST_KEYS
+    if unknown_keys:
+        raise TypeError("unsupported Telegram send_message request key")
+    chat_id = request.get("chat_id")
+    if (
+        not isinstance(bot_id, int)
+        or isinstance(bot_id, bool)
+        or bot_id <= 0
+        or not isinstance(chat_id, int)
+        or isinstance(chat_id, bool)
+        or chat_id <= 0
+    ):
+        raise TypeError("invalid Telegram delivery identity")
+    value = {
+        "adapter": _TELEGRAM_SEND_MESSAGE_ADAPTER,
+        "request": _telegram_json_projection(dict(request)),
+        "route": {
+            "bot_id": bot_id,
+            "method": "sendMessage",
+        },
+    }
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(
+        b"task-fence-delivery-wire-v1\0" + payload
+    ).hexdigest()
+
+
+def _telegram_send_message_acknowledgement_ref(
+    *,
+    bot_id: Any,
+    request: Mapping[str, Any],
+    result: Any,
+) -> str | None:
+    """Return a bounded commitment to one exact Telegram Message ACK."""
+
+    try:
+        requested_chat_id = request.get("chat_id")
+        returned_chat_id = result.chat.id
+        message_id = result.message_id
+    except Exception:
+        return None
+    identities = (bot_id, requested_chat_id, returned_chat_id, message_id)
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in identities
+    ) or returned_chat_id != requested_chat_id:
+        return None
+    acknowledgement = json.dumps(
+        {
+            "bot_id": bot_id,
+            "chat_id": requested_chat_id,
+            "message_id": message_id,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8", errors="surrogatepass")
+    return (
+        "telegram:send_message:ack:sha256:"
+        f"{hashlib.sha256(acknowledgement).hexdigest()}"
+    )
+
+
+async def _task_fence_delivery_handoff(
     *,
     capability: TaskFenceDeliveryCapability | None,
+    delivery_source: str,
+    adapter: str,
     runner: Any,
-    team_id: str | None,
-    request: Mapping[str, Any],
-    post_message: Callable[..., Awaitable[Any]],
+    invocation_fingerprint: Callable[[], str],
+    acknowledgement_ref: Callable[[Any], str | None],
+    physical_call: Callable[[], Awaitable[Any]],
 ) -> Any:
-    """Audit and invoke one physical chat.postMessage without gating it."""
+    """Audit one exact physical delivery call without gating legacy behavior."""
 
-    if capability is None:
+    if capability is None or capability.delivery_source != delivery_source:
         with bind_task_fence_policy(None):
-            return await post_message(**dict(request))
+            return await physical_call()
 
     child = None
     invocation_id = f"tfiv_{uuid.uuid4().hex}"
@@ -228,38 +345,38 @@ async def task_fence_slack_post_message_handoff(
         if store is None:
             raise RuntimeError("missing Task Fence delivery store")
         policy = TaskFencePolicy(store)
+        fingerprint = invocation_fingerprint()
         attempt_id = await asyncio.to_thread(
-            _audit_slack_post_message_start,
+            _audit_delivery_start,
             policy,
             child,
             invocation_id,
-            team_id,
-            dict(request),
+            adapter,
+            fingerprint,
         )
     except Exception as exc:
         logger.warning(
             "Task Fence shadow delivery observation failed for %s: %s",
-            _SLACK_CHAT_POST_MESSAGE_ADAPTER,
+            adapter,
             type(exc).__name__,
         )
 
-    # The captured parent stays local to Slack.send so its next chunk/retry
-    # derives a sibling. Third-party SDK code receives no live policy/store
-    # or dispatchable delivery capability.
+    # The captured parent stays local to the adapter so each physical retry or
+    # chunk derives a sibling. Third-party SDK code receives no live policy,
+    # store, or dispatchable delivery capability.
     token = _CURRENT_DELIVERY_CAPABILITY.set(None)
     try:
         with bind_causal_envelope(child), bind_task_fence_policy(None):
-            result = await post_message(**dict(request))
+            result = await physical_call()
         if policy is not None and attempt_id is not None:
-            evidence_reference = _slack_post_message_acknowledgement_ref(
-                team_id=team_id,
-                request=request,
-                result=result,
-            )
+            try:
+                evidence_reference = acknowledgement_ref(result)
+            except Exception:
+                evidence_reference = None
             if evidence_reference is None:
                 logger.warning(
                     "Task Fence shadow delivery acknowledgement missing for %s",
-                    _SLACK_CHAT_POST_MESSAGE_ADAPTER,
+                    adapter,
                 )
             else:
                 try:
@@ -274,9 +391,71 @@ async def task_fence_slack_post_message_handoff(
                     logger.warning(
                         "Task Fence shadow delivery terminal observation failed "
                         "for %s: %s",
-                        _SLACK_CHAT_POST_MESSAGE_ADAPTER,
+                        adapter,
                         type(exc).__name__,
                     )
         return result
     finally:
         _CURRENT_DELIVERY_CAPABILITY.reset(token)
+
+
+async def task_fence_slack_post_message_handoff(
+    *,
+    capability: TaskFenceDeliveryCapability | None,
+    runner: Any,
+    team_id: str | None,
+    request: Mapping[str, Any],
+    post_message: Callable[..., Awaitable[Any]],
+) -> Any:
+    """Audit and invoke one physical chat.postMessage without gating it."""
+
+    request_copy = dict(request)
+    return await _task_fence_delivery_handoff(
+        capability=capability,
+        delivery_source="gateway:slack",
+        adapter=_SLACK_CHAT_POST_MESSAGE_ADAPTER,
+        runner=runner,
+        invocation_fingerprint=lambda: _slack_post_message_fingerprint(
+            team_id=team_id,
+            request=request_copy,
+        ),
+        acknowledgement_ref=lambda result: (
+            _slack_post_message_acknowledgement_ref(
+                team_id=team_id,
+                request=request_copy,
+                result=result,
+            )
+        ),
+        physical_call=lambda: post_message(**request_copy),
+    )
+
+
+async def task_fence_telegram_send_message_handoff(
+    *,
+    capability: TaskFenceDeliveryCapability | None,
+    runner: Any,
+    bot: Any,
+    request: Mapping[str, Any],
+    send_message: Callable[..., Awaitable[Any]],
+) -> Any:
+    """Audit and invoke one physical Bot.send_message without gating it."""
+
+    request_copy = dict(request)
+    return await _task_fence_delivery_handoff(
+        capability=capability,
+        delivery_source="gateway:telegram",
+        adapter=_TELEGRAM_SEND_MESSAGE_ADAPTER,
+        runner=runner,
+        invocation_fingerprint=lambda: _telegram_send_message_fingerprint(
+            bot_id=getattr(bot, "id", None),
+            request=request_copy,
+        ),
+        acknowledgement_ref=lambda result: (
+            _telegram_send_message_acknowledgement_ref(
+                bot_id=getattr(bot, "id", None),
+                request=request_copy,
+                result=result,
+            )
+        ),
+        physical_call=lambda: send_message(**request_copy),
+    )

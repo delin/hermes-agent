@@ -37,7 +37,7 @@ _SHA256_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _DECISION_ID_RE = re.compile(r"\Atfd_[0-9a-f]{64}\Z")
 
 TASK_FENCE_POLICY_VERSION = "task-fence-policy-v1"
-TASK_FENCE_CAPABILITY_VERSION = "task-fence-capability-v2"
+TASK_FENCE_CAPABILITY_VERSION = "task-fence-capability-v3"
 TASK_FENCE_FINAL_GENERATION_KEY = "_task_fence_final_generation"
 TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER = (
     "runtime:process_checkpoint_recovery_pending"
@@ -589,6 +589,8 @@ _SELECTED_COHORT_CAPABILITY_DEFINITIONS = (
     (_ADAPTER, "provider:moa.virtual", _UNSUPPORTED),
     (_ADAPTER, "gateway:slack:chat_post_message", _SUPPORTED),
     (_ADAPTER, "gateway:slack:other_delivery", _UNSUPPORTED),
+    (_ADAPTER, "gateway:telegram:send_message", _SUPPORTED),
+    (_ADAPTER, "gateway:telegram:other_delivery", _UNSUPPORTED),
     (_RUNTIME, "runtime:registered-tool-handoff", _SUPPORTED),
     (_RUNTIME, "runtime:inline-tool-handoff", _SUPPORTED),
     (_RUNTIME, "runtime:execute-code-rpc-descendant", _SUPPORTED),

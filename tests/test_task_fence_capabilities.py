@@ -103,6 +103,14 @@ def test_selected_capability_vocabulary_is_closed_canonical_and_secret_free() ->
         is TaskFenceCapabilityState.UNSUPPORTED
     )
     assert (
+        by_id["gateway:telegram:send_message"]
+        is TaskFenceCapabilityState.SUPPORTED
+    )
+    assert (
+        by_id["gateway:telegram:other_delivery"]
+        is TaskFenceCapabilityState.UNSUPPORTED
+    )
+    assert (
         by_id["runtime:internal-retries"]
         is TaskFenceCapabilityState.UNSUPPORTED
     )
@@ -226,11 +234,13 @@ def test_v1_selected_set_is_rejected_without_merge_or_dml(tmp_path) -> None:
     _materialize(db)
     db._conn.execute(
         "DELETE FROM main.task_fence_cohort_capabilities "
-        "WHERE cohort_key = ? AND capability_id IN (?, ?)",
+        "WHERE cohort_key = ? AND capability_id IN (?, ?, ?, ?)",
         (
             _COHORT_KEY,
             "gateway:telegram:typed_ingress",
             "gateway:telegram:other_ingress",
+            "gateway:telegram:send_message",
+            "gateway:telegram:other_delivery",
         ),
     )
     db._conn.execute(
@@ -244,6 +254,52 @@ def test_v1_selected_set_is_rejected_without_merge_or_dml(tmp_path) -> None:
     assert len(rows_before) == 34
     assert {row[2] for row in rows_before} == {
         "task-fence-capability-v1"
+    }
+    total_changes_before = db._conn.total_changes
+    traced = []
+    db._conn.set_trace_callback(traced.append)
+
+    with pytest.raises(
+        TaskFenceCapabilityUnavailable,
+        match="capability_declaration_conflict",
+    ):
+        _materialize(db)
+
+    db._conn.set_trace_callback(None)
+    assert _capability_rows(db) == rows_before
+    assert db._conn.total_changes == total_changes_before
+    assert not any(
+        statement.lstrip().upper().startswith(
+            ("INSERT ", "UPDATE ", "DELETE ", "REPLACE ")
+        )
+        for statement in traced
+    )
+    db.close()
+
+
+def test_v2_selected_set_is_rejected_without_merge_or_dml(tmp_path) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    _materialize(db)
+    db._conn.execute(
+        "DELETE FROM main.task_fence_cohort_capabilities "
+        "WHERE cohort_key = ? AND capability_id IN (?, ?)",
+        (
+            _COHORT_KEY,
+            "gateway:telegram:send_message",
+            "gateway:telegram:other_delivery",
+        ),
+    )
+    db._conn.execute(
+        "UPDATE main.task_fence_cohort_capabilities "
+        "SET capability_version = 'task-fence-capability-v2' "
+        "WHERE cohort_key = ?",
+        (_COHORT_KEY,),
+    )
+    db._conn.commit()
+    rows_before = _capability_rows(db)
+    assert len(rows_before) == 36
+    assert {row[2] for row in rows_before} == {
+        "task-fence-capability-v2"
     }
     total_changes_before = db._conn.total_changes
     traced = []
