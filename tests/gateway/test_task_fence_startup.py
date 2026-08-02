@@ -11,6 +11,7 @@ from hermes_state import SessionDB
 from task_fence import (
     TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
     TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+    TaskFenceRecovery,
 )
 
 
@@ -364,6 +365,25 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
 
     monkeypatch.setattr(SessionDB, "recover_task_fence_state", traced_recover)
 
+    real_load_catalog = SessionDB.load_task_fence_selected_launch_catalog
+
+    def traced_load_catalog(self: SessionDB, **kwargs):
+        events.append("catalog")
+        assert self.read_only is True
+        assert kwargs == {
+            "shadow_conversation_key": _SHADOW_SESSION_KEY,
+            "manifest": TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+            "expected_runtime_epoch": 1,
+            "expected_mode_generation": 0,
+        }
+        return real_load_catalog(self, **kwargs)
+
+    monkeypatch.setattr(
+        SessionDB,
+        "load_task_fence_selected_launch_catalog",
+        traced_load_catalog,
+    )
+
     queued_event = json.dumps({
         "type": "async_delegation",
         "delegation_id": "deadbeef",
@@ -566,6 +586,10 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
         async def start(self) -> bool:
             events.append("start")
             assert self._platform_lock_takeover_on_start is False
+            catalog = self._task_fence_launch_catalog
+            assert catalog is not None
+            assert catalog.runtime_epoch == 1
+            assert catalog.manifest is TASK_FENCE_SELECTED_LAUNCH_MANIFEST
             return True
 
     gateway_run = _install_start_gateway_shell(
@@ -581,7 +605,7 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     )
 
     assert ok is True
-    assert events[:9] == [
+    assert events[:10] == [
         "lock",
         "pid",
         "receipt",
@@ -589,6 +613,7 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
         "capabilities",
         "binding",
         "composite",
+        "catalog",
         "runner",
         "start",
     ]
@@ -897,6 +922,7 @@ async def test_empty_shadow_key_preserves_legacy_startup(
 
         async def start(self) -> bool:
             events.append("start")
+            assert self._task_fence_launch_catalog is None
             return True
 
     gateway_run = _install_start_gateway_shell(
@@ -1017,6 +1043,7 @@ async def test_configured_startup_recovers_before_full_config_loader(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
+    catalog_sentinel = object()
     (tmp_path / "config.yaml").write_text(
         "task_fence:\n"
         f"  shadow_conversation_key: {_SHADOW_SESSION_KEY}\n",
@@ -1034,6 +1061,7 @@ async def test_configured_startup_recovers_before_full_config_loader(
 
         async def start(self) -> bool:
             events.append("start")
+            assert self._task_fence_launch_catalog is catalog_sentinel
             return True
 
     gateway_run = _install_start_gateway_shell(
@@ -1054,6 +1082,11 @@ async def test_configured_startup_recovers_before_full_config_loader(
             is TASK_FENCE_SELECTED_LAUNCH_MANIFEST
         )
         events.append("recover")
+        return TaskFenceRecovery(
+            previous_runtime_epoch=0,
+            runtime_epoch=1,
+            recovered_at=1.0,
+        )
 
     monkeypatch.setattr(
         startup,
@@ -1073,16 +1106,110 @@ async def test_configured_startup_recovers_before_full_config_loader(
         "load_gateway_config_for_runner",
         load_full_config,
     )
+    monkeypatch.setattr(
+        startup,
+        "load_task_fence_shadow_launch_catalog",
+        lambda *args, **kwargs: events.append("catalog") or catalog_sentinel,
+    )
 
     ok = await gateway_run.start_gateway(config=None, verbosity=None)
 
     assert ok is True
-    assert events[:7] == [
+    assert events[:8] == [
         "lock",
         "pid",
         "owner",
         "recover",
         "full_config",
+        "catalog",
         "runner",
         "start",
     ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        ("typed", "launch_binding_conflict"),
+        ("missing", "launch_catalog_unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_launch_catalog_failure_releases_claim_without_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    reason: str,
+) -> None:
+    events: list[str] = []
+
+    class RunnerMustNotOpen:
+        def __init__(self, config: GatewayConfig):
+            raise AssertionError("runner opened after launch catalog failure")
+
+    gateway_run = _install_start_gateway_shell(
+        monkeypatch,
+        tmp_path,
+        events,
+        RunnerMustNotOpen,
+    )
+    monkeypatch.setattr(
+        startup,
+        "acquire_task_fence_owner_lock",
+        lambda home=None: events.append("owner") or True,
+    )
+    monkeypatch.setattr(
+        startup,
+        "prepare_task_fence_shadow_startup",
+        lambda *args, **kwargs: events.append("recover")
+        or TaskFenceRecovery(
+            previous_runtime_epoch=0,
+            runtime_epoch=1,
+            recovered_at=1.0,
+        ),
+    )
+
+    def fail_catalog(*args, **kwargs):
+        events.append("catalog")
+        if failure == "typed":
+            raise startup.TaskFenceStartupUnavailable(reason)
+        return None
+
+    monkeypatch.setattr(
+        startup,
+        "load_task_fence_shadow_launch_catalog",
+        fail_catalog,
+    )
+    real_release_owner = startup.release_task_fence_owner_lock
+
+    def traced_release_owner() -> None:
+        events.append("release_owner")
+        real_release_owner()
+
+    monkeypatch.setattr(
+        startup,
+        "release_task_fence_owner_lock",
+        traced_release_owner,
+    )
+
+    ok = await gateway_run.start_gateway(
+        config=GatewayConfig(
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
+            sessions_dir=tmp_path / "sessions",
+        ),
+        verbosity=None,
+    )
+
+    assert ok is False
+    assert events == [
+        "lock",
+        "pid",
+        "owner",
+        "recover",
+        "catalog",
+        "release_owner",
+        "remove_pid",
+        "release_lock",
+    ]
+    assert f"Task Fence shadow startup refused: {reason}" in caplog.messages

@@ -26,6 +26,7 @@ from task_fence import (
     TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
     TaskFenceArtifactIdentity,
     TaskFenceCapabilityUnavailable,
+    TaskFenceLaunchCatalog,
     TaskFenceLaunchBindingUnavailable,
     TaskFenceLaunchManifest,
     TaskFenceProtocolRejected,
@@ -559,6 +560,45 @@ def prepare_task_fence_shadow_startup(
         TaskFenceLaunchBindingUnavailable,
         TaskFenceProtocolRejected,
         TaskFenceRecoveryUnavailable,
+    ) as exc:
+        raise TaskFenceStartupUnavailable(exc.reason) from None
+    except Exception as exc:
+        raise TaskFenceStartupUnavailable("store_unavailable") from exc
+    finally:
+        if database is not None:
+            database.close()
+
+
+def load_task_fence_shadow_launch_catalog(
+    shadow_conversation_key: str,
+    *,
+    hermes_home: Path | None = None,
+    manifest: TaskFenceLaunchManifest,
+    expected_runtime_epoch: int,
+    expected_mode_generation: int,
+) -> TaskFenceLaunchCatalog:
+    """Revalidate the durable launch seal without mutating startup state."""
+
+    database = None
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        resolved_home = (
+            Path(hermes_home) if hermes_home is not None else get_hermes_home()
+        )
+        database = SessionDB(resolved_home / "state.db", read_only=True)
+        return database.load_task_fence_selected_launch_catalog(
+            shadow_conversation_key=shadow_conversation_key,
+            manifest=manifest,
+            expected_runtime_epoch=expected_runtime_epoch,
+            expected_mode_generation=expected_mode_generation,
+        )
+    except TaskFenceStartupUnavailable:
+        raise
+    except (
+        TaskFenceLaunchBindingUnavailable,
+        TaskFenceProtocolRejected,
     ) as exc:
         raise TaskFenceStartupUnavailable(exc.reason) from None
     except Exception as exc:

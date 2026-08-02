@@ -14,7 +14,7 @@ import re
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Iterator, Mapping, Protocol
@@ -624,9 +624,9 @@ class TaskFenceLaunchRoute:
 class TaskFenceLaunchManifest:
     """Closed expected route set for one inactive activation candidate.
 
-    The manifest is an allowlist to be checked against resolved runtime
-    reachability by a later startup validator. It is not discovery evidence
-    and does not make any route live by itself.
+    The manifest is a curated allowlist for later site-owned route witnesses.
+    It is not runtime discovery evidence or an authority token, and it does
+    not make any route live by itself.
     """
 
     manifest_version: str
@@ -680,6 +680,137 @@ class TaskFenceLaunchBindingMaterialization:
     conversation_fingerprint: str
     manifest_fingerprint: str
     created: bool
+
+
+@dataclass(frozen=True)
+class TaskFenceLaunchRouteValidation:
+    """Pure classification of one handoff-owned launch-route witness."""
+
+    verified: bool
+    reason: str
+    route_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.verified) is not bool:
+            raise TaskFenceProtocolRejected("invalid_launch_route_validation")
+        if self.reason not in {
+            "verified",
+            "unknown_reachable_route",
+            "changed_reachable_route",
+            "unsupported_reachable_route",
+            "extra_reachable_route",
+        }:
+            raise TaskFenceProtocolRejected("invalid_launch_route_reason")
+        if self.verified is not (self.reason == "verified"):
+            raise TaskFenceProtocolRejected("invalid_launch_route_validation")
+        _bounded_text(
+            self.route_id,
+            field="route_id",
+            max_bytes=_MAX_IDENTIFIER_BYTES,
+        )
+
+
+@dataclass(frozen=True)
+class TaskFenceLaunchCatalog:
+    """Immutable process-local view of one exact durable launch seal.
+
+    The catalog is not a runtime-topology claim or an authority token. A real
+    handoff must provide its own route kind, ID, and version; this object only
+    classifies that witness against the exact durable declarations and bound
+    expected manifest.
+    """
+
+    conversation_fingerprint: str
+    manifest_fingerprint: str
+    runtime_epoch: int
+    mode_generation: int
+    manifest: TaskFenceLaunchManifest
+    declarations: tuple[TaskFenceCapabilityDeclaration, ...]
+    _declarations_by_id: Mapping[str, TaskFenceCapabilityDeclaration] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _manifest_routes: frozenset[TaskFenceLaunchRoute] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        for fingerprint in (
+            self.conversation_fingerprint,
+            self.manifest_fingerprint,
+        ):
+            if not isinstance(fingerprint, str) or _SHA256_RE.fullmatch(
+                fingerprint
+            ) is None:
+                raise TaskFenceProtocolRejected("invalid_launch_catalog_fingerprint")
+        if type(self.runtime_epoch) is not int or self.runtime_epoch < 0:
+            raise TaskFenceProtocolRejected("invalid_runtime_epoch")
+        if type(self.mode_generation) is not int or self.mode_generation < 0:
+            raise TaskFenceProtocolRejected("invalid_mode_generation")
+        if not isinstance(self.manifest, TaskFenceLaunchManifest):
+            raise TaskFenceProtocolRejected("invalid_launch_manifest")
+        if self.manifest_fingerprint != task_fence_launch_manifest_fingerprint(
+            self.manifest
+        ):
+            raise TaskFenceProtocolRejected(
+                "launch_manifest_fingerprint_mismatch"
+            )
+        declarations = _canonical_capability_declarations(self.declarations)
+        declarations_by_id = {
+            declaration.capability_id: declaration
+            for declaration in declarations
+        }
+        if len(declarations_by_id) != len(declarations):
+            raise TaskFenceProtocolRejected("duplicate_capability_id")
+        for route in self.manifest.routes:
+            declaration = declarations_by_id.get(route.route_id)
+            if declaration is None or (
+                declaration.kind,
+                declaration.capability_version,
+            ) != (route.kind, route.capability_version):
+                raise TaskFenceProtocolRejected("launch_route_not_declared")
+        object.__setattr__(self, "declarations", declarations)
+        object.__setattr__(
+            self,
+            "_declarations_by_id",
+            MappingProxyType(declarations_by_id),
+        )
+        object.__setattr__(
+            self,
+            "_manifest_routes",
+            frozenset(self.manifest.routes),
+        )
+
+    def classify_route(
+        self,
+        route: TaskFenceLaunchRoute,
+    ) -> TaskFenceLaunchRouteValidation:
+        """Classify one site-owned witness without storage or side effects."""
+
+        if not isinstance(route, TaskFenceLaunchRoute):
+            raise TaskFenceProtocolRejected("invalid_launch_route_type")
+        declaration = self._declarations_by_id.get(route.route_id)
+        if declaration is None:
+            reason = "unknown_reachable_route"
+        elif (declaration.kind, declaration.capability_version) != (
+            route.kind,
+            route.capability_version,
+        ):
+            reason = "changed_reachable_route"
+        elif declaration.state is TaskFenceCapabilityState.UNSUPPORTED:
+            reason = "unsupported_reachable_route"
+        elif route not in self._manifest_routes:
+            reason = "extra_reachable_route"
+        else:
+            reason = "verified"
+        return TaskFenceLaunchRouteValidation(
+            verified=reason == "verified",
+            reason=reason,
+            route_id=route.route_id,
+        )
 
 
 def task_fence_launch_manifest_fingerprint(

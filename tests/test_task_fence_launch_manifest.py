@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import sqlite3
 
@@ -16,6 +17,7 @@ from task_fence import (
     TaskFenceLaunchBindingUnavailable,
     TaskFenceLaunchManifest,
     TaskFenceLaunchRoute,
+    TaskFenceProtocolRejected,
     task_fence_launch_manifest_fingerprint,
 )
 
@@ -156,6 +158,233 @@ def test_launch_manifest_fingerprint_commits_version_and_canonical_routes() -> N
     assert task_fence_launch_manifest_fingerprint(changed) != (
         task_fence_launch_manifest_fingerprint(selected)
     )
+
+
+def test_launch_catalog_is_select_only_immutable_and_classifies_real_witnesses(
+    tmp_path,
+) -> None:
+    conversation_key = "agent:main:slack:dm:workspace:channel:user"
+    path = tmp_path / "state.db"
+    seed = SessionDB(path)
+    store = _ready_store(seed)
+    binding = seed.materialize_task_fence_selected_launch_binding(
+        shadow_conversation_key=conversation_key,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        expected_runtime_epoch=store.runtime_epoch,
+        expected_mode_generation=store.mode_generation,
+    )
+    changes_before_writable_load = seed._conn.total_changes
+    with pytest.raises(TaskFenceLaunchBindingUnavailable) as exc_info:
+        seed.load_task_fence_selected_launch_catalog(
+            shadow_conversation_key=conversation_key,
+            manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+            expected_runtime_epoch=store.runtime_epoch,
+            expected_mode_generation=store.mode_generation,
+        )
+    assert exc_info.value.reason == "store_unavailable"
+    assert seed._conn.total_changes == changes_before_writable_load
+    seed.close()
+
+    database = SessionDB(path, read_only=True)
+    try:
+        changes_before = database._conn.total_changes
+        catalog = database.load_task_fence_selected_launch_catalog(
+            shadow_conversation_key=conversation_key,
+            manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+            expected_runtime_epoch=store.runtime_epoch,
+            expected_mode_generation=store.mode_generation,
+        )
+
+        assert database._conn.total_changes == changes_before == 0
+        assert catalog.conversation_fingerprint == binding.conversation_fingerprint
+        assert catalog.manifest_fingerprint == binding.manifest_fingerprint
+        assert catalog.runtime_epoch == store.runtime_epoch
+        assert catalog.mode_generation == store.mode_generation
+        assert catalog.declarations == TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        assert catalog.manifest is TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+
+        selected = TASK_FENCE_SELECTED_LAUNCH_MANIFEST.routes[0]
+        exact = catalog.classify_route(selected)
+        assert (exact.verified, exact.reason, exact.route_id) == (
+            True,
+            "verified",
+            selected.route_id,
+        )
+
+        unknown = catalog.classify_route(
+            TaskFenceLaunchRoute(
+                kind=selected.kind,
+                route_id="provider:future.unreviewed",
+                capability_version=selected.capability_version,
+            )
+        )
+        assert (unknown.verified, unknown.reason) == (
+            False,
+            "unknown_reachable_route",
+        )
+
+        changed = catalog.classify_route(
+            TaskFenceLaunchRoute(
+                kind=selected.kind,
+                route_id=selected.route_id,
+                capability_version=selected.capability_version + ".changed",
+            )
+        )
+        assert (changed.verified, changed.reason) == (
+            False,
+            "changed_reachable_route",
+        )
+
+        unsupported_declaration = next(
+            declaration
+            for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+            if declaration.state is TaskFenceCapabilityState.UNSUPPORTED
+        )
+        unsupported = catalog.classify_route(
+            TaskFenceLaunchRoute(
+                kind=unsupported_declaration.kind,
+                route_id=unsupported_declaration.capability_id,
+                capability_version=unsupported_declaration.capability_version,
+            )
+        )
+        assert (unsupported.verified, unsupported.reason) == (
+            False,
+            "unsupported_reachable_route",
+        )
+
+        expected_ids = {
+            route.route_id for route in TASK_FENCE_SELECTED_LAUNCH_MANIFEST.routes
+        }
+        extra_declaration = next(
+            declaration
+            for declaration in TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+            if declaration.state is TaskFenceCapabilityState.SUPPORTED
+            and declaration.capability_id not in expected_ids
+        )
+        extra = catalog.classify_route(
+            TaskFenceLaunchRoute(
+                kind=extra_declaration.kind,
+                route_id=extra_declaration.capability_id,
+                capability_version=extra_declaration.capability_version,
+            )
+        )
+        assert (extra.verified, extra.reason) == (
+            False,
+            "extra_reachable_route",
+        )
+
+        with pytest.raises(FrozenInstanceError):
+            catalog.runtime_epoch = 99
+        with pytest.raises(TaskFenceProtocolRejected) as exc_info:
+            replace(catalog, manifest_fingerprint="d" * 64)
+        assert (
+            exc_info.value.reason
+            == "launch_manifest_fingerprint_mismatch"
+        )
+
+        database._conn.execute("BEGIN")
+        try:
+            with pytest.raises(TaskFenceLaunchBindingUnavailable) as exc_info:
+                database.load_task_fence_selected_launch_catalog(
+                    shadow_conversation_key=conversation_key,
+                    manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+                    expected_runtime_epoch=store.runtime_epoch,
+                    expected_mode_generation=store.mode_generation,
+                )
+            assert exc_info.value.reason == "launch_snapshot_unavailable"
+        finally:
+            database._conn.rollback()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("epoch_delta", "generation_delta", "reason"),
+    [
+        (1, 0, "runtime_epoch_changed"),
+        (0, 1, "mode_generation_changed"),
+    ],
+)
+def test_launch_catalog_refuses_stale_control_expectations_without_dml(
+    tmp_path,
+    epoch_delta: int,
+    generation_delta: int,
+    reason: str,
+) -> None:
+    conversation_key = "agent:main:slack:dm:workspace:channel:user"
+    path = tmp_path / "state.db"
+    seed = SessionDB(path)
+    store = _ready_store(seed)
+    seed.materialize_task_fence_selected_launch_binding(
+        shadow_conversation_key=conversation_key,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        expected_runtime_epoch=store.runtime_epoch,
+        expected_mode_generation=store.mode_generation,
+    )
+    seed.close()
+
+    database = SessionDB(path, read_only=True)
+    try:
+        with pytest.raises(TaskFenceLaunchBindingUnavailable) as exc_info:
+            database.load_task_fence_selected_launch_catalog(
+                shadow_conversation_key=conversation_key,
+                manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+                expected_runtime_epoch=store.runtime_epoch + epoch_delta,
+                expected_mode_generation=(
+                    store.mode_generation + generation_delta
+                ),
+            )
+        assert exc_info.value.reason == reason
+        assert database._conn.total_changes == 0
+    finally:
+        database.close()
+
+
+def test_launch_catalog_refuses_valid_hash_retarget_without_repair(
+    tmp_path,
+) -> None:
+    conversation_key = "agent:main:slack:dm:workspace:channel:user"
+    path = tmp_path / "state.db"
+    seed = SessionDB(path)
+    store = _ready_store(seed)
+    seed.materialize_task_fence_selected_launch_binding(
+        shadow_conversation_key=conversation_key,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        expected_runtime_epoch=store.runtime_epoch,
+        expected_mode_generation=store.mode_generation,
+    )
+    seed._conn.execute(
+        "UPDATE task_fence_cohort_launch_bindings "
+        "SET conversation_fingerprint = ?",
+        ("d" * 64,),
+    )
+    seed._conn.commit()
+    row_before = tuple(
+        seed._conn.execute(
+            "SELECT * FROM task_fence_cohort_launch_bindings"
+        ).fetchone()
+    )
+    seed.close()
+
+    database = SessionDB(path, read_only=True)
+    try:
+        with pytest.raises(TaskFenceLaunchBindingUnavailable) as exc_info:
+            database.load_task_fence_selected_launch_catalog(
+                shadow_conversation_key=conversation_key,
+                manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+                expected_runtime_epoch=store.runtime_epoch,
+                expected_mode_generation=store.mode_generation,
+            )
+        row_after = tuple(
+            database._conn.execute(
+                "SELECT * FROM task_fence_cohort_launch_bindings"
+            ).fetchone()
+        )
+        assert exc_info.value.reason == "launch_binding_conflict"
+        assert row_after == row_before
+        assert database._conn.total_changes == 0
+    finally:
+        database.close()
 
 
 def test_launch_binding_creates_distinct_inactive_candidate_and_exact_replays(

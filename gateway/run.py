@@ -5614,6 +5614,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
+    _task_fence_launch_catalog: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Legacy per-session dict adapters.  All per-session state lives in
@@ -25845,6 +25846,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from task_fence_runtime import (
         TaskFenceStartupUnavailable,
         acquire_task_fence_owner_lock,
+        load_task_fence_shadow_launch_catalog,
         prepare_task_fence_shadow_startup,
         release_task_fence_owner_lock,
     )
@@ -25900,13 +25902,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _hermes_home
         ):
             raise TaskFenceStartupUnavailable("runtime_owner_unavailable")
+        launch_manifest = _task_fence_gateway_launch_manifest(
+            shadow_conversation_key
+        )
         recovery = prepare_task_fence_shadow_startup(
             shadow_conversation_key,
             hermes_home=_hermes_home,
             multiplex_profiles=shadow_multiplex_profiles,
-            launch_manifest=_task_fence_gateway_launch_manifest(
-                shadow_conversation_key
-            ),
+            launch_manifest=launch_manifest,
         )
         if recovery is not None:
             logger.info(
@@ -25937,7 +25940,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 != shadow_multiplex_profiles
             ):
                 raise TaskFenceStartupUnavailable("startup_config_changed")
+        launch_catalog = None
+        if launch_manifest is not None:
+            if recovery is None:
+                raise TaskFenceStartupUnavailable("recovery_unavailable")
+            launch_catalog = load_task_fence_shadow_launch_catalog(
+                shadow_conversation_key,
+                hermes_home=_hermes_home,
+                manifest=launch_manifest,
+                expected_runtime_epoch=recovery.runtime_epoch,
+                expected_mode_generation=0,
+            )
+            if launch_catalog is None:
+                raise TaskFenceStartupUnavailable(
+                    "launch_catalog_unavailable"
+                )
         runner = GatewayRunner(resolved_config)
+        runner._task_fence_launch_catalog = launch_catalog
     except TaskFenceStartupUnavailable as exc:
         _release_startup_claim()
         logger.error("Task Fence shadow startup refused: %s", exc.reason)

@@ -75,6 +75,7 @@ from task_fence import (
     TaskFenceCapabilityDeclaration,
     TaskFenceCapabilityMaterialization,
     TaskFenceCapabilityUnavailable,
+    TaskFenceLaunchCatalog,
     TaskFenceLaunchBindingMaterialization,
     TaskFenceLaunchBindingUnavailable,
     TaskFenceLaunchManifest,
@@ -6126,6 +6127,90 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return "launch_route_not_declared"
         return "verified"
 
+    def _task_fence_selected_launch_binding_projection_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        store: TaskFenceStoreInspection,
+        *,
+        expected_conversation_fingerprint: str,
+        expected_manifest_fingerprint: str,
+        manifest: TaskFenceLaunchManifest,
+    ) -> Tuple[
+        str,
+        Optional[str],
+        Optional[str],
+        Tuple[TaskFenceCapabilityDeclaration, ...],
+    ]:
+        """Read one exact selected launch seal inside the caller's snapshot."""
+
+        cohort_reason = self._task_fence_selected_cohort_reason_unlocked(
+            conn,
+            store,
+        )
+        if cohort_reason != "verified":
+            return cohort_reason, None, None, ()
+        projection_reason, declarations = (
+            self._task_fence_selected_capability_projection_unlocked(conn)
+        )
+        if projection_reason != "verified":
+            return projection_reason, None, None, ()
+        route_reason = self._task_fence_launch_routes_reason(
+            manifest,
+            declarations,
+        )
+        if route_reason != "verified":
+            return route_reason, None, None, ()
+
+        cohort = conn.execute(
+            "SELECT mode, mode_generation, activation_state, "
+            "audit_degraded FROM main.task_fence_cohorts "
+            "WHERE cohort_key = ?",
+            (_TASK_FENCE_SELECTED_ACTIVATION_COHORT,),
+        ).fetchone()
+        bindings = conn.execute(
+            "SELECT cohort_key, conversation_fingerprint, "
+            "manifest_fingerprint, bound_at "
+            "FROM main.task_fence_cohort_launch_bindings "
+            "ORDER BY cohort_key LIMIT 2",
+        ).fetchall()
+        if cohort is None and not bindings:
+            return "launch_binding_not_materialized", None, None, ()
+        if cohort is None or len(bindings) != 1:
+            return "launch_binding_conflict", None, None, ()
+        if tuple(cohort) != (
+            "audit",
+            store.mode_generation,
+            "inactive",
+            0,
+        ):
+            return "launch_binding_conflict", None, None, ()
+
+        binding = bindings[0]
+        conversation_fingerprint = binding["conversation_fingerprint"]
+        manifest_fingerprint = binding["manifest_fingerprint"]
+        bound_at = binding["bound_at"]
+        if (
+            not isinstance(conversation_fingerprint, str)
+            or binding["cohort_key"]
+            != _TASK_FENCE_SELECTED_ACTIVATION_COHORT
+            or _TASK_FENCE_SHA256_RE.fullmatch(conversation_fingerprint) is None
+            or conversation_fingerprint != expected_conversation_fingerprint
+            or not isinstance(manifest_fingerprint, str)
+            or _TASK_FENCE_SHA256_RE.fullmatch(manifest_fingerprint) is None
+            or isinstance(bound_at, bool)
+            or not isinstance(bound_at, (int, float))
+            or not math.isfinite(float(bound_at))
+            or bound_at < 0
+            or manifest_fingerprint != expected_manifest_fingerprint
+        ):
+            return "launch_binding_conflict", None, None, ()
+        return (
+            "verified",
+            conversation_fingerprint,
+            manifest_fingerprint,
+            declarations,
+        )
+
     def inspect_task_fence_selected_launch_binding(
         self,
         *,
@@ -6177,123 +6262,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             None,
                             None,
                         )
-                    cohort_reason = (
-                        self._task_fence_selected_cohort_reason_unlocked(
-                            self._conn,
-                            store,
-                        )
+                    (
+                        reason,
+                        conversation_fingerprint,
+                        manifest_fingerprint,
+                        _,
+                    ) = self._task_fence_selected_launch_binding_projection_unlocked(
+                        self._conn,
+                        store,
+                        expected_conversation_fingerprint=(
+                            expected_conversation_fingerprint
+                        ),
+                        expected_manifest_fingerprint=(
+                            expected_manifest_fingerprint
+                        ),
+                        manifest=manifest,
                     )
-                    if cohort_reason != "verified":
-                        return TaskFenceLaunchBindingInspection(
-                            store,
-                            False,
-                            cohort_reason,
-                            None,
-                            None,
-                        )
-                    projection_reason, declarations = (
-                        self._task_fence_selected_capability_projection_unlocked(
-                            self._conn
-                        )
-                    )
-                    if projection_reason != "verified":
-                        return TaskFenceLaunchBindingInspection(
-                            store,
-                            False,
-                            projection_reason,
-                            None,
-                            None,
-                        )
-                    route_reason = self._task_fence_launch_routes_reason(
-                        manifest,
-                        declarations,
-                    )
-                    if route_reason != "verified":
-                        return TaskFenceLaunchBindingInspection(
-                            store,
-                            False,
-                            route_reason,
-                            None,
-                            None,
-                        )
-                    cohort = self._conn.execute(
-                        "SELECT mode, mode_generation, activation_state, "
-                        "audit_degraded FROM main.task_fence_cohorts "
-                        "WHERE cohort_key = ?",
-                        (_TASK_FENCE_SELECTED_ACTIVATION_COHORT,),
-                    ).fetchone()
-                    bindings = self._conn.execute(
-                        "SELECT cohort_key, conversation_fingerprint, "
-                        "manifest_fingerprint, bound_at "
-                        "FROM main.task_fence_cohort_launch_bindings "
-                        "ORDER BY cohort_key LIMIT 2",
-                    ).fetchall()
-                    if cohort is None and not bindings:
-                        return TaskFenceLaunchBindingInspection(
-                            store,
-                            False,
-                            "launch_binding_not_materialized",
-                            None,
-                            None,
-                        )
-                    if cohort is None or len(bindings) != 1:
-                        return TaskFenceLaunchBindingInspection(
-                            store,
-                            False,
-                            "launch_binding_conflict",
-                            None,
-                            None,
-                        )
-                    if tuple(cohort) != (
-                        "audit",
-                        store.mode_generation,
-                        "inactive",
-                        0,
-                    ):
-                        return TaskFenceLaunchBindingInspection(
-                            store,
-                            False,
-                            "launch_binding_conflict",
-                            None,
-                            None,
-                        )
-                    binding = bindings[0]
-                    conversation_fingerprint = binding[
-                        "conversation_fingerprint"
-                    ]
-                    manifest_fingerprint = binding["manifest_fingerprint"]
-                    bound_at = binding["bound_at"]
-                    if (
-                        not isinstance(conversation_fingerprint, str)
-                        or binding["cohort_key"]
-                        != _TASK_FENCE_SELECTED_ACTIVATION_COHORT
-                        or _TASK_FENCE_SHA256_RE.fullmatch(
-                            conversation_fingerprint
-                        ) is None
-                        or conversation_fingerprint
-                        != expected_conversation_fingerprint
-                        or not isinstance(manifest_fingerprint, str)
-                        or _TASK_FENCE_SHA256_RE.fullmatch(
-                            manifest_fingerprint
-                        ) is None
-                        or isinstance(bound_at, bool)
-                        or not isinstance(bound_at, (int, float))
-                        or not math.isfinite(float(bound_at))
-                        or bound_at < 0
-                        or manifest_fingerprint
-                        != expected_manifest_fingerprint
-                    ):
-                        return TaskFenceLaunchBindingInspection(
-                            store,
-                            False,
-                            "launch_binding_conflict",
-                            None,
-                            None,
-                        )
                     return TaskFenceLaunchBindingInspection(
                         store,
-                        True,
-                        "verified",
+                        reason == "verified",
+                        reason,
                         conversation_fingerprint,
                         manifest_fingerprint,
                     )
@@ -6309,6 +6297,99 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 None,
                 None,
             )
+
+    def load_task_fence_selected_launch_catalog(
+        self,
+        *,
+        shadow_conversation_key: str,
+        manifest: TaskFenceLaunchManifest = TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        expected_runtime_epoch: int,
+        expected_mode_generation: int,
+    ) -> TaskFenceLaunchCatalog:
+        """Load one immutable launch catalog from one SELECT-only snapshot."""
+
+        conversation_fingerprint = self._task_fence_conversation_fingerprint(
+            shadow_conversation_key
+        )
+        if not isinstance(manifest, TaskFenceLaunchManifest):
+            raise TaskFenceProtocolRejected("invalid_launch_manifest")
+        manifest_fingerprint = task_fence_launch_manifest_fingerprint(manifest)
+        if type(expected_runtime_epoch) is not int or expected_runtime_epoch < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_runtime_epoch")
+        if type(expected_mode_generation) is not int or expected_mode_generation < 0:
+            raise TaskFenceProtocolRejected("invalid_expected_mode_generation")
+        if not self.read_only or self._conn is None:
+            raise TaskFenceLaunchBindingUnavailable("store_unavailable")
+
+        try:
+            with self._lock:
+                if self._conn.in_transaction:
+                    raise TaskFenceLaunchBindingUnavailable(
+                        "launch_snapshot_unavailable"
+                    )
+                owned_snapshot = self._begin_task_fence_read_snapshot_unlocked()
+                if not owned_snapshot:
+                    raise TaskFenceLaunchBindingUnavailable(
+                        "launch_snapshot_unavailable"
+                    )
+                try:
+                    store = self._inspect_task_fence_store_unlocked(
+                        include_counts=False
+                    )
+                    if not store.compatible:
+                        raise TaskFenceLaunchBindingUnavailable(store.reason)
+                    if store.runtime_epoch != expected_runtime_epoch:
+                        raise TaskFenceLaunchBindingUnavailable(
+                            "runtime_epoch_changed"
+                        )
+                    if store.mode_generation != expected_mode_generation:
+                        raise TaskFenceLaunchBindingUnavailable(
+                            "mode_generation_changed"
+                        )
+                    (
+                        reason,
+                        observed_conversation_fingerprint,
+                        observed_manifest_fingerprint,
+                        declarations,
+                    ) = self._task_fence_selected_launch_binding_projection_unlocked(
+                        self._conn,
+                        store,
+                        expected_conversation_fingerprint=(
+                            conversation_fingerprint
+                        ),
+                        expected_manifest_fingerprint=manifest_fingerprint,
+                        manifest=manifest,
+                    )
+                    if reason != "verified":
+                        raise TaskFenceLaunchBindingUnavailable(reason)
+                    if (
+                        observed_conversation_fingerprint is None
+                        or observed_manifest_fingerprint is None
+                    ):
+                        raise TaskFenceLaunchBindingUnavailable(
+                            "launch_binding_conflict"
+                        )
+                    return TaskFenceLaunchCatalog(
+                        conversation_fingerprint=(
+                            observed_conversation_fingerprint
+                        ),
+                        manifest_fingerprint=observed_manifest_fingerprint,
+                        runtime_epoch=expected_runtime_epoch,
+                        mode_generation=expected_mode_generation,
+                        manifest=manifest,
+                        declarations=declarations,
+                    )
+                finally:
+                    self._end_task_fence_read_snapshot_unlocked(owned_snapshot)
+        except (
+            TaskFenceProtocolRejected,
+            TaskFenceLaunchBindingUnavailable,
+        ):
+            raise
+        except sqlite3.DatabaseError:
+            raise TaskFenceLaunchBindingUnavailable(
+                "launch_binding_database_error"
+            ) from None
 
     def materialize_task_fence_selected_launch_binding(
         self,
