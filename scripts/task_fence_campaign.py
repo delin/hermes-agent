@@ -38,8 +38,11 @@ from task_fence import (
     OperationDescriptor,
     TASK_FENCE_CAPABILITY_VERSION,
     TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
     TaskFenceArtifactIdentity,
     TaskFenceCapabilityState,
+    TaskFenceLaunchRoute,
+    TaskFenceLaunchRouteValidation,
     TaskFencePolicy,
     bind_causal_envelope,
     current_causal_envelope,
@@ -49,7 +52,7 @@ from task_fence import (
 
 REPORT_SCHEMA = "hermes.task-fence.campaign-report/v1"
 DECISION_RECORD_SCHEMA = "task-fence-campaign-decision/v1"
-SCENARIO_SET_VERSION = "task-fence-slack-openai-shadow-v1"
+SCENARIO_SET_VERSION = "task-fence-slack-openai-shadow-v2"
 MAX_CAMPAIGN_DECISION_RECORDS = 64
 MAX_REPORT_BYTES = 65_536
 
@@ -115,11 +118,16 @@ class CampaignPolicyProbe:
         self._policy = policy
         self._route_id = route_id
         self._records: list[CampaignDecisionRecord] = []
+        self._launch_route_observations: list[tuple[str, bool]] = []
         self._failure_reason: str | None = None
 
     @property
     def records(self) -> tuple[CampaignDecisionRecord, ...]:
         return tuple(self._records)
+
+    @property
+    def launch_route_observations(self) -> tuple[tuple[str, bool], ...]:
+        return tuple(self._launch_route_observations)
 
     def assert_complete(self) -> None:
         if self._failure_reason == "campaign_record_limit":
@@ -191,8 +199,27 @@ class CampaignPolicyProbe:
         )
         return decision
 
-    def classify_launch_route(self, route):
-        return self._policy.classify_launch_route(route)
+    def classify_launch_route(
+        self,
+        route: TaskFenceLaunchRoute,
+    ) -> TaskFenceLaunchRouteValidation | None:
+        if len(self._launch_route_observations) >= MAX_CAMPAIGN_DECISION_RECORDS:
+            self._failure_reason = "campaign_record_limit"
+            return self._policy.classify_launch_route(route)
+        route_id = route.route_id if isinstance(route, TaskFenceLaunchRoute) else ""
+        try:
+            validation = self._policy.classify_launch_route(route)
+        except Exception:
+            self._launch_route_observations.append((route_id, False))
+            raise
+        verified = (
+            isinstance(validation, TaskFenceLaunchRouteValidation)
+            and validation.verified
+            and validation.reason == "verified"
+            and validation.route_id == route_id == self._route_id
+        )
+        self._launch_route_observations.append((route_id, verified))
+        return validation
 
     def finish_attempt(self, *args: Any, **kwargs: Any) -> None:
         self._policy.finish_attempt(*args, **kwargs)
@@ -206,6 +233,7 @@ class _ScenarioEvidence:
     physical_handoff_count: int
     contract_match: bool
     record_handoff_binding_verified: bool
+    observed_route_ids: tuple[str, ...]
 
 
 def _runtime_platform() -> str:
@@ -271,6 +299,26 @@ def verify_artifact_receipt(
     return receipt
 
 
+def _configured_slack_source() -> Any:
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    return SessionSource(
+        platform=Platform.SLACK,
+        chat_id="D_TASK_FENCE_CAMPAIGN",
+        chat_type="dm",
+        user_id="U_TASK_FENCE_CAMPAIGN",
+        thread_id="1700000000.000001",
+        scope_id="T_TASK_FENCE_CAMPAIGN",
+    )
+
+
+def _configured_slack_session_key() -> str:
+    from gateway.session import build_session_key
+
+    return build_session_key(_configured_slack_source())
+
+
 async def _accept_configured_slack_ingress(db: Any) -> tuple[Any, int]:
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.base import (
@@ -279,17 +327,10 @@ async def _accept_configured_slack_ingress(db: Any) -> tuple[Any, int]:
         task_fence_sidecar_for_human_message,
     )
     from gateway.run import GatewayRunner
-    from gateway.session import SessionSource, build_session_key
+    from gateway.session import build_session_key
     from hermes_state import AsyncSessionDB
 
-    source = SessionSource(
-        platform=Platform.SLACK,
-        chat_id="D_TASK_FENCE_CAMPAIGN",
-        chat_type="dm",
-        user_id="U_TASK_FENCE_CAMPAIGN",
-        thread_id="1700000000.000001",
-        scope_id="T_TASK_FENCE_CAMPAIGN",
-    )
+    source = _configured_slack_source()
     session_key = build_session_key(source)
     event = MessageEvent(
         text=_CAMPAIGN_PAYLOAD_MARKER,
@@ -348,6 +389,7 @@ def _run_openai_scenario(
     probe = CampaignPolicyProbe(policy, route_id=_OPENAI_ROUTE)
     physical_handoffs = 0
     handoff_records: tuple[CampaignDecisionRecord, ...] = ()
+    handoff_launch_route_observations: tuple[tuple[str, bool], ...] = ()
     handoff_envelope: CausalEnvelope | None = None
     handoff_policy: TaskFencePolicy | None = None
     response = SimpleNamespace(
@@ -358,8 +400,10 @@ def _run_openai_scenario(
 
     def create(**_kwargs: Any) -> Any:
         nonlocal handoff_envelope, handoff_policy, handoff_records
+        nonlocal handoff_launch_route_observations
         nonlocal physical_handoffs
         handoff_records = probe.records
+        handoff_launch_route_observations = probe.launch_route_observations
         handoff_envelope = current_causal_envelope()
         handoff_policy = current_task_fence_policy()
         physical_handoffs += 1
@@ -408,6 +452,7 @@ def _run_openai_scenario(
     )
     probe.assert_complete()
     final_records = probe.records
+    final_launch_route_observations = probe.launch_route_observations
     if envelope is None:
         binding_verified = (
             bool(handoff_records)
@@ -428,9 +473,15 @@ def _run_openai_scenario(
                 for record in handoff_records
             )
         )
+    launch_route_verified = (
+        handoff_launch_route_observations == ((_OPENAI_ROUTE, True),)
+        and final_launch_route_observations
+        == handoff_launch_route_observations
+    )
     contract_match = (
         handoff_policy is None
         and final_records == handoff_records
+        and launch_route_verified
         and binding_verified
         and _records_match(
             handoff_records,
@@ -445,6 +496,15 @@ def _run_openai_scenario(
         physical_handoff_count=physical_handoffs,
         contract_match=contract_match,
         record_handoff_binding_verified=binding_verified,
+        observed_route_ids=(
+            tuple(
+                route_id
+                for route_id, verified in handoff_launch_route_observations
+                if verified
+            )
+            if contract_match
+            else ()
+        ),
     )
 
 
@@ -595,6 +655,23 @@ def build_campaign_report(
             ):
                 raise CampaignError("campaign_inventory_unverified")
             inventory = _inventory_projection(inspected.declarations)
+            conversation_key = _configured_slack_session_key()
+            db.materialize_task_fence_selected_launch_binding(
+                shadow_conversation_key=conversation_key,
+                manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+                expected_runtime_epoch=store.runtime_epoch,
+                expected_mode_generation=store.mode_generation,
+            )
+            catalog_db = SessionDB(db_path, read_only=True)
+            try:
+                launch_catalog = catalog_db.load_task_fence_selected_launch_catalog(
+                    shadow_conversation_key=conversation_key,
+                    manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+                    expected_runtime_epoch=store.runtime_epoch,
+                    expected_mode_generation=store.mode_generation,
+                )
+            finally:
+                catalog_db.close()
             setup_ns = time.perf_counter_ns() - setup_started
 
             acceptance, ingress_ns = asyncio.run(
@@ -606,7 +683,7 @@ def build_campaign_report(
             current = _run_openai_scenario(
                 scenario_id="current_authority",
                 oracle="allow",
-                policy=TaskFencePolicy(db),
+                policy=TaskFencePolicy(db, launch_catalog=launch_catalog),
                 envelope=generation,
                 expected=(
                     (
@@ -625,7 +702,7 @@ def build_campaign_report(
             taskless = _run_openai_scenario(
                 scenario_id="missing_provenance",
                 oracle="would_block_shadow_dispatch",
-                policy=TaskFencePolicy(db),
+                policy=TaskFencePolicy(db, launch_catalog=launch_catalog),
                 envelope=None,
                 expected=((
                     "admission",
@@ -639,7 +716,10 @@ def build_campaign_report(
                 unavailable = _run_openai_scenario(
                     scenario_id="store_unavailable",
                     oracle="would_block_shadow_dispatch",
-                    policy=TaskFencePolicy(read_only),
+                    policy=TaskFencePolicy(
+                        read_only,
+                        launch_catalog=launch_catalog,
+                    ),
                     envelope=generation,
                     expected=((
                         "admission",
@@ -666,6 +746,11 @@ def build_campaign_report(
     all_records = tuple(
         record for scenario in scenarios for record in scenario.records
     )
+    observed_route_ids = sorted({
+        route_id
+        for scenario in scenarios
+        for route_id in scenario.observed_route_ids
+    })
     current, taskless, unavailable = scenarios
     supported_count = sum(
         declaration["declaration_state"]
@@ -713,7 +798,7 @@ def build_campaign_report(
             "setup_ns": setup_ns,
             "state_storage_bytes": storage_bytes,
         },
-        "observed_route_ids": [_OPENAI_ROUTE],
+        "observed_route_ids": observed_route_ids,
         "receipt": {
             "dependency_lock_fingerprint": (
                 receipt.dependency_lock_fingerprint

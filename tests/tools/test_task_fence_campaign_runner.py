@@ -31,7 +31,9 @@ from task_fence import (
     OperationDescriptor,
     OperationKind,
     TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
     TaskFenceCapabilityState,
+    TaskFenceLaunchRouteValidation,
     TaskFencePolicy,
 )
 
@@ -129,7 +131,9 @@ def test_receipt_verification_rejects_mismatched_image_identity(
     assert exc.value.reason == reason
 
 
-def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs():
+def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs(
+    monkeypatch,
+):
     receipt = TestedArtifactReceipt(
         target_platform="linux/amd64",
         tested_artifact_commit=_COMMIT,
@@ -137,8 +141,29 @@ def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs():
         dependency_lock_fingerprint="sha256:" + "c" * 64,
     )
 
+    catalog_loads = []
+    real_load_catalog = SessionDB.load_task_fence_selected_launch_catalog
+
+    def load_catalog(database, **kwargs):
+        catalog_loads.append((database.read_only, kwargs))
+        return real_load_catalog(database, **kwargs)
+
+    monkeypatch.setattr(
+        SessionDB,
+        "load_task_fence_selected_launch_catalog",
+        load_catalog,
+    )
+
     report = build_campaign_report(receipt)
     encoded = serialize_campaign_report(report)
+
+    assert len(catalog_loads) == 1
+    read_only, catalog_kwargs = catalog_loads[0]
+    assert read_only is True
+    assert catalog_kwargs["manifest"] is TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+    assert catalog_kwargs["shadow_conversation_key"] == (
+        campaign._configured_slack_session_key()
+    )
 
     assert set(report) == {
         "artifact_binding",
@@ -380,6 +405,60 @@ def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs():
     assert json.loads(encoded) == report
 
 
+@pytest.mark.parametrize(
+    "classification",
+    ("missing", "changed", "fault", "malformed"),
+)
+def test_campaign_launch_route_failure_blocks_conformance_not_legacy_handoff(
+    monkeypatch,
+    caplog,
+    classification,
+):
+    receipt = TestedArtifactReceipt(
+        target_platform="linux/amd64",
+        tested_artifact_commit=_COMMIT,
+        tested_artifact_checksum=_ARTIFACT,
+        dependency_lock_fingerprint="sha256:" + "c" * 64,
+    )
+    secret = "campaign-classifier-private-detail"
+
+    def classify_launch_route(_policy, route):
+        if classification == "missing":
+            return None
+        if classification == "changed":
+            return TaskFenceLaunchRouteValidation(
+                verified=False,
+                reason="changed_reachable_route",
+                route_id=route.route_id,
+            )
+        if classification == "fault":
+            raise RuntimeError(secret)
+        return object()
+
+    monkeypatch.setattr(
+        TaskFencePolicy,
+        "classify_launch_route",
+        classify_launch_route,
+    )
+
+    report = build_campaign_report(receipt)
+
+    assert report["execution_complete"] is True
+    assert report["scenario_contracts_match"] is False
+    assert report["cohort_complete"] is False
+    assert report["observed_route_ids"] == []
+    assert report["legacy_behavior"] == {
+        "physical_handoff_count": 3,
+        "suppressed_handoff_count": 0,
+    }
+    assert all(
+        scenario["physical_handoff_count"] == 1
+        and scenario["contract_match"] is False
+        for scenario in report["scenarios"]
+    )
+    assert secret not in caplog.text
+
+
 def test_campaign_probe_latches_overflow_before_unbounded_projection(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     probe = CampaignPolicyProbe(
@@ -415,6 +494,33 @@ def test_campaign_probe_latches_overflow_before_unbounded_projection(tmp_path):
         db.close()
 
 
+def test_campaign_probe_bounds_launch_route_observations(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    probe = CampaignPolicyProbe(
+        TaskFencePolicy(db),
+        route_id="provider:openai.chat.completions.create",
+    )
+    route = next(
+        route
+        for route in TASK_FENCE_SELECTED_LAUNCH_MANIFEST.routes
+        if route.route_id == "provider:openai.chat.completions.create"
+    )
+    try:
+        for _ in range(MAX_CAMPAIGN_DECISION_RECORDS + 1):
+            probe.classify_launch_route(route)
+
+        assert len(probe.launch_route_observations) == (
+            MAX_CAMPAIGN_DECISION_RECORDS
+        )
+        with pytest.raises(
+            CampaignRecordOverflow,
+            match="campaign_record_limit",
+        ):
+            probe.assert_complete()
+    finally:
+        db.close()
+
+
 def test_campaign_contract_mismatch_does_not_invent_false_block(monkeypatch):
     receipt = TestedArtifactReceipt(
         target_platform="linux/amd64",
@@ -432,6 +538,7 @@ def test_campaign_contract_mismatch_does_not_invent_false_block(monkeypatch):
 
     assert report["execution_complete"] is True
     assert report["scenario_contracts_match"] is False
+    assert report["observed_route_ids"] == []
     assert report["reviews"]["false_block"] == {
         "denominator": 1,
         "numerator": 0,
@@ -483,6 +590,7 @@ def test_campaign_post_handoff_record_invalidates_scenario_contract(monkeypatch)
 
     assert report["execution_complete"] is True
     assert report["scenario_contracts_match"] is False
+    assert report["observed_route_ids"] == []
     assert all(not scenario["contract_match"] for scenario in report["scenarios"])
     assert all(
         scenario["records"][-1]["invocation_id"]
