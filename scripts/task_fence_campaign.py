@@ -2,8 +2,9 @@
 """Run one receipt-bound Task Fence shadow campaign inside a tested image.
 
 The runner is an isolated CI owner, not runtime telemetry. It exercises one
-configured Slack ingress lane and one inert OpenAI-compatible physical handoff
-without changing legacy dispatch outcomes or contacting an external service.
+configured Slack ingress lane plus inert OpenAI-compatible and registered-tool
+physical handoffs without changing legacy dispatch outcomes or contacting an
+external service.
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ from task_fence import (
     TaskFenceLaunchRouteValidation,
     TaskFencePolicy,
     bind_causal_envelope,
+    bind_task_fence_policy,
     current_causal_envelope,
     current_task_fence_policy,
 )
@@ -52,13 +54,14 @@ from task_fence import (
 
 REPORT_SCHEMA = "hermes.task-fence.campaign-report/v1"
 DECISION_RECORD_SCHEMA = "task-fence-campaign-decision/v1"
-SCENARIO_SET_VERSION = "task-fence-slack-openai-shadow-v2"
+SCENARIO_SET_VERSION = "task-fence-slack-openai-tool-shadow-v3"
 MAX_CAMPAIGN_DECISION_RECORDS = 64
 MAX_REPORT_BYTES = 65_536
 
 DEFAULT_BUILD_COMMIT_PATH = Path("/opt/hermes/.hermes_build_sha")
 DEFAULT_LOCK_PATH = Path("/opt/hermes/uv.lock")
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
+_REGISTERED_TOOL_ROUTE = "runtime:registered-tool-handoff"
 _CAMPAIGN_PAYLOAD_MARKER = "task-fence-campaign-private-payload"
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _BLOCKING_OUTCOMES = frozenset({
@@ -91,7 +94,7 @@ class CampaignRecordOverflow(RuntimeError):
     pass
 
 
-class CampaignPolicyProbe:
+class CampaignPolicyProbe(TaskFencePolicy):
     """Bounded projection of real audit-only policy facade returns."""
 
     def __init__(
@@ -99,6 +102,7 @@ class CampaignPolicyProbe:
         policy: TaskFencePolicy,
         *,
         route_id: str,
+        operation_adapter: str | None = None,
     ):
         if not isinstance(policy, TaskFencePolicy):
             raise TypeError("invalid_campaign_policy")
@@ -117,6 +121,7 @@ class CampaignPolicyProbe:
             raise ValueError("unsupported_campaign_route")
         self._policy = policy
         self._route_id = route_id
+        self._operation_adapter = operation_adapter or route_id
         self._records: list[CampaignDecisionRecord] = []
         self._launch_route_observations: list[tuple[str, bool]] = []
         self._failure_reason: str | None = None
@@ -145,7 +150,7 @@ class CampaignPolicyProbe:
     ) -> None:
         if self._failure_reason is not None:
             return
-        if operation.adapter != self._route_id:
+        if operation.adapter != self._operation_adapter:
             self._failure_reason = "campaign_route_adapter_mismatch"
             return
         if len(self._records) >= MAX_CAMPAIGN_DECISION_RECORDS:
@@ -508,6 +513,114 @@ def _run_openai_scenario(
     )
 
 
+def _run_registered_tool_scenario(
+    *,
+    policy: TaskFencePolicy,
+    envelope: CausalEnvelope,
+    expected: tuple[tuple[str, str, str], ...],
+) -> _ScenarioEvidence:
+    from tools.registry import ToolRegistry
+
+    tool_name = "task_fence_campaign_probe"
+    probe = CampaignPolicyProbe(
+        policy,
+        route_id=_REGISTERED_TOOL_ROUTE,
+        operation_adapter=f"registry:{tool_name}",
+    )
+    physical_handoffs = 0
+    handoff_records: tuple[CampaignDecisionRecord, ...] = ()
+    handoff_launch_route_observations: tuple[tuple[str, bool], ...] = ()
+    handoff_envelope: CausalEnvelope | None = None
+    handoff_policy: TaskFencePolicy | None = None
+    handoff_args: dict[str, Any] | None = None
+    handoff_kwargs: dict[str, Any] | None = None
+
+    def handler(args: dict[str, Any], **kwargs: Any) -> str:
+        nonlocal handoff_envelope, handoff_policy, handoff_records
+        nonlocal handoff_launch_route_observations, physical_handoffs
+        nonlocal handoff_args, handoff_kwargs
+        handoff_records = probe.records
+        handoff_launch_route_observations = probe.launch_route_observations
+        handoff_envelope = current_causal_envelope()
+        handoff_policy = current_task_fence_policy()
+        handoff_args = dict(args)
+        handoff_kwargs = dict(kwargs)
+        physical_handoffs += 1
+        return "task-fence-campaign-registered-tool-result"
+
+    registry = ToolRegistry()
+    registry.register(
+        name=tool_name,
+        toolset="task_fence_campaign",
+        schema={
+            "name": tool_name,
+            "description": "Inert Task Fence campaign handoff.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=handler,
+    )
+
+    with (
+        bind_task_fence_policy(probe),
+        bind_causal_envelope(envelope),
+    ):
+        result = registry.dispatch(tool_name, {"probe": "bounded"})
+
+    if physical_handoffs != 1:
+        raise CampaignError("physical_handoff_not_reached")
+    probe.assert_complete()
+    final_records = probe.records
+    final_launch_route_observations = probe.launch_route_observations
+    binding_verified = (
+        bool(handoff_records)
+        and handoff_envelope is not None
+        and handoff_envelope.invocation_id is not None
+        and handoff_envelope.parent_invocation_id == envelope.invocation_id
+        and handoff_envelope.task_id == envelope.task_id
+        and handoff_envelope.generation_id == envelope.generation_id
+        and all(
+            record.invocation_id == handoff_envelope.invocation_id
+            and record.task_id == handoff_envelope.task_id
+            and record.generation_id == handoff_envelope.generation_id
+            for record in handoff_records
+        )
+    )
+    launch_route_verified = (
+        handoff_launch_route_observations
+        == ((_REGISTERED_TOOL_ROUTE, True),)
+        and final_launch_route_observations
+        == handoff_launch_route_observations
+    )
+    result_verified = (
+        result == "task-fence-campaign-registered-tool-result"
+        and handoff_args == {"probe": "bounded"}
+        and handoff_kwargs == {}
+    )
+    contract_match = (
+        handoff_policy is probe
+        and final_records == handoff_records
+        and launch_route_verified
+        and binding_verified
+        and result_verified
+        and _records_match(
+            handoff_records,
+            expected,
+            decision_id_missing=False,
+        )
+    )
+    return _ScenarioEvidence(
+        scenario_id="registered_tool_current_authority",
+        oracle="allow",
+        records=final_records,
+        physical_handoff_count=physical_handoffs,
+        contract_match=contract_match,
+        record_handoff_binding_verified=binding_verified,
+        observed_route_ids=(
+            (_REGISTERED_TOOL_ROUTE,) if contract_match else ()
+        ),
+    )
+
+
 def _inventory_projection(declarations: Sequence[Any]) -> list[dict[str, str]]:
     return [
         {
@@ -731,13 +844,28 @@ def build_campaign_report(
             finally:
                 read_only.close()
             handoff_ns = time.perf_counter_ns() - handoff_started
-            scenarios = (current, taskless, unavailable)
-
             if not db.finish_task_fence_generation(
                 generation,
                 state="committed",
             ):
                 raise CampaignError("campaign_generation_not_committed")
+            registered_tool = _run_registered_tool_scenario(
+                policy=TaskFencePolicy(db, launch_catalog=launch_catalog),
+                envelope=generation,
+                expected=(
+                    (
+                        "admission",
+                        DecisionOutcome.WOULD_RESERVE.value,
+                        DecisionReason.CURRENT_AUTHORITY.value,
+                    ),
+                    (
+                        "authorization",
+                        DecisionOutcome.WOULD_ALLOW.value,
+                        DecisionReason.CURRENT_AUTHORITY.value,
+                    ),
+                ),
+            )
+            scenarios = (current, taskless, unavailable, registered_tool)
         finally:
             db.close()
 
@@ -751,7 +879,7 @@ def build_campaign_report(
         for scenario in scenarios
         for route_id in scenario.observed_route_ids
     })
-    current, taskless, unavailable = scenarios
+    current, taskless, unavailable, registered_tool = scenarios
     supported_count = sum(
         declaration["declaration_state"]
         == TaskFenceCapabilityState.SUPPORTED.value
@@ -810,14 +938,17 @@ def build_campaign_report(
             ),
             "tested_artifact_commit": receipt.tested_artifact_commit,
         },
-        "report_scope": "configured_slack_openai_shadow_slice",
+        "report_scope": "configured_slack_openai_registered_tool_shadow_slice",
         "reviews": {
             "decision_id_missing_count": sum(
                 record.decision_id is None for record in all_records
             ),
             "false_block": {
-                "denominator": 1,
-                "numerator": int(_has_blocking_outcome(current.records)),
+                "denominator": 2,
+                "numerator": sum(
+                    int(_has_blocking_outcome(scenario.records))
+                    for scenario in (current, registered_tool)
+                ),
             },
             "missing_provenance": {
                 "denominator": 1,

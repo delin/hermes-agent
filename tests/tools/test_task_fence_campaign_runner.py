@@ -190,7 +190,9 @@ def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs(
     assert report["execution_complete"] is True
     assert report["scenario_contracts_match"] is True
     assert report["cohort_complete"] is False
-    assert report["report_scope"] == "configured_slack_openai_shadow_slice"
+    assert report["report_scope"] == (
+        "configured_slack_openai_registered_tool_shadow_slice"
+    )
     assert report["receipt"] == {
         "dependency_lock_fingerprint": receipt.dependency_lock_fingerprint,
         "schema": RECEIPT_SCHEMA,
@@ -256,7 +258,8 @@ def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs(
         "sha256:" + hashlib.sha256(inventory_bytes).hexdigest()
     )
     assert report["observed_route_ids"] == [
-        "provider:openai.chat.completions.create"
+        "provider:openai.chat.completions.create",
+        "runtime:registered-tool-handoff",
     ]
 
     scenarios = report["scenarios"]
@@ -276,8 +279,10 @@ def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs(
         "current_authority",
         "missing_provenance",
         "store_unavailable",
+        "registered_tool_current_authority",
     ]
     assert [scenario["physical_handoff_count"] for scenario in scenarios] == [
+        1,
         1,
         1,
         1,
@@ -290,7 +295,7 @@ def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs(
     records = [
         record for scenario in scenarios for record in scenario["records"]
     ]
-    assert len(records) == 4
+    assert len(records) == 6
     assert all(
         set(record)
         == {
@@ -322,13 +327,13 @@ def test_campaign_report_runs_real_configured_ingress_and_physical_handoffs(
     assert scenarios[2]["records"][0]["decision_id"] is None
     assert report["reviews"] == {
         "decision_id_missing_count": 1,
-        "false_block": {"denominator": 1, "numerator": 0},
+        "false_block": {"denominator": 2, "numerator": 0},
         "missing_provenance": {"denominator": 1, "numerator": 1},
         "store_unavailable": {"denominator": 1, "numerator": 1},
         "taskless_record_count": 1,
     }
     assert report["legacy_behavior"] == {
-        "physical_handoff_count": 3,
+        "physical_handoff_count": 4,
         "suppressed_handoff_count": 0,
     }
     assert report["counters"] == sorted(
@@ -448,7 +453,7 @@ def test_campaign_launch_route_failure_blocks_conformance_not_legacy_handoff(
     assert report["cohort_complete"] is False
     assert report["observed_route_ids"] == []
     assert report["legacy_behavior"] == {
-        "physical_handoff_count": 3,
+        "physical_handoff_count": 4,
         "suppressed_handoff_count": 0,
     }
     assert all(
@@ -456,6 +461,68 @@ def test_campaign_launch_route_failure_blocks_conformance_not_legacy_handoff(
         and scenario["contract_match"] is False
         for scenario in report["scenarios"]
     )
+    assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "classification",
+    ("missing", "changed", "fault", "malformed"),
+)
+def test_registered_route_failure_preserves_other_route_and_all_handoffs(
+    monkeypatch,
+    caplog,
+    classification,
+):
+    receipt = TestedArtifactReceipt(
+        target_platform="linux/amd64",
+        tested_artifact_commit=_COMMIT,
+        tested_artifact_checksum=_ARTIFACT,
+        dependency_lock_fingerprint="sha256:" + "c" * 64,
+    )
+    secret = "registered-classifier-private-detail"
+    real_classify = TaskFencePolicy.classify_launch_route
+
+    def classify_launch_route(policy, route):
+        if route.route_id != campaign._REGISTERED_TOOL_ROUTE:
+            return real_classify(policy, route)
+        if classification == "missing":
+            return None
+        if classification == "changed":
+            return TaskFenceLaunchRouteValidation(
+                verified=False,
+                reason="changed_reachable_route",
+                route_id=route.route_id,
+            )
+        if classification == "fault":
+            raise RuntimeError(secret)
+        return object()
+
+    monkeypatch.setattr(
+        TaskFencePolicy,
+        "classify_launch_route",
+        classify_launch_route,
+    )
+
+    report = build_campaign_report(receipt)
+
+    assert report["execution_complete"] is True
+    assert report["scenario_contracts_match"] is False
+    assert report["observed_route_ids"] == [
+        "provider:openai.chat.completions.create"
+    ]
+    assert report["legacy_behavior"] == {
+        "physical_handoff_count": 4,
+        "suppressed_handoff_count": 0,
+    }
+    assert all(
+        scenario["contract_match"] is True
+        for scenario in report["scenarios"][:3]
+    )
+    registered = report["scenarios"][3]
+    assert registered["scenario_id"] == "registered_tool_current_authority"
+    assert registered["physical_handoff_count"] == 1
+    assert registered["contract_match"] is False
+    assert len(registered["records"]) == (2 if classification == "missing" else 0)
     assert secret not in caplog.text
 
 
@@ -540,12 +607,12 @@ def test_campaign_contract_mismatch_does_not_invent_false_block(monkeypatch):
     assert report["scenario_contracts_match"] is False
     assert report["observed_route_ids"] == []
     assert report["reviews"]["false_block"] == {
-        "denominator": 1,
+        "denominator": 2,
         "numerator": 0,
     }
     assert report["reviews"]["missing_provenance"]["numerator"] == 1
     assert report["reviews"]["store_unavailable"]["numerator"] == 1
-    assert report["legacy_behavior"]["physical_handoff_count"] == 3
+    assert report["legacy_behavior"]["physical_handoff_count"] == 4
 
 
 def test_campaign_post_handoff_record_invalidates_scenario_contract(monkeypatch):
@@ -590,13 +657,66 @@ def test_campaign_post_handoff_record_invalidates_scenario_contract(monkeypatch)
 
     assert report["execution_complete"] is True
     assert report["scenario_contracts_match"] is False
-    assert report["observed_route_ids"] == []
-    assert all(not scenario["contract_match"] for scenario in report["scenarios"])
+    assert report["observed_route_ids"] == [
+        "runtime:registered-tool-handoff"
+    ]
+    assert all(
+        not scenario["contract_match"] for scenario in report["scenarios"][:3]
+    )
+    assert report["scenarios"][3]["contract_match"] is True
     assert all(
         scenario["records"][-1]["invocation_id"]
         == "tfiv_post_handoff_extra"
-        for scenario in report["scenarios"]
+        for scenario in report["scenarios"][:3]
     )
+
+
+def test_campaign_registered_post_handoff_observation_invalidates_only_route(
+    monkeypatch,
+):
+    from tools.registry import ToolRegistry
+
+    receipt = TestedArtifactReceipt(
+        target_platform="linux/amd64",
+        tested_artifact_commit=_COMMIT,
+        tested_artifact_checksum=_ARTIFACT,
+        dependency_lock_fingerprint="sha256:" + "c" * 64,
+    )
+    real_normalize = ToolRegistry._normalize_handler_result
+    registered_route = next(
+        route
+        for route in TASK_FENCE_SELECTED_LAUNCH_MANIFEST.routes
+        if route.route_id == campaign._REGISTERED_TOOL_ROUTE
+    )
+
+    def normalize_with_extra_observation(registry, name, result):
+        policy = campaign.current_task_fence_policy()
+        assert isinstance(policy, CampaignPolicyProbe)
+        policy.classify_launch_route(registered_route)
+        return real_normalize(registry, name, result)
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "_normalize_handler_result",
+        normalize_with_extra_observation,
+    )
+
+    report = campaign.build_campaign_report(receipt)
+
+    assert report["execution_complete"] is True
+    assert report["scenario_contracts_match"] is False
+    assert report["observed_route_ids"] == [
+        "provider:openai.chat.completions.create"
+    ]
+    assert all(
+        scenario["contract_match"] is True
+        for scenario in report["scenarios"][:3]
+    )
+    assert report["scenarios"][3]["contract_match"] is False
+    assert report["legacy_behavior"] == {
+        "physical_handoff_count": 4,
+        "suppressed_handoff_count": 0,
+    }
 
 
 @pytest.mark.parametrize(

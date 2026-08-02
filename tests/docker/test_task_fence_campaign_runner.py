@@ -177,10 +177,11 @@ def test_campaign_runs_in_exact_read_only_image(
         for scenario in report["scenarios"]
     )
     assert report["observed_route_ids"] == [
-        "provider:openai.chat.completions.create"
+        "provider:openai.chat.completions.create",
+        "runtime:registered-tool-handoff",
     ]
     assert report["legacy_behavior"] == {
-        "physical_handoff_count": 3,
+        "physical_handoff_count": 4,
         "suppressed_handoff_count": 0,
     }
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o444
