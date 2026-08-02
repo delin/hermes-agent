@@ -2521,12 +2521,42 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _task_fence_acceptance_has_open_unpresented_run(acceptance: Any) -> bool:
+    """Return whether an acceptance owns one exact unpresented open run."""
+
+    projection = getattr(acceptance, "task_projection", None)
+    return bool(
+        acceptance is not None
+        and getattr(acceptance, "task_id", None) is not None
+        and not getattr(acceptance, "pending_input_ids", ())
+        and getattr(acceptance, "opened_run_id", None) is not None
+        and getattr(projection, "status", None) == "running"
+        and getattr(projection, "current_generation_id", None) is None
+        and getattr(projection, "active_execution_run_id", None)
+        == getattr(acceptance, "opened_run_id", None)
+    )
+
+
+def _task_fence_acceptance_extends_unpresented_run(
+    previous: Any,
+    latest: Any,
+) -> bool:
+    """Return whether latest is the exact successor of an unpresented run."""
+
+    return bool(
+        _task_fence_acceptance_has_open_unpresented_run(previous)
+        and _task_fence_acceptance_has_open_unpresented_run(latest)
+        and previous.task_id == latest.task_id
+        and latest.closed_run_id == previous.opened_run_id
+        and latest.accepted_order > previous.accepted_order
+    )
+
+
 def _carry_latest_task_fence_ingress_result(
     existing: MessageEvent,
     incoming: MessageEvent,
 ) -> None:
     """Keep plain merged text bound only to one exact ingress result."""
-
     if (
         getattr(existing, "_task_fence_mixed_origin", False)
         or getattr(incoming, "_task_fence_mixed_origin", False)
@@ -2536,11 +2566,15 @@ def _carry_latest_task_fence_ingress_result(
         or incoming.task_fence_ingress is None
         or existing.task_fence_acceptance is None
         or incoming.task_fence_acceptance is None
+        or not _task_fence_acceptance_extends_unpresented_run(
+            existing.task_fence_acceptance,
+            incoming.task_fence_acceptance,
+        )
     ):
-        # A merged prompt containing runtime, untyped, or uncommitted text has
-        # no closed exact authority chain. Preserve the legacy merged turn,
-        # but do not let either acceptance launder authority for the combined
-        # payload.
+        # A merged prompt containing runtime, untyped, uncommitted, or
+        # independently controlled text has no closed exact authority chain.
+        # Preserve the legacy merged turn, but do not let either acceptance
+        # launder authority for the combined payload.
         existing.task_fence_ingress = None
         existing.task_fence_acceptance = None
         existing.task_fence_acceptance_attempted = True

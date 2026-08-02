@@ -810,7 +810,7 @@ async def test_busy_plain_text_commits_hold_before_legacy_queue(
 
 @pytest.mark.parametrize("busy_text_mode", ("", "queue"))
 @pytest.mark.asyncio
-async def test_busy_text_coalescing_carries_latest_exact_acceptance(
+async def test_busy_text_coalescing_clears_non_successor_acceptance(
     task_fence_db,
     busy_text_mode,
 ):
@@ -844,6 +844,7 @@ async def test_busy_text_coalescing_carries_latest_exact_acceptance(
     first_task = adapter._session_tasks[_session_key()]
     await asyncio.wait_for(first_started.wait(), timeout=1)
     await adapter.handle_message(earlier)
+    assert earlier.task_fence_acceptance is not None
     await adapter.handle_message(latest)
 
     if busy_text_mode == "queue":
@@ -852,14 +853,14 @@ async def test_busy_text_coalescing_carries_latest_exact_acceptance(
     else:
         merged = adapter._pending_messages[_session_key()]
 
-    assert earlier.task_fence_acceptance is not None
     assert latest.task_fence_acceptance is not None
     assert latest.task_fence_acceptance.accepted_order == 3
     assert merged is earlier
     assert merged.text == "earlier\nlatest"
-    assert merged.task_fence_ingress is latest.task_fence_ingress
-    assert merged.task_fence_acceptance is latest.task_fence_acceptance
+    assert merged.task_fence_ingress is None
+    assert merged.task_fence_acceptance is None
     assert merged.task_fence_acceptance_attempted is True
+    assert merged._task_fence_mixed_origin is True
 
     failed = _event("failed", "1700000000.000015")
     failed.task_fence_acceptance_attempted = True
@@ -1145,7 +1146,7 @@ async def test_pending_uncorrelated_prompt_is_excluded_once(
 
 
 @pytest.mark.asyncio
-async def test_non_slack_or_mismatched_sidecar_source_is_excluded():
+async def test_unsupported_platform_or_mismatched_sidecar_source_is_excluded():
     db = AsyncMock()
     discord_source = SessionSource(
         platform=Platform.DISCORD,
@@ -1173,6 +1174,58 @@ async def test_non_slack_or_mismatched_sidecar_source_is_excluded():
     await _runner(db)._accept_task_fence_gateway_ingress(
         wrong_source_event,
         _session_key(),
+    )
+
+    telegram_source = replace(
+        _source(),
+        platform=Platform.TELEGRAM,
+        scope_id=None,
+    )
+    telegram_event = MessageEvent(
+        text="cross-platform mismatch",
+        message_type=MessageType.TEXT,
+        source=telegram_source,
+    )
+    telegram_event.task_fence_ingress = task_fence_sidecar_for_human_message(
+        telegram_event,
+        source_event_id="update:999:49",
+    )
+    telegram_event.task_fence_ingress = replace(
+        telegram_event.task_fence_ingress,
+        source="gateway:slack",
+    )
+    telegram_key = build_session_key(telegram_source)
+    await _runner(
+        db,
+        configured_key=telegram_key,
+    )._accept_task_fence_gateway_ingress(
+        telegram_event,
+        telegram_key,
+    )
+
+    telegram_group_source = replace(
+        telegram_source,
+        chat_id="-100123",
+        chat_type="group",
+    )
+    telegram_group_event = MessageEvent(
+        text="group ingress remains excluded",
+        message_type=MessageType.TEXT,
+        source=telegram_group_source,
+    )
+    telegram_group_event.task_fence_ingress = (
+        task_fence_sidecar_for_human_message(
+            telegram_group_event,
+            source_event_id="update:999:50",
+        )
+    )
+    telegram_group_key = build_session_key(telegram_group_source)
+    await _runner(
+        db,
+        configured_key=telegram_group_key,
+    )._accept_task_fence_gateway_ingress(
+        telegram_group_event,
+        telegram_group_key,
     )
 
     db.accept_task_fence_ingress_sidecar.assert_not_awaited()

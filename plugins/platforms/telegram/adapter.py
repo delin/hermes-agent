@@ -278,6 +278,10 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    _carry_latest_task_fence_ingress_result,
+    _task_fence_acceptance_has_open_unpresented_run,
+    coerce_plaintext_gateway_command,
+    task_fence_sidecar_for_human_message,
     utf16_len,
 )
 from plugins.platforms.telegram.telegram_ids import (
@@ -8716,7 +8720,31 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        batch_key = self._text_batch_key(event)
+        pending = self._pending_text_batches.get(batch_key)
+        if pending is None or pending.message_type is not MessageType.COMMAND:
+            acceptance = getattr(pending, "task_fence_acceptance", None)
+            extend_unpresented_batch = (
+                pending is not None
+                and pending.message_type is MessageType.TEXT
+                and not getattr(pending, "_task_fence_mixed_origin", False)
+                and pending.task_fence_ingress is not None
+                and acceptance is not None
+                and not acceptance.replayed
+                and _task_fence_acceptance_has_open_unpresented_run(
+                    acceptance
+                )
+            )
+            prior_task = self._pending_text_batch_tasks.get(batch_key)
+            if prior_task is not None and not prior_task.done():
+                prior_task.cancel()
+            await self._accept_task_fence_raw_update(
+                event,
+                session_key=batch_key,
+                payload_text=msg.text,
+                extend_unpresented_batch=extend_unpresented_batch,
+            )
+        self._enqueue_text_event(event, batch_key=batch_key)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8750,6 +8778,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
             self._enqueue_text_event(event)
             return
+        session_key = self._text_batch_key(event)
+        pending = self._pending_text_batches.get(session_key)
+        if pending is not None:
+            # Clear authority synchronously before the acceptance await. The
+            # pre-existing batch timer and legacy short-command ordering stay
+            # untouched even if that timer expires while storage is busy.
+            _carry_latest_task_fence_ingress_result(pending, event)
+        await self._accept_task_fence_raw_update(
+            event,
+            session_key=session_key,
+            payload_text=msg.text,
+        )
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8803,6 +8843,57 @@ class TelegramAdapter(BasePlatformAdapter):
     # Text message aggregation (handles Telegram client-side splits)
     # ------------------------------------------------------------------
 
+    async def _accept_task_fence_raw_update(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        payload_text: str,
+        extend_unpresented_batch: bool = False,
+    ) -> None:
+        """Accept one authenticated DM update before local text batching."""
+
+        if getattr(self, "_task_fence_ingress_handler", None) is None:
+            return
+        source = getattr(event, "source", None)
+        if (
+            getattr(source, "platform", None) is not Platform.TELEGRAM
+            or getattr(source, "chat_type", None) != "dm"
+        ):
+            return
+        bot_id = getattr(getattr(self, "_bot", None), "id", None)
+        update_id = getattr(event, "platform_update_id", None)
+        if (
+            not isinstance(bot_id, int)
+            or isinstance(bot_id, bool)
+            or bot_id <= 0
+            or not isinstance(update_id, int)
+            or isinstance(update_id, bool)
+            or update_id < 0
+        ):
+            return
+
+        # Classify against the same plaintext-command normalization as legacy
+        # dispatch without mutating the pre-existing Telegram batch behavior.
+        probe = dataclasses.replace(event)
+        coerce_plaintext_gateway_command(probe)
+        sidecar = task_fence_sidecar_for_human_message(
+            probe,
+            source_event_id=f"update:{bot_id}:{update_id}",
+            payload_text=payload_text,
+        )
+        if extend_unpresented_batch and sidecar is not None:
+            # A Telegram split is still one logical, not-yet-presented turn.
+            # Reusing the existing replace/run/append wire shape lets the
+            # transaction rebind all predecessor chunks into one successor
+            # run without a platform-specific protocol action or journal.
+            sidecar = dataclasses.replace(
+                sidecar,
+                active_lane_action=sidecar.action,
+            )
+        event.task_fence_ingress = sidecar
+        await self._invoke_task_fence_ingress_handler(event, session_key)
+
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching.
 
@@ -8819,7 +8910,12 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    def _enqueue_text_event(
+        self,
+        event: MessageEvent,
+        *,
+        batch_key: Optional[str] = None,
+    ) -> None:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
@@ -8831,7 +8927,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
             return
 
-        key = self._text_batch_key(event)
+        key = batch_key if batch_key is not None else self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
         if existing is None:
@@ -8846,6 +8942,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            _carry_latest_task_fence_ingress_result(existing, event)
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)

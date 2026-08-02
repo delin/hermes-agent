@@ -2300,7 +2300,9 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 _AGENT_PENDING_SENTINEL = object()
 _TASK_FENCE_FINAL_TURN_GENERATION_KEY = TASK_FENCE_FINAL_GENERATION_KEY
 _TASK_FENCE_FINAL_TURN_FOOTER_KEY = "_task_fence_final_turn_runtime_footer"
-_TASK_FENCE_TYPED_INGRESS_PLATFORMS = frozenset({Platform.SLACK})
+_TASK_FENCE_TYPED_INGRESS_PLATFORMS = frozenset(
+    {Platform.SLACK, Platform.TELEGRAM}
+)
 _TASK_FENCE_DELIVERY_EXCLUDE_QUEUED = 1
 _TASK_FENCE_DELIVERY_EXCLUDE_PROXY = 2
 _TASK_FENCE_DELIVERY_EXCLUDE_STREAMING = 4
@@ -8436,10 +8438,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Accept one lane before queue, ack, typing, or legacy dispatch.
 
         The empty config value and every non-matching session return without a
-        database call. The first bounded producer set contains only the
-        default-profile Slack adapter; internal and currently unsupported
-        command/answer paths keep their legacy behavior and are not part of a
-        coverage claim.
+        database call. The bounded producer set is closed explicitly above;
+        internal and currently unsupported command/answer paths keep their
+        legacy behavior and are not part of a coverage claim.
         """
 
         configured_key = getattr(
@@ -8460,6 +8461,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source = getattr(event, "source", None)
         platform = getattr(source, "platform", None)
         if platform not in _TASK_FENCE_TYPED_INGRESS_PLATFORMS:
+            return
+        if (
+            platform is Platform.TELEGRAM
+            and getattr(source, "chat_type", None) != "dm"
+        ):
             return
         platform_name = getattr(platform, "value", None)
         if sidecar.source != f"gateway:{platform_name}":

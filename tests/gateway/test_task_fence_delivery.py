@@ -950,6 +950,22 @@ async def test_queued_result_and_terminal_command_cannot_stage_delivery(tmp_path
             parent,
             queued_followup=False,
         ) is not None
+        telegram_event = replace(
+            event,
+            source=replace(event.source, platform=Platform.TELEGRAM),
+            task_fence_ingress=replace(
+                event.task_fence_ingress,
+                source="gateway:telegram",
+            ),
+        )
+        assert _task_fence_delivery_capability_for_event(
+            runner,
+            telegram_event,
+            session_key,
+            "telegram final response",
+            parent,
+            queued_followup=False,
+        ) is None
         assert _task_fence_delivery_capability_for_event(
             runner,
             event,
