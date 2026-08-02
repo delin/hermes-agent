@@ -25,6 +25,7 @@ from task_fence import (
     OperationKind,
     TASK_FENCE_PROCESS_CHECKPOINT_RECOVERY_ADAPTER,
     TaskFenceArtifactIdentity,
+    TaskFenceCapabilityUnavailable,
     TaskFenceProtocolRejected,
     TaskFenceRecovery,
     TaskFenceRecoveryUnavailable,
@@ -530,6 +531,10 @@ def prepare_task_fence_shadow_startup(
             or store.ever_enforced is not False
         ):
             raise TaskFenceStartupUnavailable("unsupported_shadow_control_state")
+        database.materialize_task_fence_selected_cohort_capabilities(
+            expected_runtime_epoch=store.runtime_epoch,
+            expected_mode_generation=store.mode_generation,
+        )
         return database.recover_task_fence_state(
             expected_runtime_epoch=store.runtime_epoch,
             expected_mode_generation=store.mode_generation,
@@ -539,7 +544,11 @@ def prepare_task_fence_shadow_startup(
         )
     except TaskFenceStartupUnavailable:
         raise
-    except (TaskFenceProtocolRejected, TaskFenceRecoveryUnavailable) as exc:
+    except (
+        TaskFenceCapabilityUnavailable,
+        TaskFenceProtocolRejected,
+        TaskFenceRecoveryUnavailable,
+    ) as exc:
         raise TaskFenceStartupUnavailable(exc.reason) from None
     except Exception as exc:
         raise TaskFenceStartupUnavailable("store_unavailable") from exc

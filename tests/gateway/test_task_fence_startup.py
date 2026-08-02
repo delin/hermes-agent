@@ -8,6 +8,7 @@ import pytest
 import task_fence_runtime as startup
 from gateway.config import GatewayConfig
 from hermes_state import SessionDB
+from task_fence import TASK_FENCE_SELECTED_COHORT_CAPABILITIES
 
 
 _PLATFORM = "linux/amd64"
@@ -15,6 +16,7 @@ _SHADOW_SESSION_KEY = "slack:workspace:channel:user"
 _COMMIT = "a" * 40
 _ARTIFACT_DIGEST = "sha256:" + "b" * 64
 _LOCK_DIGEST = "sha256:" + "c" * 64
+_COHORT_KEY = "__task_fence_shadow_v1__"
 
 @pytest.fixture(autouse=True)
 def _release_task_fence_owner_lock():
@@ -280,6 +282,28 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
         traced_checkpoint_snapshot,
     )
 
+    real_materialize = (
+        SessionDB.materialize_task_fence_selected_cohort_capabilities
+    )
+
+    def traced_materialize(self: SessionDB, **kwargs):
+        events.append("capabilities")
+        store = self.inspect_task_fence_store(include_counts=False)
+        assert kwargs == {
+            "expected_runtime_epoch": store.runtime_epoch,
+            "expected_mode_generation": store.mode_generation,
+        }
+        result = real_materialize(self, **kwargs)
+        assert result.created is True
+        assert result.declarations == TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+        return result
+
+    monkeypatch.setattr(
+        SessionDB,
+        "materialize_task_fence_selected_cohort_capabilities",
+        traced_materialize,
+    )
+
     real_recover = SessionDB.recover_task_fence_state
 
     def traced_recover(self: SessionDB, **kwargs):
@@ -386,6 +410,17 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
             database = SessionDB(tmp_path / "state.db")
             try:
                 store = database.inspect_task_fence_store()
+                capabilities = (
+                    database.inspect_task_fence_selected_cohort_capabilities()
+                )
+                cohort = tuple(
+                    database._conn.execute(
+                        "SELECT mode, mode_generation, activation_state, "
+                        "audit_degraded FROM task_fence_cohorts "
+                        "WHERE cohort_key = ?",
+                        (_COHORT_KEY,),
+                    ).fetchone()
+                )
             finally:
                 database.close()
             assert store.compatible is True
@@ -395,6 +430,16 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
             assert store.tested_artifact_commit == _COMMIT
             assert store.tested_artifact_checksum == _ARTIFACT_DIGEST
             assert store.dependency_lock_fingerprint == _LOCK_DIGEST
+            assert capabilities.verified is True
+            assert (
+                capabilities.declarations
+                == TASK_FENCE_SELECTED_COHORT_CAPABILITIES
+            )
+            assert any(
+                declaration.state.value == "unsupported"
+                for declaration in capabilities.declarations
+            )
+            assert cohort == ("audit", 0, "inactive", 0)
             database = SessionDB(tmp_path / "state.db")
             try:
                 decisions = {
@@ -493,11 +538,12 @@ async def test_start_gateway_commits_recovery_before_runner_reopens_store(
     )
 
     assert ok is True
-    assert events[:7] == [
+    assert events[:8] == [
         "lock",
         "pid",
         "receipt",
         "checkpoint",
+        "capabilities",
         "composite",
         "runner",
         "start",
@@ -532,6 +578,131 @@ async def test_active_startup_failure_releases_claim_without_runner(
 
     assert ok is False
     assert events == ["lock", "pid", "remove_pid", "release_lock"]
+
+
+@pytest.mark.asyncio
+async def test_capability_conflict_refuses_before_recovery_without_repair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    platform = startup._runtime_platform()
+    receipt_path = tmp_path / "tested-artifact.json"
+    _write_receipt(
+        receipt_path,
+        _receipt_bytes(_receipt_payload(platform=platform)),
+    )
+    _pretend_receipt_is_root_owned(monkeypatch)
+    monkeypatch.setattr(startup, "_TESTED_ARTIFACT_RECEIPT_PATH", receipt_path)
+
+    seed = SessionDB(tmp_path / "state.db")
+    store = seed.inspect_task_fence_store(include_counts=False)
+    seed.materialize_task_fence_selected_cohort_capabilities(
+        expected_runtime_epoch=store.runtime_epoch,
+        expected_mode_generation=store.mode_generation,
+    )
+    declaration = TASK_FENCE_SELECTED_COHORT_CAPABILITIES[0]
+    seed._conn.execute(
+        "DELETE FROM task_fence_cohort_capabilities "
+        "WHERE cohort_key = ? AND capability_kind = ? "
+        "AND capability_id = ? AND capability_version = ?",
+        (
+            _COHORT_KEY,
+            declaration.kind.value,
+            declaration.capability_id,
+            declaration.capability_version,
+        ),
+    )
+    seed._conn.commit()
+    control_before = tuple(
+        seed._conn.execute(
+            "SELECT * FROM task_fence_control WHERE singleton = 1"
+        ).fetchone()
+    )
+    rows_before = tuple(
+        tuple(row)
+        for row in seed._conn.execute(
+            "SELECT * FROM task_fence_cohort_capabilities "
+            "WHERE cohort_key = ? ORDER BY capability_kind, capability_id",
+            (_COHORT_KEY,),
+        )
+    )
+    assert (
+        seed.inspect_task_fence_selected_cohort_capabilities().reason
+        == "capability_declaration_conflict"
+    )
+    seed.close()
+
+    real_recover = SessionDB.recover_task_fence_state
+
+    def traced_recover(self: SessionDB, **kwargs):
+        events.append("recovery")
+        return real_recover(self, **kwargs)
+
+    monkeypatch.setattr(SessionDB, "recover_task_fence_state", traced_recover)
+    real_release_owner = startup.release_task_fence_owner_lock
+
+    def traced_release_owner() -> None:
+        events.append("release_owner")
+        real_release_owner()
+
+    monkeypatch.setattr(
+        startup,
+        "release_task_fence_owner_lock",
+        traced_release_owner,
+    )
+
+    class RunnerMustNotOpen:
+        def __init__(self, config: GatewayConfig):
+            raise AssertionError("runner opened after capability conflict")
+
+    gateway_run = _install_start_gateway_shell(
+        monkeypatch, tmp_path, events, RunnerMustNotOpen
+    )
+
+    ok = await gateway_run.start_gateway(
+        config=GatewayConfig(
+            task_fence_shadow_conversation_key=_SHADOW_SESSION_KEY,
+            sessions_dir=tmp_path / "sessions",
+        ),
+        verbosity=None,
+    )
+
+    assert ok is False
+    assert events == [
+        "lock",
+        "pid",
+        "release_owner",
+        "remove_pid",
+        "release_lock",
+    ]
+    assert (
+        "Task Fence shadow startup refused: capability_declaration_conflict"
+        in caplog.messages
+    )
+    reopened = SessionDB(tmp_path / "state.db")
+    try:
+        control_after = tuple(
+            reopened._conn.execute(
+                "SELECT * FROM task_fence_control WHERE singleton = 1"
+            ).fetchone()
+        )
+        rows_after = tuple(
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT * FROM task_fence_cohort_capabilities "
+                "WHERE cohort_key = ? ORDER BY capability_kind, capability_id",
+                (_COHORT_KEY,),
+            )
+        )
+        inspection = reopened.inspect_task_fence_selected_cohort_capabilities()
+    finally:
+        reopened.close()
+    assert control_after == control_before
+    assert rows_after == rows_before
+    assert inspection.reason == "capability_declaration_conflict"
+    assert inspection.declarations == ()
 
 
 @pytest.mark.asyncio
