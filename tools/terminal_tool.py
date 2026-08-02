@@ -47,9 +47,16 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_FOREGROUND_TERMINAL_RETRY_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:foreground-terminal-retry",
+    capability_version="task-fence-capability-v4",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2839,6 +2846,9 @@ def terminal_tool(
                                 "environment": env_type,
                             },
                             adapter="agent-runtime:terminal-retry",
+                            launch_route=(
+                                _TASK_FENCE_FOREGROUND_TERMINAL_RETRY_LAUNCH_ROUTE
+                            ),
                         ):
                             result = env.execute(command, **execute_kwargs)
                 except Exception as e:

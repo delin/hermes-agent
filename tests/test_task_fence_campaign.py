@@ -25,11 +25,16 @@ from task_fence import (
     OperationKind,
     TASK_FENCE_ACTIONS,
     TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+    TaskFenceCapabilityKind,
     TaskFenceCapabilityState,
+    TaskFenceLaunchCatalog,
+    TaskFenceLaunchRoute,
     TaskFencePolicy,
     bind_causal_envelope,
     current_causal_envelope,
     current_task_fence_policy,
+    task_fence_launch_manifest_fingerprint,
 )
 
 
@@ -44,6 +49,7 @@ _GENERIC_AUXILIARY_ROUTE = "runtime:generic-auxiliary"
 _INTERNAL_RETRIES_ROUTE = "runtime:internal-retries"
 _MOA_ONE_SHOT_ROUTE = "runtime:moa-one-shot"
 _OPENAI_ROUTE = "provider:openai.chat.completions.create"
+_ITERATION_SUMMARY_ROUTE = "runtime:iteration-summary:owned-wires"
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -198,6 +204,25 @@ def _run_campaign_summary(
 ):
     agent._session_db = db
     generations = []
+    launch_witnesses = []
+    catalog = TaskFenceLaunchCatalog(
+        conversation_fingerprint="a" * 64,
+        manifest_fingerprint=task_fence_launch_manifest_fingerprint(
+            TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+        ),
+        runtime_epoch=1,
+        mode_generation=0,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        declarations=TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    )
+
+    def classify_route(route):
+        launch_witnesses.append(route)
+        return catalog.classify_route(route)
+
+    agent._task_fence_launch_catalog = SimpleNamespace(
+        classify_route=classify_route
+    )
     with patch(
         "task_fence.TaskFencePolicy",
         new=_campaign_probe_factory(
@@ -214,7 +239,25 @@ def _run_campaign_summary(
         )
     assert current_causal_envelope() is None
     assert current_task_fence_policy() is None
-    return result, generations
+    return result, generations, launch_witnesses
+
+
+def _assert_summary_launch_witnesses(
+    witnesses: list[TaskFenceLaunchRoute],
+    provider_route_id: str,
+) -> None:
+    assert witnesses == [
+        TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.RUNTIME,
+            route_id=_ITERATION_SUMMARY_ROUTE,
+            capability_version="task-fence-capability-v4",
+        ),
+        TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.ADAPTER,
+            route_id=provider_route_id,
+            capability_version="task-fence-capability-v4",
+        ),
+    ]
 
 
 def test_campaign_probe_records_gemini_iteration_summary_at_http_entry(
@@ -280,7 +323,7 @@ def test_campaign_probe_records_gemini_iteration_summary_at_http_entry(
             "_ensure_primary_openai_client",
             return_value=client,
         ) as ensure_client:
-            result, generations = _run_campaign_summary(
+            result, generations, launch_witnesses = _run_campaign_summary(
                 agent=agent,
                 acceptance=acceptance,
                 db=db,
@@ -301,6 +344,10 @@ def test_campaign_probe_records_gemini_iteration_summary_at_http_entry(
         )
         assert len(probes) == 1
         probes[0].assert_complete()
+        _assert_summary_launch_witnesses(
+            launch_witnesses,
+            _GEMINI_ROUTE,
+        )
     finally:
         client.close()
         db.close()
@@ -369,7 +416,7 @@ def test_campaign_probe_records_anthropic_iteration_summary_at_stream_open(
     agent._is_anthropic_oauth = False
     agent._disable_streaming = False
     try:
-        result, generations = _run_campaign_summary(
+        result, generations, launch_witnesses = _run_campaign_summary(
             agent=agent,
             acceptance=acceptance,
             db=db,
@@ -384,6 +431,10 @@ def test_campaign_probe_records_anthropic_iteration_summary_at_stream_open(
         assert generations[0].generation_id == physical[0].generation_id
         assert len(probes) == 1
         probes[0].assert_complete()
+        _assert_summary_launch_witnesses(
+            launch_witnesses,
+            _ANTHROPIC_STREAM_ROUTE,
+        )
     finally:
         db.close()
 
@@ -433,7 +484,7 @@ def test_campaign_probe_records_anthropic_iteration_summary_at_messages_create(
     agent._is_anthropic_oauth = False
     agent._disable_streaming = True
     try:
-        result, generations = _run_campaign_summary(
+        result, generations, launch_witnesses = _run_campaign_summary(
             agent=agent,
             acceptance=acceptance,
             db=db,
@@ -447,6 +498,10 @@ def test_campaign_probe_records_anthropic_iteration_summary_at_messages_create(
         assert generations[0].generation_id == physical[0][1].generation_id
         assert len(probes) == 1
         probes[0].assert_complete()
+        _assert_summary_launch_witnesses(
+            launch_witnesses,
+            _ANTHROPIC_CREATE_ROUTE,
+        )
     finally:
         db.close()
 
@@ -509,7 +564,7 @@ def test_campaign_probe_records_codex_iteration_summary_at_responses_create(
             "_ensure_primary_openai_client",
             return_value=client,
         ) as ensure_client:
-            result, generations = _run_campaign_summary(
+            result, generations, launch_witnesses = _run_campaign_summary(
                 agent=agent,
                 acceptance=acceptance,
                 db=db,
@@ -525,6 +580,10 @@ def test_campaign_probe_records_codex_iteration_summary_at_responses_create(
         assert generations[0].generation_id == physical[0][1].generation_id
         assert len(probes) == 1
         probes[0].assert_complete()
+        _assert_summary_launch_witnesses(
+            launch_witnesses,
+            _CODEX_ROUTE,
+        )
     finally:
         db.close()
 

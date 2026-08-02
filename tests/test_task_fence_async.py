@@ -20,15 +20,21 @@ from task_fence import (
     DecisionReason,
     IngressEnvelope,
     TASK_FENCE_ACTIONS,
+    TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
     TaskFenceArtifactIdentity,
-    TaskFencePolicy,
+    TaskFenceCapabilityKind,
     TaskFenceIngressRejected,
     TaskFenceIngressUnavailable,
+    TaskFenceLaunchCatalog,
+    TaskFenceLaunchRoute,
+    TaskFencePolicy,
     TaskFenceRecoveryUnavailable,
     bind_causal_envelope,
     bind_task_fence_policy,
     current_causal_envelope,
     current_task_fence_policy,
+    task_fence_launch_manifest_fingerprint,
 )
 from tools.registry import _task_fence_tool_fingerprint
 
@@ -143,6 +149,40 @@ def _live_lane(path, *, conversation_id: str = "delegation-conversation"):
     generation = db.reserve_task_fence_generation(acceptance)
     assert db.finish_task_fence_generation(generation, state="committed")
     return db, acceptance, generation
+
+
+def _recording_launch_policy(db: SessionDB):
+    witnesses = []
+    catalog = TaskFenceLaunchCatalog(
+        conversation_fingerprint="a" * 64,
+        manifest_fingerprint=task_fence_launch_manifest_fingerprint(
+            TASK_FENCE_SELECTED_LAUNCH_MANIFEST
+        ),
+        runtime_epoch=1,
+        mode_generation=0,
+        manifest=TASK_FENCE_SELECTED_LAUNCH_MANIFEST,
+        declarations=TASK_FENCE_SELECTED_COHORT_CAPABILITIES,
+    )
+
+    def classify_route(route):
+        witnesses.append(route)
+        return catalog.classify_route(route)
+
+    return (
+        TaskFencePolicy(
+            db,
+            launch_catalog=SimpleNamespace(classify_route=classify_route),
+        ),
+        witnesses,
+    )
+
+
+def _delegated_child_launch_route():
+    return TaskFenceLaunchRoute(
+        kind=TaskFenceCapabilityKind.RUNTIME,
+        route_id="runtime:delegated-child-launch",
+        capability_version="task-fence-capability-v4",
+    )
 
 
 def _context_carries_task_fence_authority() -> bool:
@@ -390,7 +430,7 @@ def test_exact_child_launch_is_started_before_run_conversation(
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db, _acceptance, generation = _live_lane(tmp_path / "state.db")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     parent_envelope = generation.for_invocation("tfiv_delegate_handler")
     secret_goal = "delegated-secret-must-not-be-durable"
     observed = []
@@ -429,6 +469,7 @@ def test_exact_child_launch_is_started_before_run_conversation(
 
         assert result["status"] == "completed"
         assert result["summary"] == "finished"
+        assert launch_witnesses == [_delegated_child_launch_route()]
         assert len(observed) == 1
         (
             user_message,
@@ -1077,7 +1118,7 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db, acceptance, generation = _live_lane(tmp_path / "state.db")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     parent_envelope = generation.for_invocation("tfiv_background_delegate_handler")
     goals = ["background-secret-alpha", "background-secret-beta"]
     observed = []
@@ -1171,6 +1212,10 @@ def test_background_batch_separates_exact_launch_from_synthetic_completion(
         delegation_id = dispatch["delegation_id"]
         assert all_entered.wait(timeout=10.0)
         assert len(observed) == 2
+        assert launch_witnesses == [
+            _delegated_child_launch_route(),
+            _delegated_child_launch_route(),
+        ]
         child_envelopes = [item[3] for item in observed]
         assert len({envelope.invocation_id for envelope in child_envelopes}) == 2
         assert {

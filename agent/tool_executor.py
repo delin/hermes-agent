@@ -49,8 +49,15 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_INLINE_TOOL_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:inline-tool-handoff",
+    capability_version="task-fence-capability-v4",
+)
 
 
 def _ensure_file_checkpoint(
@@ -497,6 +504,7 @@ def _run_agent_tool_execution_middleware(
                     "session_id": getattr(agent, "session_id", "") or "",
                 },
                 adapter=f"agent-runtime:{function_name}",
+                launch_route=_TASK_FENCE_INLINE_TOOL_LAUNCH_ROUTE,
             ),
         ):
             return execute(final_args)

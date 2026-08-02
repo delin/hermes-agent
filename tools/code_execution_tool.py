@@ -43,10 +43,17 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 _IS_WINDOWS = platform.system() == "Windows"
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from task_fence import (
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+    bind_task_fence_policy,
+    current_task_fence_policy,
+)
 from tools.thread_context import propagate_context_to_thread
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
@@ -54,6 +61,12 @@ from tools.thread_context import propagate_context_to_thread
 # ``_use_tcp_rpc`` in ``_execute_local`` below.  That makes execute_code
 # available on every platform Hermes itself runs on.
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_EXECUTE_CODE_RPC_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:execute-code-rpc-descendant",
+    capability_version="task-fence-capability-v4",
+)
 
 SANDBOX_AVAILABLE = True
 
@@ -74,6 +87,38 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+
+
+@contextmanager
+def _task_fence_execute_code_rpc_handoff() -> Iterator[None]:
+    """Classify one parent-side RPC descendant without adding an attempt."""
+
+    policy = current_task_fence_policy()
+    if policy is not None:
+        try:
+            launch_validation = policy.classify_launch_route(
+                _TASK_FENCE_EXECUTE_CODE_RPC_LAUNCH_ROUTE
+            )
+            if (
+                launch_validation is not None
+                and not launch_validation.verified
+            ):
+                logger.warning(
+                    "Task Fence shadow execute-code RPC launch route would "
+                    "block (%s): %s",
+                    launch_validation.route_id,
+                    launch_validation.reason,
+                )
+                policy = None
+        except Exception as exc:
+            logger.warning(
+                "Task Fence shadow execute-code RPC launch route failed: %s",
+                type(exc).__name__,
+            )
+            policy = None
+
+    with bind_task_fence_policy(policy):
+        yield
 
 
 def _assemble_stdout_result(
@@ -684,7 +729,10 @@ def _rpc_server_loop(
                         )
                         from task_fence import bind_causal_envelope
 
-                        with bind_causal_envelope(child_envelope):
+                        with (
+                            bind_causal_envelope(child_envelope),
+                            _task_fence_execute_code_rpc_handoff(),
+                        ):
                             result = handle_function_call(
                                 tool_name,
                                 tool_args,
@@ -977,7 +1025,10 @@ def _rpc_poll_loop(
                             )
                             from task_fence import bind_causal_envelope
 
-                            with bind_causal_envelope(child_envelope):
+                            with (
+                                bind_causal_envelope(child_envelope),
+                                _task_fence_execute_code_rpc_handoff(),
+                            ):
                                 tool_result = handle_function_call(
                                     tool_name,
                                     tool_args,

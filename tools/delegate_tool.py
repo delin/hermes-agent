@@ -33,6 +33,10 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from task_fence import (
+    TaskFenceCapabilityKind,
+    TaskFenceLaunchRoute,
+)
 from toolsets import TOOLSETS
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -42,6 +46,13 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+_TASK_FENCE_DELEGATED_CHILD_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:delegated-child-launch",
+    capability_version="task-fence-capability-v4",
+)
 
 
 # Tools that children must never have access to
@@ -2672,14 +2683,33 @@ def _run_task_fence_child_launch(
         )
 
     launch_envelope = None
+    launch_policy = policy
     audit_start = None
     attempt_id = None
     if parent_envelope is not None and policy is not None:
         try:
+            launch_validation = policy.classify_launch_route(
+                _TASK_FENCE_DELEGATED_CHILD_LAUNCH_ROUTE
+            )
+            if launch_validation is not None and not launch_validation.verified:
+                logger.warning(
+                    "Task Fence shadow child-launch route would block (%s): %s",
+                    launch_validation.route_id,
+                    launch_validation.reason,
+                )
+                launch_policy = None
+        except Exception as exc:
+            logger.warning(
+                "Task Fence shadow child-launch route failed: %s",
+                type(exc).__name__,
+            )
+            launch_policy = None
+        try:
             launch_envelope = parent_envelope.for_invocation()
-            from tools.registry import _audit_task_fence_tool_start
+            if launch_policy is not None:
+                from tools.registry import _audit_task_fence_tool_start
 
-            audit_start = _audit_task_fence_tool_start
+                audit_start = _audit_task_fence_tool_start
         except Exception as exc:
             logger.warning(
                 "Task Fence shadow child-launch context failed: %s",
@@ -2696,7 +2726,7 @@ def _run_task_fence_child_launch(
                     "delegate_child_launch",
                     {"goal": goal},
                     adapter="delegate:run_conversation",
-                    policy=policy,
+                    policy=launch_policy,
                     envelope=launch_envelope,
                     kwargs={"task_id": child_task_id},
                 )

@@ -45,7 +45,7 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _bind_recording_launch_catalog(agent) -> None:
+def _recording_launch_catalog():
     witnesses = []
     catalog = TaskFenceLaunchCatalog(
         conversation_fingerprint="a" * 64,
@@ -62,21 +62,43 @@ def _bind_recording_launch_catalog(agent) -> None:
         witnesses.append(route)
         return catalog.classify_route(route)
 
-    agent._task_fence_launch_catalog = SimpleNamespace(
-        classify_route=classify_route
-    )
+    return SimpleNamespace(classify_route=classify_route), witnesses
+
+
+def _bind_recording_launch_catalog(agent) -> None:
+    catalog, witnesses = _recording_launch_catalog()
+    agent._task_fence_launch_catalog = catalog
     agent._task_fence_launch_witnesses = witnesses
 
 
-def _assert_launch_witnesses(agent, *route_ids: str) -> None:
-    assert agent._task_fence_launch_witnesses == [
-        TaskFenceLaunchRoute(
-            kind=TaskFenceCapabilityKind.ADAPTER,
-            route_id=route_id,
-            capability_version="task-fence-capability-v4",
-        )
-        for route_id in route_ids
-    ]
+def _recording_launch_policy(db):
+    catalog, witnesses = _recording_launch_catalog()
+    return TaskFencePolicy(db, launch_catalog=catalog), witnesses
+
+
+def _launch_route(
+    kind: TaskFenceCapabilityKind,
+    route_id: str,
+) -> TaskFenceLaunchRoute:
+    return TaskFenceLaunchRoute(
+        kind=kind,
+        route_id=route_id,
+        capability_version="task-fence-capability-v4",
+    )
+
+
+def _assert_launch_witnesses(
+    agent,
+    *routes: str | tuple[TaskFenceCapabilityKind, str],
+) -> None:
+    expected = []
+    for route in routes:
+        if isinstance(route, tuple):
+            kind, route_id = route
+        else:
+            kind, route_id = TaskFenceCapabilityKind.ADAPTER, route
+        expected.append(_launch_route(kind, route_id))
+    assert agent._task_fence_launch_witnesses == expected
 
 
 def _openai_response_evidence(response_id: str) -> str:
@@ -1349,6 +1371,24 @@ def test_real_persistent_moa_retries_physical_aggregator_in_outer_generation(
         assert {entry[2] for entry in aggregator_entries} == {"STARTED"}
         assert all(entry[3] is None for entry in creates)
         assert not any(entry[4] for entry in creates)
+        _assert_launch_witnesses(
+            persistent_moa_agent,
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:persistent-moa-acting",
+            ),
+            "provider:openai.chat.completions.create",
+            "provider:openai.chat.completions.create",
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:registered-tool-handoff",
+            ),
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:persistent-moa-acting",
+            ),
+            "provider:openai.chat.completions.create",
+        )
         envelopes = [entry[1] for entry in aggregator_entries]
         assert len({envelope.invocation_id for envelope in envelopes}) == 3
         assert envelopes[0].generation_id == envelopes[1].generation_id
@@ -3766,6 +3806,24 @@ def test_real_iteration_summary_empty_retry_owns_fresh_generations(
         assert not any(entry[3] for entry in factories)
         assert provider_requests[1] == provider_requests[2]
         assert "tools" not in provider_requests[1]
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:openai.chat.completions.create",
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:registered-tool-handoff",
+            ),
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:iteration-summary:owned-wires",
+            ),
+            "provider:openai.chat.completions.create",
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:iteration-summary:owned-wires",
+            ),
+            "provider:openai.chat.completions.create",
+        )
 
         generation_rows = {
             row["generation_id"]: row
@@ -4894,6 +4952,15 @@ def test_real_conversation_audits_inline_handler_before_entry(
         audit_dump = repr(audit_rows)
         assert secret not in audit_dump
         assert "rewritten" not in audit_dump
+        _assert_launch_witnesses(
+            provenance_agent,
+            "provider:openai.chat.completions.create",
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:inline-tool-handoff",
+            ),
+            "provider:openai.chat.completions.create",
+        )
         assert current_task_fence_policy() is None
     finally:
         db.close()
@@ -5928,10 +5995,11 @@ def test_concurrent_inline_tools_start_once_with_unique_invocations(
         ],
     )
 
+    policy, launch_witnesses = _recording_launch_policy(db)
     try:
         with (
             bind_causal_envelope(generation),
-            bind_task_fence_policy(TaskFencePolicy(db)),
+            bind_task_fence_policy(policy),
         ):
             provenance_agent._execute_tool_calls_concurrent(
                 response,
@@ -5976,6 +6044,16 @@ def test_concurrent_inline_tools_start_once_with_unique_invocations(
             )
             for secret in secrets
         }
+        assert launch_witnesses == [
+            _launch_route(
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:inline-tool-handoff",
+            ),
+            _launch_route(
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:inline-tool-handoff",
+            ),
+        ]
         dump = "\n".join(db._conn.iterdump())
         assert all(secret not in dump for secret in secrets)
     finally:
@@ -6112,7 +6190,7 @@ def test_terminal_physical_retry_gets_fresh_child_and_revalidates_authority(
         )
         generation = db.reserve_task_fence_generation(acceptance)
         assert db.finish_task_fence_generation(generation, state="committed")
-        policy = TaskFencePolicy(db)
+        policy, launch_witnesses = _recording_launch_policy(db)
 
         class FakeEnvironment:
             cwd = str(tmp_path)
@@ -6261,6 +6339,16 @@ def test_terminal_physical_retry_gets_fresh_child_and_revalidates_authority(
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_dispatch_permits"
         ).fetchone()[0] == (1 if advance_before_retry else 2)
+        assert launch_witnesses == [
+            _launch_route(
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:registered-tool-handoff",
+            ),
+            _launch_route(
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:foreground-terminal-retry",
+            ),
+        ]
         assert raw_command not in "\n".join(db._conn.iterdump())
         assert current_causal_envelope() is None
         assert current_task_fence_policy() is None
@@ -6309,7 +6397,7 @@ def rpc_policy_probe(
     generation = db.reserve_task_fence_generation(acceptance)
     assert db.finish_task_fence_generation(generation, state="committed")
     parent = generation.for_invocation("tfiv_execute_code_parent")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     forged = replace(
         _generation(),
         task_id="tft_forged_rpc_policy",
@@ -6343,6 +6431,7 @@ def rpc_policy_probe(
         observed=observed,
         parent=parent,
         policy=policy,
+        launch_witnesses=launch_witnesses,
     )
 
 
@@ -6428,6 +6517,16 @@ def _assert_rpc_policy_handoff(probe, request_args):
         "SELECT COUNT(*) FROM task_fence_policy_decisions"
     ).fetchone()[0] == 2
     assert request_args["opaque"] not in "\n".join(probe.db._conn.iterdump())
+    assert probe.launch_witnesses == [
+        _launch_route(
+            TaskFenceCapabilityKind.RUNTIME,
+            "runtime:execute-code-rpc-descendant",
+        ),
+        _launch_route(
+            TaskFenceCapabilityKind.RUNTIME,
+            "runtime:registered-tool-handoff",
+        ),
+    ]
 
 
 @pytest.mark.skipif(
@@ -6657,36 +6756,64 @@ def test_execute_code_remote_rpc_thread_propagates_policy_to_registered_handoff(
         worker.join(timeout=1)
 
 
-def test_execute_code_real_child_process_preserves_trusted_parent():
+def test_execute_code_real_child_process_preserves_trusted_parent(
+    tmp_path,
+    monkeypatch,
+):
     from tools.code_execution_tool import execute_code
+    from tools.registry import registry
 
-    parent = _generation().for_invocation("tfiv_execute_code_real")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    acceptance = db.accept_task_fence_ingress(
+        _ingress("initial_submit", "event-execute-code-real-child")
+    )
+    generation = db.reserve_task_fence_generation(acceptance)
+    assert db.finish_task_fence_generation(generation, state="committed")
+    parent = generation.for_invocation("tfiv_execute_code_real")
+    policy, launch_witnesses = _recording_launch_policy(db)
     observed = []
 
     def fake_handle(name, args, **kwargs):
         observed.append(current_causal_envelope())
-        return json.dumps({"output": "child-ok", "exit_code": 0})
+        return registry.dispatch(name, args, **kwargs)
 
     code = (
         "from hermes_tools import terminal\n"
         "result = terminal('echo ignored')\n"
         "print(result.get('output', ''))\n"
     )
-    with patch("model_tools.handle_function_call", side_effect=fake_handle):
-        result = json.loads(
-            execute_code(
-                code=code,
-                task_id="task-fence-real-process",
-                enabled_tools=["terminal"],
-                task_fence_envelope=parent,
+    try:
+        with (
+            bind_task_fence_policy(policy),
+            patch("model_tools.handle_function_call", side_effect=fake_handle),
+        ):
+            result = json.loads(
+                execute_code(
+                    code=code,
+                    task_id="task-fence-real-process",
+                    enabled_tools=["terminal"],
+                    task_fence_envelope=parent,
+                )
             )
-        )
 
-    assert result["status"] == "success"
-    assert "child-ok" in result["output"]
-    assert len(observed) == 1
-    child = observed[0]
-    assert child is not None
-    assert child.generation_id == parent.generation_id
-    assert child.parent_invocation_id == parent.invocation_id
-    assert child.invocation_id != parent.invocation_id
+        assert result["status"] == "success"
+        assert "ignored" in result["output"]
+        assert len(observed) == 1
+        child = observed[0]
+        assert child is not None
+        assert child.generation_id == parent.generation_id
+        assert child.parent_invocation_id == parent.invocation_id
+        assert child.invocation_id != parent.invocation_id
+        assert launch_witnesses == [
+            _launch_route(
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:execute-code-rpc-descendant",
+            ),
+            _launch_route(
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:registered-tool-handoff",
+            ),
+        ]
+    finally:
+        db.close()

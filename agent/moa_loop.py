@@ -18,8 +18,14 @@ from typing import Any
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
 from agent.transports import get_transport
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 
 logger = logging.getLogger(__name__)
+_TASK_FENCE_PERSISTENT_MOA_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:persistent-moa-acting",
+    capability_version="task-fence-capability-v4",
+)
 
 # --- MoA privacy filter (config: moa.privacy_filter — '' | display | full) ---
 #
@@ -1661,6 +1667,30 @@ class MoAChatCompletions:
             agg_runtime.pop("extra_body", None),
             extra_body,
         )
+        if task_fence_model_policy is not None:
+            try:
+                launch_validation = (
+                    task_fence_model_policy.classify_launch_route(
+                        _TASK_FENCE_PERSISTENT_MOA_LAUNCH_ROUTE
+                    )
+                )
+                if (
+                    launch_validation is not None
+                    and not launch_validation.verified
+                ):
+                    logger.warning(
+                        "Task Fence shadow persistent MoA launch route would "
+                        "block (%s): %s",
+                        launch_validation.route_id,
+                        launch_validation.reason,
+                    )
+                    task_fence_model_policy = None
+            except Exception as exc:
+                logger.warning(
+                    "Task Fence shadow persistent MoA launch route failed: %s",
+                    type(exc).__name__,
+                )
+                task_fence_model_policy = None
         task_fence_kwargs: dict[str, Any] = {}
         if task_fence_model_policy is not None:
             task_fence_kwargs["_task_fence_model_policy"] = (

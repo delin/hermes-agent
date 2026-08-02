@@ -107,14 +107,21 @@ def _recording_launch_policy(db):
     )
 
 
-def _assert_launch_witnesses(witnesses, *route_ids: str) -> None:
+def _assert_launch_witnesses(
+    witnesses,
+    *routes: str | tuple[TaskFenceCapabilityKind, str],
+) -> None:
     assert witnesses == [
         TaskFenceLaunchRoute(
-            kind=TaskFenceCapabilityKind.ADAPTER,
-            route_id=route_id,
+            kind=(
+                TaskFenceCapabilityKind.ADAPTER
+                if isinstance(route, str)
+                else route[0]
+            ),
+            route_id=route if isinstance(route, str) else route[1],
             capability_version="task-fence-capability-v4",
         )
-        for route_id in route_ids
+        for route in routes
     ]
 
 
@@ -145,6 +152,7 @@ def test_registered_handler_starts_after_durable_authorization(tmp_path):
     import model_tools
 
     db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    policy, launch_witnesses = _recording_launch_policy(db)
     name = "mcp_task_fence_membrane_started"
     secret = "raw-secret-must-not-be-durable"
     observed = []
@@ -165,7 +173,7 @@ def test_registered_handler_starts_after_durable_authorization(tmp_path):
     try:
         with (
             _registered_tool(name, handler),
-            bind_task_fence_policy(TaskFencePolicy(db)),
+            bind_task_fence_policy(policy),
             bind_causal_envelope(generation),
         ):
             result = model_tools.handle_function_call(
@@ -177,6 +185,13 @@ def test_registered_handler_starts_after_durable_authorization(tmp_path):
             )
 
         assert json.loads(result) == {"legacy": "unchanged"}
+        _assert_launch_witnesses(
+            launch_witnesses,
+            (
+                TaskFenceCapabilityKind.RUNTIME,
+                "runtime:registered-tool-handoff",
+            ),
+        )
         assert len(observed) == 1
         args, envelope, attempt = observed[0]
         assert args == {"token": secret}
@@ -2813,7 +2828,7 @@ def test_inline_handoff_barrier_race_is_shadow_only(tmp_path):
     from agent.tool_executor import _run_agent_tool_execution_middleware
 
     db, acceptance, generation = _live_lane(tmp_path / "state.db")
-    policy = TaskFencePolicy(db)
+    policy, launch_witnesses = _recording_launch_policy(db)
     dispatcher = generation.for_invocation("tfiv_inline_race_dispatcher")
     original_admit = TaskFencePolicy.admit_operation
     calls = []
@@ -2871,6 +2886,10 @@ def test_inline_handoff_barrier_race_is_shadow_only(tmp_path):
             )
 
         assert outcome.result == "legacy-inline-result"
+        _assert_launch_witnesses(
+            launch_witnesses,
+            (TaskFenceCapabilityKind.RUNTIME, "runtime:inline-tool-handoff"),
+        )
         assert outcome.args == {"value": 1}
         begin_execution.assert_called_once()
         assert len(calls) == 1
@@ -2900,6 +2919,88 @@ def test_inline_handoff_barrier_race_is_shadow_only(tmp_path):
         assert db._conn.execute(
             "SELECT COUNT(*) FROM task_fence_attempts"
         ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("changed", "changed_reachable_route"),
+        ("fault", "RuntimeError"),
+        ("malformed", "AttributeError"),
+    ],
+)
+def test_registered_launch_witness_failure_keeps_handler_call(
+    tmp_path,
+    caplog,
+    case,
+    expected_reason,
+):
+    import tools.registry as registry_module
+
+    db, _acceptance, generation = _live_lane(tmp_path / "state.db")
+    fault_secret = "raw-tool-classifier-fault-secret"
+    if case == "changed":
+        policy, _witnesses = _recording_launch_policy(db)
+        launch_route = TaskFenceLaunchRoute(
+            kind=TaskFenceCapabilityKind.RUNTIME,
+            route_id="runtime:registered-tool-handoff",
+            capability_version="task-fence-capability-v5",
+        )
+    elif case == "fault":
+        def classify_route(_route):
+            raise RuntimeError(fault_secret)
+
+        policy = TaskFencePolicy(
+            db,
+            launch_catalog=SimpleNamespace(classify_route=classify_route),
+        )
+        launch_route = registry_module._TASK_FENCE_REGISTERED_TOOL_LAUNCH_ROUTE
+    else:
+        policy = TaskFencePolicy(
+            db,
+            launch_catalog=SimpleNamespace(classify_route=lambda _route: object()),
+        )
+        launch_route = registry_module._TASK_FENCE_REGISTERED_TOOL_LAUNCH_ROUTE
+
+    name = f"mcp_task_fence_launch_failure_{case}"
+    calls = []
+
+    def handler(args, **kwargs):
+        calls.append((dict(args), dict(kwargs)))
+        assert current_task_fence_policy() is None
+        return "legacy-handler-result"
+
+    try:
+        caplog.set_level(logging.WARNING, logger="tools.registry")
+        with (
+            _registered_tool(name, handler),
+            bind_task_fence_policy(policy),
+            bind_causal_envelope(generation),
+            patch.object(
+                registry_module,
+                "_TASK_FENCE_REGISTERED_TOOL_LAUNCH_ROUTE",
+                launch_route,
+            ),
+        ):
+            result = registry.dispatch(name, {"value": 1})
+
+        assert result == "legacy-handler-result"
+        assert calls == [({"value": 1}, {})]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_policy_decisions"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_dispatch_permits"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM task_fence_attempts"
+        ).fetchone()[0] == 0
+        assert any(
+            expected_reason in record.message for record in caplog.records
+        )
+        assert fault_secret not in caplog.text
     finally:
         db.close()
 

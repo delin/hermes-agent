@@ -39,9 +39,16 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_INLINE_TOOL_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:inline-tool-handoff",
+    capability_version="task-fence-capability-v4",
+)
 
 
 # Max consecutive successful credential-pool token refreshes of the SAME entry
@@ -2766,6 +2773,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 "session_id": getattr(agent, "session_id", "") or "",
             },
             adapter=f"agent-runtime:{function_name}",
+            launch_route=_TASK_FENCE_INLINE_TOOL_LAUNCH_ROUTE,
         ):
             return _execute(observed_args)
 

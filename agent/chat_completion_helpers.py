@@ -67,6 +67,11 @@ _TASK_FENCE_ANTHROPIC_MESSAGES_STREAM_LAUNCH_ROUTE = TaskFenceLaunchRoute(
     route_id="provider:anthropic.messages.stream",
     capability_version="task-fence-capability-v4",
 )
+_TASK_FENCE_ITERATION_SUMMARY_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:iteration-summary:owned-wires",
+    capability_version="task-fence-capability-v4",
+)
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -220,29 +225,34 @@ def _task_fence_iteration_summary_attempt(agent, acceptance):
         bind_task_fence_policy,
     )
 
-    generation = _reserve_task_fence_shadow_generation(agent, acceptance)
     store = getattr(agent, "_session_db", None)
     try:
         policy = TaskFencePolicy(
             store,
             launch_catalog=getattr(agent, "_task_fence_launch_catalog", None),
         )
+        launch_validation = policy.classify_launch_route(
+            _TASK_FENCE_ITERATION_SUMMARY_LAUNCH_ROUTE
+        )
+        if launch_validation is not None and not launch_validation.verified:
+            logger.warning(
+                "Task Fence shadow summary launch route would block (%s): %s",
+                launch_validation.route_id,
+                launch_validation.reason,
+            )
+            with bind_task_fence_policy(None):
+                yield None
+            return
     except Exception as exc:
         logger.warning(
-            "Task Fence shadow summary policy unavailable: %s",
+            "Task Fence shadow summary launch route failed: %s",
             type(exc).__name__,
         )
-        if generation is not None:
-            _finish_task_fence_shadow_generation(
-                agent,
-                generation,
-                state="failed",
-                required=True,
-            )
         with bind_task_fence_policy(None):
             yield None
         return
 
+    generation = _reserve_task_fence_shadow_generation(agent, acceptance)
     attempt = {
         "policy": policy,
         "state": "failed",

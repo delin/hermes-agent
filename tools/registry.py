@@ -27,7 +27,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
+from task_fence import TaskFenceCapabilityKind, TaskFenceLaunchRoute
+
 logger = logging.getLogger(__name__)
+
+_TASK_FENCE_REGISTERED_TOOL_LAUNCH_ROUTE = TaskFenceLaunchRoute(
+    kind=TaskFenceCapabilityKind.RUNTIME,
+    route_id="runtime:registered-tool-handoff",
+    capability_version="task-fence-capability-v4",
+)
 
 
 def _task_fence_tool_fingerprint(
@@ -104,6 +112,7 @@ def _task_fence_tool_handoff(
     args: dict,
     kwargs: dict,
     *,
+    launch_route: TaskFenceLaunchRoute,
     adapter: Optional[str] = None,
 ) -> Iterator[None]:
     """Bind one invocation and observe a tool handoff without gating it."""
@@ -113,11 +122,34 @@ def _task_fence_tool_handoff(
     try:
         from task_fence import (
             bind_causal_envelope,
+            bind_task_fence_policy,
             current_causal_envelope,
             current_task_fence_policy,
         )
 
         policy = current_task_fence_policy()
+        if policy is not None:
+            try:
+                launch_validation = policy.classify_launch_route(launch_route)
+                if (
+                    launch_validation is not None
+                    and not launch_validation.verified
+                ):
+                    logger.warning(
+                        "Task Fence shadow tool launch route would block for %s "
+                        "(%s): %s",
+                        name,
+                        launch_validation.route_id,
+                        launch_validation.reason,
+                    )
+                    policy = None
+            except Exception as exc:
+                logger.warning(
+                    "Task Fence shadow tool launch route failed for %s: %s",
+                    name,
+                    type(exc).__name__,
+                )
+                policy = None
         envelope = current_causal_envelope()
         if policy is not None:
             if envelope is not None:
@@ -134,7 +166,8 @@ def _task_fence_tool_handoff(
         return
 
     if policy is None:
-        yield
+        with bind_task_fence_policy(None):
+            yield
         return
 
     with bind_causal_envelope(envelope):
@@ -816,7 +849,12 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
-            with _task_fence_tool_handoff(name, args, kwargs):
+            with _task_fence_tool_handoff(
+                name,
+                args,
+                kwargs,
+                launch_route=_TASK_FENCE_REGISTERED_TOOL_LAUNCH_ROUTE,
+            ):
                 if entry.is_async:
                     from model_tools import _run_async
 
